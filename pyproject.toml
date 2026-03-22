@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hiraco"
+version = "0.1.0"
+description = "CLI scaffold for OM SYSTEM ORF to linear DNG conversion"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Krzys" }
+]
+license = { text = "Proprietary" }
+dependencies = []
+
+[project.scripts]
+hiraco = "hiraco.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

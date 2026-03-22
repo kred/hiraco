@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+dng_sdk_*/
+tmp/
+*.log
+*.dng
+*.DNG
+*.ORF
+*.orf
