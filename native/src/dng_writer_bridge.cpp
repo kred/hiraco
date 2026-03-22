@@ -17,6 +17,7 @@
 #include "dng_xy_coord.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <libraw/libraw.h>
 #include <memory>
@@ -53,12 +54,184 @@ struct RenderSettings {
   int no_auto_scale = 0;
   int no_auto_bright = 1;
   int user_flip = 0;
+  int user_qual = -1;
+  int four_color_rgb = 0;
+  int green_matching = 0;
+  int med_passes = 0;
+  float adjust_maximum_thr = 0.75f;
   float gamma_power = 1.0f;
   float gamma_slope = 1.0f;
 };
 
+bool IsOm3HighResMetadata(const SourceLinearDngMetadata& metadata) {
+  return metadata.model == "OM-3" &&
+         metadata.default_crop_origin_h == 6 &&
+         metadata.default_crop_origin_v == 6 &&
+         metadata.default_crop_width == 8160 &&
+         metadata.default_crop_height == 6120;
+}
+
+bool ReadEnvInt(const char* name, int* value) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return false;
+  }
+
+  char* end = nullptr;
+  const long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || (end != nullptr && *end != '\0')) {
+    return false;
+  }
+
+  *value = static_cast<int>(parsed);
+  return true;
+}
+
+bool ReadEnvFloat(const char* name, float* value) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return false;
+  }
+
+  char* end = nullptr;
+  const float parsed = std::strtof(raw, &end);
+  if (end == raw || (end != nullptr && *end != '\0')) {
+    return false;
+  }
+
+  *value = parsed;
+  return true;
+}
+
+void ApplyLibRawEnvironmentOverrides(RenderSettings* settings) {
+  ReadEnvInt("HIRACO_LIBRAW_USER_QUAL", &settings->user_qual);
+  ReadEnvInt("HIRACO_LIBRAW_FOUR_COLOR_RGB", &settings->four_color_rgb);
+  ReadEnvInt("HIRACO_LIBRAW_GREEN_MATCHING", &settings->green_matching);
+  ReadEnvInt("HIRACO_LIBRAW_MED_PASSES", &settings->med_passes);
+  ReadEnvInt("HIRACO_LIBRAW_NO_AUTO_SCALE", &settings->no_auto_scale);
+  ReadEnvInt("HIRACO_LIBRAW_NO_AUTO_BRIGHT", &settings->no_auto_bright);
+  ReadEnvFloat("HIRACO_LIBRAW_ADJUST_MAXIMUM_THR", &settings->adjust_maximum_thr);
+}
+
+RenderSettings BuildRawRenderSettings(const SourceLinearDngMetadata& metadata) {
+  RenderSettings settings;
+  settings.output_color = 1;
+  settings.use_camera_wb = 1;
+  settings.use_camera_matrix = 1;
+  settings.no_auto_scale = 0;
+  settings.no_auto_bright = 1;
+  settings.user_flip = 0;
+  settings.user_qual = -1;
+  settings.four_color_rgb = 0;
+  settings.green_matching = 0;
+  settings.med_passes = 0;
+  settings.adjust_maximum_thr = 0.75f;
+  settings.gamma_power = 1.0f;
+  settings.gamma_slope = 1.0f;
+
+  if (IsOm3HighResMetadata(metadata)) {
+    settings.user_qual = 11;
+    settings.four_color_rgb = 1;
+    settings.green_matching = 1;
+  }
+
+  ApplyLibRawEnvironmentOverrides(&settings);
+  return settings;
+}
+
+RenderSettings BuildPreviewRenderSettings(const SourceLinearDngMetadata& metadata) {
+  RenderSettings settings;
+  settings.output_color = 1;
+  settings.use_camera_wb = 1;
+  settings.use_camera_matrix = 1;
+  settings.no_auto_scale = 0;
+  settings.no_auto_bright = 0;
+  settings.user_flip = 0;
+  settings.user_qual = -1;
+  settings.four_color_rgb = 0;
+  settings.green_matching = 0;
+  settings.med_passes = 0;
+  settings.adjust_maximum_thr = 0.75f;
+  settings.gamma_power = 0.45f;
+  settings.gamma_slope = 4.5f;
+
+  if (IsOm3HighResMetadata(metadata)) {
+    settings.user_qual = 11;
+    settings.four_color_rgb = 1;
+    settings.green_matching = 1;
+  }
+
+  ApplyLibRawEnvironmentOverrides(&settings);
+  return settings;
+}
+
+bool ShouldApplyOm3SourceDrivenLinearTransform(const SourceLinearDngMetadata& metadata,
+                                               const RasterImage& image) {
+  if (metadata.model != "OM-3" || !metadata.has_black_level || !metadata.has_as_shot_neutral) {
+    return false;
+  }
+
+  const bool is_high_res = metadata.default_crop_origin_h == 6 &&
+                           metadata.default_crop_origin_v == 6 &&
+                           metadata.default_crop_width == 8160 &&
+                           metadata.default_crop_height == 6120 &&
+                           image.width == 8172 &&
+                           image.height == 6132;
+  const bool is_standard_20mp = metadata.default_crop_origin_h == 12 &&
+                                metadata.default_crop_origin_v == 12 &&
+                                metadata.default_crop_width == 5184 &&
+                                metadata.default_crop_height == 3888 &&
+                                image.width == 5220 &&
+                                image.height == 3912;
+  return is_high_res || is_standard_20mp;
+}
+
+bool ShouldUseOm3AdobeMetadata(const SourceLinearDngMetadata& metadata,
+                               const RasterImage& image) {
+  if (metadata.model != "OM-3" || !metadata.has_black_level || !metadata.has_as_shot_neutral) {
+    return false;
+  }
+
+  const bool is_high_res = metadata.default_crop_origin_h == 6 &&
+                           metadata.default_crop_origin_v == 6 &&
+                           metadata.default_crop_width == 8160 &&
+                           metadata.default_crop_height == 6120 &&
+                           image.width == 8172 &&
+                           image.height == 6132;
+  const bool is_standard_20mp = metadata.default_crop_origin_h == 12 &&
+                                metadata.default_crop_origin_v == 12 &&
+                                metadata.default_crop_width == 5184 &&
+                                metadata.default_crop_height == 3888 &&
+                                image.width == 5220 &&
+                                image.height == 3912;
+  return is_high_res || is_standard_20mp;
+}
+
+void ApplyLinearDngRasterTransform(const SourceLinearDngMetadata& metadata,
+                                   RasterImage* image) {
+  if (ShouldApplyOm3SourceDrivenLinearTransform(metadata, *image)) {
+    const double pedestal = metadata.black_level;
+    const double gain = (65535.0 - pedestal) / 65535.0;
+    const size_t pixel_count = static_cast<size_t>(image->width) * static_cast<size_t>(image->height);
+    for (size_t index = 0; index < pixel_count; ++index) {
+      for (size_t channel = 0; channel < 3; ++channel) {
+        const size_t sample_index = index * image->colors + channel;
+        const double scaled = pedestal + gain * metadata.as_shot_neutral[channel] * image->pixels[sample_index];
+        image->pixels[sample_index] = static_cast<uint16_t>(std::clamp(scaled, 0.0, 65535.0));
+      }
+    }
+  }
+}
+
+uint32_t DngVersionForCompression(const std::string& compression) {
+  if (compression == "jpeg-xl") {
+    return dngVersion_SaveDefault;
+  }
+  return dngVersion_1_6_0_0;
+}
+
 void ConfigureHost(dng_host& host, const std::string& compression) {
-  host.SetSaveDNGVersion(dngVersion_SaveDefault);
+  host.SetSaveDNGVersion(DngVersionForCompression(compression));
   host.SetSaveLinearDNG(true);
   host.SetLosslessJXL(compression == "jpeg-xl");
   host.SetLossyMosaicJXL(false);
@@ -120,6 +293,13 @@ bool RenderLibRawImage(const std::string& source_path,
   processor.imgdata.params.use_camera_matrix = settings.use_camera_matrix;
   processor.imgdata.params.no_auto_scale = settings.no_auto_scale;
   processor.imgdata.params.user_flip = settings.user_flip;
+  if (settings.user_qual >= 0) {
+    processor.imgdata.params.user_qual = settings.user_qual;
+  }
+  processor.imgdata.params.four_color_rgb = settings.four_color_rgb;
+  processor.imgdata.params.green_matching = settings.green_matching;
+  processor.imgdata.params.med_passes = settings.med_passes;
+  processor.imgdata.params.adjust_maximum_thr = settings.adjust_maximum_thr;
 
   result = processor.dcraw_process();
   if (result != LIBRAW_SUCCESS) {
@@ -163,28 +343,11 @@ bool RenderLibRawImage(const std::string& source_path,
 }
 
 bool BuildLinearDngPayload(const std::string& source_path,
+                           const SourceLinearDngMetadata& metadata,
                            LinearDngPayload* payload,
                            std::string* error_message) {
-  const RenderSettings raw_settings = {
-      0,
-      0,
-      0,
-      0,
-  1,
-  0,
-  1.0f,
-  1.0f,
-  };
-  const RenderSettings preview_settings = {
-      1,
-      1,
-      1,
-      0,
-  0,
-  0,
-  0.45f,
-  4.5f,
-  };
+  const RenderSettings raw_settings = BuildRawRenderSettings(metadata);
+  const RenderSettings preview_settings = BuildPreviewRenderSettings(metadata);
 
   if (!RenderLibRawImage(source_path, raw_settings, &payload->raw_image, error_message)) {
     return false;
@@ -266,24 +429,90 @@ AutoPtr<dng_image> MakeUint8Image(dng_host& host, const PreviewImage& image) {
   return AutoPtr<dng_image>(dng_image_ptr.Release());
 }
 
+void AttachLinearSrgbProfile(dng_negative& negative) {
+  AutoPtr<dng_camera_profile> profile(new dng_camera_profile());
+  profile->SetName("hiraco-linear-srgb");
+  profile->SetCalibrationIlluminant1(lsD65);
+  profile->SetColorMatrix1(dng_matrix_3by3(
+      3.2404542, -1.5371385, -0.4985314,
+      -0.9692660, 1.8760108, 0.0415560,
+      0.0556434, -0.2040259, 1.0572252));
+  profile->SetForwardMatrix1(dng_matrix_3by3(
+      0.4124564, 0.3575761, 0.1804375,
+      0.2126729, 0.7151522, 0.0721750,
+      0.0193339, 0.1191920, 0.9503041));
+  negative.AddProfile(profile);
+  negative.SetAsShotProfileName("hiraco-linear-srgb");
+
+  dng_vector camera_neutral(3);
+  camera_neutral.SetIdentity(3);
+  negative.SetCameraNeutral(camera_neutral);
+  negative.SetCameraWhiteXY(D65_xy_coord());
+}
+
+void AttachOm3AdobeLikeProfile(dng_negative& negative) {
+  AutoPtr<dng_camera_profile> profile(new dng_camera_profile());
+  profile->SetName("Adobe Standard");
+  profile->SetCalibrationIlluminant1(lsStandardLightA);
+  profile->SetCalibrationIlluminant2(lsD65);
+  profile->SetColorMatrix1(dng_matrix_3by3(
+      1.0602, -0.5977, 0.0574,
+      -0.3109, 1.1296, 0.2063,
+      0.0002, 0.0521, 0.6609));
+  profile->SetColorMatrix2(dng_matrix_3by3(
+      0.9090, -0.3591, -0.0756,
+      -0.3252, 1.1396, 0.2109,
+      -0.0318, 0.1059, 0.5606));
+  profile->SetForwardMatrix1(dng_matrix_3by3(
+      0.4436, 0.4158, 0.1049,
+      0.1597, 0.8100, 0.0304,
+      0.0503, 0.0022, 0.7725));
+  profile->SetForwardMatrix2(dng_matrix_3by3(
+      0.4504, 0.3593, 0.1546,
+      0.2285, 0.7248, 0.0467,
+      0.1088, 0.0045, 0.7118));
+  negative.AddProfile(profile);
+  negative.SetAsShotProfileName("Adobe Standard");
+}
+
+void SetSourceCameraNeutral(const SourceLinearDngMetadata& metadata,
+                            dng_negative& negative) {
+  if (!metadata.has_as_shot_neutral) {
+    return;
+  }
+
+  dng_vector camera_neutral(3);
+  camera_neutral[0] = metadata.as_shot_neutral[0];
+  camera_neutral[1] = metadata.as_shot_neutral[1];
+  camera_neutral[2] = metadata.as_shot_neutral[2];
+  negative.SetCameraNeutral(camera_neutral);
+}
+
 void PopulateLinearRawNegative(dng_host& host,
                                const std::string& source_path,
                                const RasterImage& raw_image,
+                               const SourceLinearDngMetadata& metadata,
                                dng_negative& negative) {
-  negative.SetModelName("OM-3");
-  negative.SetLocalName("OM-3");
+  const std::string model_name = metadata.model.empty() ? std::string("linear-raw") : metadata.model;
+  const std::string local_name = metadata.unique_camera_model.empty() ? model_name : metadata.unique_camera_model;
+
+  negative.SetModelName(model_name.c_str());
+  negative.SetLocalName(local_name.c_str());
   negative.SetOriginalRawFileName(std::filesystem::path(source_path).filename().string().c_str());
-  negative.SetColorimetricReference(crSceneReferred);
   negative.SetColorChannels(raw_image.colors);
   negative.SetBaseOrientation(dng_orientation::Normal());
-  negative.SetDefaultCropOrigin(0, 0);
-  negative.SetDefaultCropSize(raw_image.width, raw_image.height);
+  if (metadata.has_default_crop) {
+    negative.SetDefaultCropOrigin(metadata.default_crop_origin_h, metadata.default_crop_origin_v);
+    negative.SetDefaultCropSize(metadata.default_crop_width, metadata.default_crop_height);
+  } else {
+    negative.SetDefaultCropOrigin(0, 0);
+    negative.SetDefaultCropSize(raw_image.width, raw_image.height);
+  }
   negative.SetDefaultScale(dng_urational(1, 1), dng_urational(1, 1));
   negative.SetRawDefaultCrop();
   negative.SetRawDefaultScale();
   negative.SetRawBestQualityScale();
-  negative.SetCameraWhiteXY(D65_xy_coord());
-  negative.SetBlackLevel(0.0);
+  negative.SetBlackLevel(ShouldUseOm3AdobeMetadata(metadata, raw_image) ? metadata.black_level : 0.0);
   negative.SetWhiteLevel((1u << raw_image.bits) - 1);
   negative.SetBaselineExposure(0.0);
   negative.SetLinearResponseLimit(1.0);
@@ -292,6 +521,12 @@ void PopulateLinearRawNegative(dng_host& host,
   dng_vector analog_balance(raw_image.colors);
   analog_balance.SetIdentity(raw_image.colors);
   negative.SetAnalogBalance(analog_balance);
+  if (ShouldUseOm3AdobeMetadata(metadata, raw_image)) {
+    AttachOm3AdobeLikeProfile(negative);
+    SetSourceCameraNeutral(metadata, negative);
+  } else {
+    AttachLinearSrgbProfile(negative);
+  }
 
   AutoPtr<dng_image> image = MakeUint16Image(host, raw_image);
   negative.SetStage3Image(image);
@@ -343,7 +578,8 @@ DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string& compress
 
 DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const std::string& output_path,
-                                     const std::string& compression) {
+                                     const std::string& compression,
+                                     const SourceLinearDngMetadata& metadata) {
   DngWriteResult result;
 
   if (!IsSupportedWriteCompression(compression)) {
@@ -354,10 +590,12 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
   try {
     LinearDngPayload payload;
     std::string render_error;
-    if (!BuildLinearDngPayload(source_path, &payload, &render_error)) {
+    if (!BuildLinearDngPayload(source_path, metadata, &payload, &render_error)) {
       result.message = render_error;
       return result;
     }
+
+    ApplyLinearDngRasterTransform(metadata, &payload.raw_image);
 
     PreviewImage preview_image = BuildPreviewImage(payload.rendered_preview_source, 1024);
 
@@ -365,7 +603,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     ConfigureHost(host, compression);
 
     AutoPtr<dng_negative> negative(host.Make_dng_negative());
-    PopulateLinearRawNegative(host, source_path, payload.raw_image, *negative.Get());
+    PopulateLinearRawNegative(host, source_path, payload.raw_image, metadata, *negative.Get());
 
     dng_preview_list preview_list;
     AppendImagePreview(host, preview_image, &preview_list);
@@ -380,7 +618,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                     stream,
                     *negative.Get(),
                     &preview_list,
-                    dngVersion_SaveDefault,
+                    DngVersionForCompression(compression),
                     compression == "uncompressed");
     stream.Flush();
 
@@ -412,18 +650,22 @@ DngWriteResult WriteSyntheticLinearDng(const std::string& output_path,
     ConfigureHost(host, compression);
 
     AutoPtr<dng_negative> negative(host.Make_dng_negative());
-    PopulateLinearRawNegative(host, "synthetic-gradient.raw", processed, *negative.Get());
+    PopulateLinearRawNegative(host, "synthetic-gradient.raw", processed, SourceLinearDngMetadata(), *negative.Get());
 
     dng_preview_list preview_list;
     AppendImagePreview(host, preview_image, &preview_list);
 
     dng_file_stream stream(output_path.c_str(), true);
     dng_image_writer writer;
+    if (compression == "jpeg-xl") {
+      negative->LosslessCompressJXL(host, writer, false);
+    }
+
     writer.WriteDNG(host,
                     stream,
                     *negative.Get(),
                     &preview_list,
-                    dngVersion_SaveDefault,
+                    DngVersionForCompression(compression),
                     compression == "uncompressed");
     stream.Flush();
 
@@ -447,7 +689,7 @@ DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string&) {
   return summary;
 }
 
-DngWriteResult WriteLinearDngFromRaw(const std::string&, const std::string&, const std::string&) {
+DngWriteResult WriteLinearDngFromRaw(const std::string&, const std::string&, const std::string&, const SourceLinearDngMetadata&) {
   DngWriteResult result;
   result.message = "Adobe DNG SDK integration not enabled in this build";
   return result;

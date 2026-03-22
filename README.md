@@ -20,7 +20,10 @@ This repository currently contains:
 - RAW inspection and metadata diff commands backed by rawpy and ExifTool
 
 The current native helper can write linear DNG output through the Adobe DNG SDK
-for `uncompressed`, `deflate`, and `jpeg-xl` requests.
+for `uncompressed`, `deflate`, and `jpeg-xl` requests. The writer requests DNG
+`1.6.0.0` compatibility for `uncompressed` and `deflate`, and experimental DNG
+`1.7.1.0` compatibility for `jpeg-xl`, but the Adobe SDK may stamp a lower
+final `DNGVersion` when the file does not require newer features.
 
 ## Bootstrap
 
@@ -114,7 +117,7 @@ hiraco copy-metadata source.orf output.dng --dry-run
 
 - `hiraco doctor` validates the local environment and optionally checks current upstream releases.
 - `hiraco build-native` configures and builds the native helper with Adobe DNG SDK support, including bundled libjxl support for JPEG XL output.
-- `hiraco convert ...` writes linear DNG for `uncompressed`, `deflate`, or `jpeg-xl`, then runs ExifTool metadata copy from the source file.
+- `hiraco convert ...` requests DNG `1.6.0.0` compatibility for `uncompressed` and `deflate`, or experimental DNG `1.7.1.0` compatibility for `jpeg-xl`, then runs ExifTool metadata copy from the source file without overriding the SDK-written version tags.
 - Automatic metadata copy during `hiraco convert` preserves EXIF, IPTC, and XMP, but intentionally skips MakerNotes because raw-camera white-balance and vendor processing tags can corrupt rendered linear DNG color.
 - The current converter writes rendered linear RGB DNG, not mosaic/raw DNG. That means color should stay stable across viewers, but some raw editors may present it more like a high-bit-depth rendered image than a fully editable camera-raw file.
 - Rendered DNG output is normalized to a generic `hiraco` camera identity after metadata copy so raw editors do not apply OM SYSTEM camera profiles to already rendered pixels.

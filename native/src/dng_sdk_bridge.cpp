@@ -21,6 +21,13 @@ std::string FormatDngVersion(uint32_t version) {
   return stream.str();
 }
 
+uint32_t DngVersionForCompression(const std::string& compression) {
+  if (compression == "jpeg-xl") {
+    return dngVersion_SaveDefault;
+  }
+  return dngVersion_1_6_0_0;
+}
+
 }  // namespace
 
 DngSdkSupportSummary GetDngSdkSupportSummary() {
@@ -41,22 +48,26 @@ DngWriterConfigSummary BuildDngWriterConfigSummary(const std::string& compressio
   if (compression == "uncompressed") {
     summary.compression_code = ccUncompressed;
     summary.compression_name = "uncompressed";
-    summary.status = "Writer can request uncompressed linear DNG output";
+    summary.dng_version = FormatDngVersion(DngVersionForCompression(compression));
+    summary.status = "Writer can request uncompressed linear DNG output as DNG 1.6.0.0";
     return summary;
   }
 
   if (compression == "deflate") {
     summary.compression_code = ccDeflate;
     summary.compression_name = "deflate";
-    summary.status = "Writer can request Deflate-compressed linear DNG output";
+    summary.dng_version = FormatDngVersion(DngVersionForCompression(compression));
+    summary.status = "Writer can request Deflate-compressed linear DNG output as DNG 1.6.0.0";
     return summary;
   }
 
   if (compression == "jpeg-xl") {
     summary.compression_code = ccJXL;
     summary.compression_name = "jpeg-xl";
+    summary.dng_version = FormatDngVersion(DngVersionForCompression(compression));
+    summary.experimental = true;
     summary.lossless_jpeg_xl = true;
-    summary.status = "Writer can request lossless JPEG XL linear DNG output";
+    summary.status = "Writer can request lossless JPEG XL linear DNG output as experimental DNG 1.7.1.0";
     return summary;
   }
 

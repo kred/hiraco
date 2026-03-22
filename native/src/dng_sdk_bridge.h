@@ -18,6 +18,8 @@ struct DngWriterConfigSummary {
   bool lossy_mosaic_jpeg_xl = false;
   unsigned compression_code = 0;
   std::string compression_name;
+  std::string dng_version;
+  bool experimental = false;
   std::string status;
 };
 

@@ -7,6 +7,7 @@ __pycache__/
 .pytest_cache/
 dist/
 build/
+native/build*/
 *.egg-info/
 dng_sdk_*/
 tmp/
@@ -15,3 +16,7 @@ tmp/
 *.DNG
 *.ORF
 *.orf
+*.tif
+*.TIF
+*.tiff
+*.TIFF

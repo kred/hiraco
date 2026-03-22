@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,6 +23,8 @@ def build_native_helper(
 
     configure_command = [cmake, "-S", str(native_root), "-B", str(build_root)]
     configure_command.append(f"-DHIRACO_DNG_SDK_ROOT={effective_dng_sdk_root}")
+    if platform.system() == "Darwin":
+        configure_command.append(f"-DCMAKE_OSX_ARCHITECTURES={platform.machine()}")
 
     configure = subprocess.run(
         configure_command,
