@@ -12,7 +12,9 @@ authors = [
   { name = "Krzys" }
 ]
 license = { text = "Proprietary" }
-dependencies = []
+dependencies = [
+  "rawpy>=0.25.1",
+]
 
 [project.scripts]
 hiraco = "hiraco.cli:main"

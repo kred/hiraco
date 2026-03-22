@@ -30,8 +30,11 @@ Create and use a virtual environment:
 /usr/bin/python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install -r requirements.txt
 ```
+
+The editable install is kept in `requirements.txt`, so `rawpy` and the local
+`hiraco` package are installed together.
 
 Run the doctor command:
 
@@ -47,10 +50,10 @@ brew install cmake exiftool libraw
 
 For native development, the current helper expects a system LibRaw installation.
 
-Adobe DNG SDK is a required manual dependency for the DNG writer path, but it
-cannot be redistributed in this repository. Before building with
-`--enable-dng-sdk`, copy your local Adobe DNG SDK bundle into
-`dng_sdk_1_7_1/`, or point CMake at a local copy with `HIRACO_DNG_SDK_ROOT`.
+Adobe DNG SDK is a required manual dependency and the only supported native
+build mode. It cannot be redistributed in this repository. Before building,
+copy your local Adobe DNG SDK bundle into `dng_sdk_1_7_1/`, or point CMake at a
+local copy with `HIRACO_DNG_SDK_ROOT`.
 
 Build the native helper:
 
@@ -58,16 +61,10 @@ Build the native helper:
 hiraco build-native
 ```
 
-Build the native helper with Adobe DNG SDK support enabled:
-
-```bash
-hiraco build-native --enable-dng-sdk
-```
-
 Example with an external SDK checkout:
 
 ```bash
-cmake -S native -B native/build -DHIRACO_ENABLE_DNG_SDK=ON -DHIRACO_DNG_SDK_ROOT=/path/to/dng_sdk_1_7_1
+cmake -S native -B native/build -DHIRACO_DNG_SDK_ROOT=/path/to/dng_sdk_1_7_1
 cmake --build native/build
 ```
 
@@ -116,8 +113,7 @@ hiraco copy-metadata source.orf output.dng --dry-run
 ## Planned commands
 
 - `hiraco doctor` validates the local environment and optionally checks current upstream releases.
-- `hiraco build-native` configures and builds the native helper.
-- `hiraco build-native --enable-dng-sdk` enables Adobe DNG SDK-backed writing, including bundled libjxl support for JPEG XL output.
+- `hiraco build-native` configures and builds the native helper with Adobe DNG SDK support, including bundled libjxl support for JPEG XL output.
 - `hiraco convert ...` writes linear DNG for `uncompressed`, `deflate`, or `jpeg-xl`, then runs ExifTool metadata copy from the source file.
 - Automatic metadata copy during `hiraco convert` preserves EXIF, IPTC, and XMP, but intentionally skips MakerNotes because raw-camera white-balance and vendor processing tags can corrupt rendered linear DNG color.
 - The current converter writes rendered linear RGB DNG, not mosaic/raw DNG. That means color should stay stable across viewers, but some raw editors may present it more like a high-bit-depth rendered image than a fully editable camera-raw file.
@@ -131,4 +127,3 @@ hiraco copy-metadata source.orf output.dng --dry-run
 
 - Adobe DNG SDK is required for the full DNG writer, but it is not included in this repository and must be copied in manually from Adobe's distribution.
 - The expected default local path is `dng_sdk_1_7_1/`, or you can override it with `HIRACO_DNG_SDK_ROOT` during CMake configure.
-- The repo is not yet a git repository.

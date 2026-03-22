@@ -65,7 +65,6 @@ def build_parser() -> argparse.ArgumentParser:
     copy_parser.set_defaults(handler=handle_copy_metadata)
 
     build_native_parser = subparsers.add_parser("build-native", help="Configure and build the native helper")
-    build_native_parser.add_argument("--enable-dng-sdk", action="store_true", help="Enable Adobe DNG SDK header integration scaffold")
     build_native_parser.add_argument("--dng-sdk-root", type=Path, help="Override the Adobe DNG SDK root passed to CMake")
     build_native_parser.set_defaults(handler=handle_build_native)
 
@@ -160,7 +159,6 @@ def handle_convert(args: argparse.Namespace) -> int:
 def handle_build_native(args: argparse.Namespace) -> int:
     return build_native_helper(
         _workspace_root(),
-        enable_dng_sdk=args.enable_dng_sdk,
         dng_sdk_root=args.dng_sdk_root,
     )
 

@@ -62,7 +62,6 @@ void ConfigureHost(dng_host& host, const std::string& compression) {
   host.SetSaveLinearDNG(true);
   host.SetLosslessJXL(compression == "jpeg-xl");
   host.SetLossyMosaicJXL(false);
-  host.SetPreferredRawCompression(compression == "deflate" ? ccDeflate : 0);
 }
 
 bool IsSupportedWriteCompression(const std::string& compression) {

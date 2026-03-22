@@ -8,7 +8,6 @@ from pathlib import Path
 def build_native_helper(
     workspace_root: Path,
     *,
-    enable_dng_sdk: bool = False,
     dng_sdk_root: Path | None = None,
 ) -> int:
     cmake = shutil.which("cmake")
@@ -19,12 +18,10 @@ def build_native_helper(
     native_root = workspace_root / "native"
     build_root = native_root / "build"
     build_root.mkdir(parents=True, exist_ok=True)
+    effective_dng_sdk_root = dng_sdk_root or (workspace_root / "dng_sdk_1_7_1")
 
     configure_command = [cmake, "-S", str(native_root), "-B", str(build_root)]
-    configure_command.append(f"-DHIRACO_ENABLE_DNG_SDK={'ON' if enable_dng_sdk else 'OFF'}")
-    if enable_dng_sdk:
-        effective_dng_sdk_root = dng_sdk_root or (workspace_root / "dng_sdk_1_7_1")
-        configure_command.append(f"-DHIRACO_DNG_SDK_ROOT={effective_dng_sdk_root}")
+    configure_command.append(f"-DHIRACO_DNG_SDK_ROOT={effective_dng_sdk_root}")
 
     configure = subprocess.run(
         configure_command,
