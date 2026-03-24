@@ -13,6 +13,7 @@ authors = [
 ]
 license = { text = "Proprietary" }
 dependencies = [
+  "Pillow>=10.0.0",
   "rawpy>=0.25.1",
 ]
 

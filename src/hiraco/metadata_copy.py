@@ -17,6 +17,8 @@ def build_copy_command(source: Path, destination: Path, preserve_makernotes: boo
         "-XMP:all",
         "--EXIF:Orientation",
         "--XMP-tiff:Orientation",
+        "--CFAPattern",
+        "--CFA*",
     ]
     if preserve_makernotes:
         command.append("-MakerNotes:all")
@@ -50,7 +52,6 @@ def copy_metadata(source: Path,
                   dry_run: bool = False) -> dict[str, object]:
     command = build_copy_command(source, destination, preserve_makernotes=preserve_makernotes)
     cleanup_command = None if preserve_makernotes else build_cleanup_command(destination)
-    override_command = None
     if dry_run:
         payload = {
             "ok": True,
@@ -61,9 +62,6 @@ def copy_metadata(source: Path,
         if cleanup_command is not None:
             payload["cleanup_command"] = cleanup_command
             payload["cleanup_command_text"] = format_copy_command(cleanup_command)
-        if override_command is not None:
-            payload["override_command"] = override_command
-            payload["override_command_text"] = format_copy_command(override_command)
         return payload
 
     completed = subprocess.run(
@@ -97,22 +95,4 @@ def copy_metadata(source: Path,
     payload["cleanup_stderr"] = cleanup_completed.stderr
     payload["ok"] = payload["ok"] and cleanup_completed.returncode == 0
 
-    if cleanup_completed.returncode != 0:
-        return payload
-
-    if override_command is None:
-        return payload
-
-    override_completed = subprocess.run(
-        override_command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    payload["override_command"] = override_command
-    payload["override_command_text"] = format_copy_command(override_command)
-    payload["override_returncode"] = override_completed.returncode
-    payload["override_stdout"] = override_completed.stdout
-    payload["override_stderr"] = override_completed.stderr
-    payload["ok"] = payload["ok"] and override_completed.returncode == 0
     return payload

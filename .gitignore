@@ -16,6 +16,8 @@ tmp/
 *.DNG
 *.ORF
 *.orf
+*.ORI
+*.ori
 *.tif
 *.TIF
 *.tiff

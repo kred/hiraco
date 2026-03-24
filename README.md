@@ -13,11 +13,9 @@ This repository currently contains:
 
 - project packaging via `pyproject.toml`
 - CLI entry point `hiraco`
-- environment and upstream freshness checks
 - configuration and native-helper request models
 - native helper with a cross-platform CMake build
 - Adobe DNG SDK runtime-backed linear DNG write path for `uncompressed`, `deflate`, and `jpeg-xl`
-- RAW inspection and metadata diff commands backed by rawpy and ExifTool
 
 The current native helper can write linear DNG output through the Adobe DNG SDK
 for `uncompressed`, `deflate`, and `jpeg-xl` requests. The writer requests DNG
@@ -38,12 +36,6 @@ python -m pip install -r requirements.txt
 
 The editable install is kept in `requirements.txt`, so `rawpy` and the local
 `hiraco` package are installed together.
-
-Run the doctor command:
-
-```bash
-hiraco doctor
-```
 
 Install native prerequisites on macOS:
 
@@ -71,62 +63,27 @@ cmake -S native -B native/build -DHIRACO_DNG_SDK_ROOT=/path/to/dng_sdk_1_7_1
 cmake --build native/build
 ```
 
-The native helper also exposes a low-level synthetic write validation command:
+## Usage
+
+This project explicitly focuses on a direct file conversion paradigm. The CLI has been stripped of legacy evaluation and maker-note diagnostic logic.
+
+Convert utilizing standard explicit Deflate or JPEG-XL compression:
 
 ```bash
-native/build/hiraco-native selftest-write --output tmp/test.dng --compression deflate
+hiraco convert _3210505.ORF output.dng --compression deflate
+hiraco convert _3210505.ORI output.dng --compression jpeg-xl
 ```
 
-Run upstream freshness checks:
+Convert into Uncompressed 16-bit DNG format:
 
 ```bash
-hiraco doctor --check-upstream
+hiraco convert _3210505.ORF output.dng --compression uncompressed
 ```
-
-Inspect a RAW file:
-
-```bash
-hiraco inspect path/to/file.orf
-```
-
-Inspect native LibRaw support for a source file:
-
-```bash
-hiraco probe-native path/to/file.orf
-```
-
-Validate convert preflight without invoking the native helper:
-
-```bash
-hiraco convert path/to/file.orf output.dng --compression deflate --preflight-only
-```
-
-Compare metadata between two files:
-
-```bash
-hiraco metadata-diff source.orf output.dng
-```
-
-Preview the metadata copy command that will be used after DNG generation:
-
-```bash
-hiraco copy-metadata source.orf output.dng --dry-run
-```
-
-## Planned commands
-
-- `hiraco doctor` validates the local environment and optionally checks current upstream releases.
-- `hiraco build-native` configures and builds the native helper with Adobe DNG SDK support, including bundled libjxl support for JPEG XL output.
-- `hiraco convert ...` requests DNG `1.6.0.0` compatibility for `uncompressed` and `deflate`, or experimental DNG `1.7.1.0` compatibility for `jpeg-xl`, then runs ExifTool metadata copy from the source file without overriding the SDK-written version tags.
-- Automatic metadata copy during `hiraco convert` preserves EXIF, IPTC, and XMP, but intentionally skips MakerNotes because raw-camera white-balance and vendor processing tags can corrupt rendered linear DNG color.
-- The current converter writes rendered linear RGB DNG, not mosaic/raw DNG. That means color should stay stable across viewers, but some raw editors may present it more like a high-bit-depth rendered image than a fully editable camera-raw file.
-- Rendered DNG output is normalized to a generic `hiraco` camera identity after metadata copy so raw editors do not apply OM SYSTEM camera profiles to already rendered pixels.
-- `hiraco inspect` summarizes raw structure and metadata for an input file.
-- `hiraco probe-native` shows native LibRaw decode support and camera metadata for an input file.
-- `hiraco metadata-diff` compares metadata between source and destination files.
-- `hiraco copy-metadata` applies ExifTool-based metadata transfer with a policy focused on EXIF, IPTC, XMP, and optional MakerNotes.
 
 ## Repository notes
 
 - Adobe DNG SDK is required for the full DNG writer, but it is not included in this repository and must be copied in manually from Adobe's distribution.
 - The expected default local path is `dng_sdk_1_7_1/`, or you can override it with `HIRACO_DNG_SDK_ROOT` during CMake configure.
+- Automatic metadata copy during `hiraco convert` preserves EXIF, IPTC, and XMP, but intentionally skips MakerNotes because raw-camera white-balance and vendor processing tags can corrupt rendered linear DNG color.
+- The current converter writes rendered linear RGB DNG, not mosaic/raw DNG. That means color should stay stable across viewers, but some raw editors may present it more like a high-bit-depth rendered image than a fully editable camera-raw file.
+- Rendered DNG output is normalized to a generic `hiraco` camera identity after metadata copy so raw editors do not apply OM SYSTEM camera profiles to already rendered pixels.

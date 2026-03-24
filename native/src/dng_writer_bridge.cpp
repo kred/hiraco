@@ -186,6 +186,25 @@ bool ShouldApplyOm3SourceDrivenLinearTransform(const SourceLinearDngMetadata& me
   return is_high_res || is_standard_20mp;
 }
 
+bool IsOm3HighResRaster(const SourceLinearDngMetadata& metadata,
+                       const RasterImage& image) {
+  return metadata.model == "OM-3" &&
+         metadata.default_crop_origin_h == 6 &&
+         metadata.default_crop_origin_v == 6 &&
+         metadata.default_crop_width == 8160 &&
+         metadata.default_crop_height == 6120 &&
+         image.width == 8172 &&
+         image.height == 6132 &&
+         image.colors == 3;
+}
+
+bool ShouldApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
+                                    const RasterImage& image) {
+  return metadata.has_predicted_detail_gain &&
+         metadata.predicted_detail_gain > 1.0001 &&
+         IsOm3HighResRaster(metadata, image);
+}
+
 bool ShouldUseOm3AdobeMetadata(const SourceLinearDngMetadata& metadata,
                                const RasterImage& image) {
   if (metadata.model != "OM-3" || !metadata.has_black_level || !metadata.has_as_shot_neutral) {
@@ -222,6 +241,111 @@ void ApplyLinearDngRasterTransform(const SourceLinearDngMetadata& metadata,
     }
   }
 }
+
+void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
+                              RasterImage* image) {
+  if (!ShouldApplyPredictedDetailGain(metadata, *image)) {
+    return;
+  }
+
+  // 7x7 separable Gaussian kernel approximating sigma=2.0 for effective
+  // high-pass detail extraction.  The 1D kernel is
+  // [1, 6, 15, 20, 15, 6, 1] / 64 — a two-fold iterated Pascal row that
+  // yields sigma ≈ sqrt(3/2) ≈ 1.73, close enough to 2.0 for our purposes.
+  // The 2D normaliser is 64*64 = 4096.
+
+  const double gain = std::clamp(metadata.predicted_detail_gain, 1.0, 5.0);
+  const uint32_t width = image->width;
+  const uint32_t height = image->height;
+  const uint32_t colors = image->colors;
+  const size_t row_stride = static_cast<size_t>(width) * colors;
+  
+  if (colors != 3) {
+    return;
+  }
+
+  constexpr int kRadius = 3;
+  constexpr int kKernelSize = 2 * kRadius + 1;
+  const double k1D[kKernelSize] = {1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0};
+  constexpr double kNorm = 4096.0;  // 64 * 64
+
+  std::vector<double> y_rows[kKernelSize];
+  for (int i = 0; i < kKernelSize; ++i) {
+    y_rows[i].assign(width, 0.0);
+  }
+
+  auto load_y_row = [&](uint32_t row_idx, std::vector<double>* y_buffer) {
+    const uint32_t clamped_row = std::min(row_idx, height - 1);
+    const size_t offset = static_cast<size_t>(clamped_row) * row_stride;
+    for (uint32_t col = 0; col < width; ++col) {
+      const size_t px_idx = offset + col * colors;
+      (*y_buffer)[col] = 0.299 * static_cast<double>(image->pixels[px_idx]) +
+                         0.587 * static_cast<double>(image->pixels[px_idx + 1]) +
+                         0.114 * static_cast<double>(image->pixels[px_idx + 2]);
+    }
+  };
+
+  // Pre-fill the row ring buffer.  For the very first row (row 0) the center
+  // sits at index kRadius.  Rows before the image are clamped to row 0.
+  for (int i = 0; i < kKernelSize; ++i) {
+    const int source_row = i - kRadius;  // may be negative
+    const uint32_t clamped = source_row < 0 ? 0u
+                             : (static_cast<uint32_t>(source_row) >= height
+                                    ? height - 1
+                                    : static_cast<uint32_t>(source_row));
+    load_y_row(clamped, &y_rows[i]);
+  }
+
+  for (uint32_t row = 0; row < height; ++row) {
+    const size_t output_row_offset = static_cast<size_t>(row) * row_stride;
+
+    for (uint32_t col = 0; col < width; ++col) {
+      // Compute column indices with clamped boundary handling.
+      uint32_t cols[kKernelSize];
+      for (int k = 0; k < kKernelSize; ++k) {
+        const int src_col = static_cast<int>(col) + k - kRadius;
+        cols[k] = src_col < 0 ? 0u
+                  : (static_cast<uint32_t>(src_col) >= width
+                         ? width - 1
+                         : static_cast<uint32_t>(src_col));
+      }
+
+      double blurred_y = 0.0;
+      for (int r = 0; r < kKernelSize; ++r) {
+        const auto& Y = y_rows[r];
+        double row_sum = 0.0;
+        for (int c = 0; c < kKernelSize; ++c) {
+          row_sum += k1D[c] * Y[cols[c]];
+        }
+        blurred_y += k1D[r] * row_sum;
+      }
+      blurred_y /= kNorm;
+
+      const double center_y = y_rows[kRadius][col];
+      const double luma_detail = center_y - blurred_y;
+      const double luma_offset = (gain - 1.0) * luma_detail;
+
+      for (uint32_t channel = 0; channel < colors; ++channel) {
+        const size_t px_idx = output_row_offset + static_cast<size_t>(col) * colors + channel;
+        const double source_value = static_cast<double>(image->pixels[px_idx]);
+        const double enhanced = source_value + luma_offset;
+        image->pixels[px_idx] = static_cast<uint16_t>(std::clamp(enhanced, 0.0, 65535.0));
+      }
+    }
+
+    if (row + 1 >= height) {
+      continue;
+    }
+
+    // Shift the ring buffer up by one row.
+    for (int i = 0; i < kKernelSize - 1; ++i) {
+      y_rows[i].swap(y_rows[i + 1]);
+    }
+    const uint32_t next_row = row + 1 + kRadius;
+    load_y_row(next_row < height ? next_row : height - 1, &y_rows[kKernelSize - 1]);
+  }
+}
+
 
 uint32_t DngVersionForCompression(const std::string& compression) {
   if (compression == "jpeg-xl") {
@@ -443,11 +567,6 @@ void AttachLinearSrgbProfile(dng_negative& negative) {
       0.0193339, 0.1191920, 0.9503041));
   negative.AddProfile(profile);
   negative.SetAsShotProfileName("hiraco-linear-srgb");
-
-  dng_vector camera_neutral(3);
-  camera_neutral.SetIdentity(3);
-  negative.SetCameraNeutral(camera_neutral);
-  negative.SetCameraWhiteXY(D65_xy_coord());
 }
 
 void AttachOm3AdobeLikeProfile(dng_negative& negative) {
@@ -493,8 +612,8 @@ void PopulateLinearRawNegative(dng_host& host,
                                const RasterImage& raw_image,
                                const SourceLinearDngMetadata& metadata,
                                dng_negative& negative) {
-  const std::string model_name = metadata.model.empty() ? std::string("linear-raw") : metadata.model;
-  const std::string local_name = metadata.unique_camera_model.empty() ? model_name : metadata.unique_camera_model;
+  const std::string model_name = metadata.unique_camera_model.empty() ? "hiraco" : metadata.unique_camera_model;
+  const std::string local_name = metadata.model.empty() ? "hiraco" : metadata.model;
 
   negative.SetModelName(model_name.c_str());
   negative.SetLocalName(local_name.c_str());
@@ -512,20 +631,33 @@ void PopulateLinearRawNegative(dng_host& host,
   negative.SetRawDefaultCrop();
   negative.SetRawDefaultScale();
   negative.SetRawBestQualityScale();
-  negative.SetBlackLevel(ShouldUseOm3AdobeMetadata(metadata, raw_image) ? metadata.black_level : 0.0);
+  if (ShouldApplyOm3SourceDrivenLinearTransform(metadata, raw_image) && metadata.has_black_level) {
+    negative.SetBlackLevel(metadata.black_level);
+  } else {
+    negative.SetBlackLevel(0.0);
+  }
   negative.SetWhiteLevel((1u << raw_image.bits) - 1);
-  negative.SetBaselineExposure(0.0);
+  if (ShouldApplyOm3SourceDrivenLinearTransform(metadata, raw_image) && metadata.has_black_level) {
+    negative.SetBaselineExposure(0.37);
+  } else {
+    negative.SetBaselineExposure(0.0);
+  }
   negative.SetLinearResponseLimit(1.0);
   negative.UpdateDateTimeToNow();
 
   dng_vector analog_balance(raw_image.colors);
   analog_balance.SetIdentity(raw_image.colors);
   negative.SetAnalogBalance(analog_balance);
+
   if (ShouldUseOm3AdobeMetadata(metadata, raw_image)) {
     AttachOm3AdobeLikeProfile(negative);
     SetSourceCameraNeutral(metadata, negative);
   } else {
     AttachLinearSrgbProfile(negative);
+    dng_vector camera_neutral(3);
+    camera_neutral.SetIdentity(3);
+    negative.SetCameraNeutral(camera_neutral);
+    negative.SetCameraWhiteXY(D50_xy_coord());
   }
 
   AutoPtr<dng_image> image = MakeUint16Image(host, raw_image);
@@ -595,6 +727,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       return result;
     }
 
+    ApplyPredictedDetailGain(metadata, &payload.raw_image);
     ApplyLinearDngRasterTransform(metadata, &payload.raw_image);
 
     PreviewImage preview_image = BuildPreviewImage(payload.rendered_preview_source, 1024);

@@ -2,6 +2,7 @@
 #include "dng_writer_bridge.h"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <libraw/libraw.h>
 #include <regex>
@@ -57,11 +58,21 @@ struct DecodeSummary {
   unsigned raw_processing_options = 0;
 };
 
+struct AnalysisSummary {
+  bool wrote_mosaic = false;
+  bool wrote_cfa_index = false;
+  bool wrote_crop_geometry = false;
+  std::string mosaic_path;
+  std::string cfa_index_path;
+  std::string crop_geometry_path;
+};
+
 std::string BuildDecodeSummaryJson(const DecodeSummary& summary);
 std::string BuildDngSdkSummaryJson(const DngSdkSupportSummary& summary);
 std::string BuildDngWriterConfigJson(const DngWriterConfigSummary& summary);
 std::string BuildDngWriterRuntimeJson(const DngWriterRuntimeSummary& summary);
 std::string BuildJsonStringArray(const std::vector<std::string>& values);
+std::string BuildAnalysisSummaryJson(const AnalysisSummary& summary);
 
 std::vector<std::string> CollectLibRawRuntimeCapabilities() {
   std::vector<std::string> capabilities;
@@ -247,6 +258,9 @@ SourceLinearDngMetadata ParseSourceLinearDngMetadata(const std::string& request_
       FindJsonDouble(request_json, "linear_dng_color_matrix_21", &metadata.color_matrix1[7]) &&
       FindJsonDouble(request_json, "linear_dng_color_matrix_22", &metadata.color_matrix1[8]);
 
+  metadata.has_predicted_detail_gain =
+      FindJsonDouble(request_json, "predicted_detail_gain", &metadata.predicted_detail_gain);
+
   unsigned crop_left = 0;
   unsigned crop_top = 0;
   unsigned crop_width = 0;
@@ -266,9 +280,79 @@ SourceLinearDngMetadata ParseSourceLinearDngMetadata(const std::string& request_
 
 int PrintUsage() {
   std::cerr << "usage: hiraco-native convert --request-json <json>\n";
+  std::cerr << "       hiraco-native analyze --request-json <json>\n";
   std::cerr << "       hiraco-native probe --source <path>\n";
   std::cerr << "       hiraco-native selftest-write --output <path> [--compression uncompressed|deflate|jpeg-xl]\n";
   return 2;
+}
+
+bool EnsureParentDirectoryExists(const std::string& output_path, std::string* error_message) {
+  const std::filesystem::path path(output_path);
+  const std::filesystem::path parent = path.parent_path();
+  if (parent.empty()) {
+    return true;
+  }
+
+  std::error_code error;
+  if (std::filesystem::exists(parent, error)) {
+    return true;
+  }
+
+  if (std::filesystem::create_directories(parent, error)) {
+    return true;
+  }
+
+  if (std::filesystem::exists(parent, error)) {
+    return true;
+  }
+
+  *error_message = std::string("failed to create parent directory for output: ") + output_path;
+  return false;
+}
+
+bool WriteBinaryFile(const std::string& output_path,
+                    const void* data,
+                    size_t size_bytes,
+                    std::string* error_message) {
+  if (!EnsureParentDirectoryExists(output_path, error_message)) {
+    return false;
+  }
+
+  std::ofstream stream(output_path, std::ios::binary | std::ios::trunc);
+  if (!stream) {
+    *error_message = std::string("failed to open output file for writing: ") + output_path;
+    return false;
+  }
+
+  stream.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size_bytes));
+  if (!stream.good()) {
+    *error_message = std::string("failed to write output file: ") + output_path;
+    return false;
+  }
+
+  return true;
+}
+
+bool WriteTextFile(const std::string& output_path,
+                   const std::string& contents,
+                   std::string* error_message) {
+  if (!EnsureParentDirectoryExists(output_path, error_message)) {
+    return false;
+  }
+
+  std::ofstream stream(output_path, std::ios::binary | std::ios::trunc);
+  if (!stream) {
+    *error_message = std::string("failed to open output file for writing: ") + output_path;
+    return false;
+  }
+
+  stream.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+  if (!stream.good()) {
+    *error_message = std::string("failed to write output file: ") + output_path;
+    return false;
+  }
+
+  return true;
 }
 
 void PrintProbeJson(bool ok,
@@ -385,6 +469,23 @@ std::string BuildDngWriterRuntimeJson(const DngWriterRuntimeSummary& summary) {
   return output.str();
 }
 
+std::string BuildAnalysisSummaryJson(const AnalysisSummary& summary) {
+  std::ostringstream output;
+  output
+      << "{\n"
+      << "      \"cfa_index_path\": "
+      << (summary.cfa_index_path.empty() ? "null" : "\"" + JsonEscape(summary.cfa_index_path) + "\"") << ",\n"
+      << "      \"crop_geometry_path\": "
+      << (summary.crop_geometry_path.empty() ? "null" : "\"" + JsonEscape(summary.crop_geometry_path) + "\"") << ",\n"
+      << "      \"mosaic_path\": "
+      << (summary.mosaic_path.empty() ? "null" : "\"" + JsonEscape(summary.mosaic_path) + "\"") << ",\n"
+      << "      \"wrote_cfa_index\": " << (summary.wrote_cfa_index ? "true" : "false") << ",\n"
+      << "      \"wrote_crop_geometry\": " << (summary.wrote_crop_geometry ? "true" : "false") << ",\n"
+      << "      \"wrote_mosaic\": " << (summary.wrote_mosaic ? "true" : "false") << "\n"
+      << "    }";
+  return output.str();
+}
+
 bool DecodeWithLibRaw(const std::string& source_path,
                       DecodeSummary* summary,
                       std::string* error_message,
@@ -485,6 +586,156 @@ bool DecodeWithLibRaw(const std::string& source_path,
 
   processor.recycle();
   return true;
+}
+
+std::string BuildCropGeometryJson(const std::string& source_path,
+                                  const DecodeSummary& summary) {
+  std::ostringstream output;
+  output
+      << "{\n"
+      << "  \"source_path\": \"" << JsonEscape(source_path) << "\",\n"
+  << "  \"camera_make\": \"" << JsonEscape(summary.camera_make) << "\",\n"
+  << "  \"camera_model\": \"" << JsonEscape(summary.camera_model) << "\",\n"
+  << "  \"normalized_make\": \"" << JsonEscape(summary.normalized_make) << "\",\n"
+  << "  \"normalized_model\": \"" << JsonEscape(summary.normalized_model) << "\",\n"
+      << "  \"raw_width\": " << summary.raw_width << ",\n"
+      << "  \"raw_height\": " << summary.raw_height << ",\n"
+      << "  \"image_width\": " << summary.image_width << ",\n"
+      << "  \"image_height\": " << summary.image_height << ",\n"
+      << "  \"left_margin\": " << summary.left_margin << ",\n"
+      << "  \"top_margin\": " << summary.top_margin << ",\n"
+      << "  \"active_area\": ["
+      << summary.top_margin << ", "
+      << summary.left_margin << ", "
+      << (summary.top_margin + summary.image_height) << ", "
+      << (summary.left_margin + summary.image_width) << "],\n"
+      << "  \"inset_crops\": [\n"
+      << "    {\"index\": 0, \"left\": " << summary.inset_crop_0_left
+      << ", \"top\": " << summary.inset_crop_0_top
+      << ", \"width\": " << summary.inset_crop_0_width
+      << ", \"height\": " << summary.inset_crop_0_height << "},\n"
+      << "    {\"index\": 1, \"left\": " << summary.inset_crop_1_left
+      << ", \"top\": " << summary.inset_crop_1_top
+      << ", \"width\": " << summary.inset_crop_1_width
+      << ", \"height\": " << summary.inset_crop_1_height << "}\n"
+      << "  ],\n"
+      << "  \"selected_inset_crop_index\": " << summary.inset_crop_applied_index << ",\n"
+      << "  \"black_level\": " << summary.black_level << ",\n"
+      << "  \"white_level\": " << summary.white_level << ",\n"
+      << "  \"linear_maximum\": ["
+      << summary.linear_maximum_0 << ", "
+      << summary.linear_maximum_1 << ", "
+      << summary.linear_maximum_2 << ", "
+      << summary.linear_maximum_3 << "],\n"
+      << "  \"filters\": " << summary.filters << ",\n"
+      << "  \"colors\": " << summary.colors << ",\n"
+      << "  \"color_description\": \"" << JsonEscape(summary.color_description) << "\",\n"
+      << "  \"mosaic_dump_format\": {\"dtype\": \"uint16_le\", \"layout\": \"raw_width_by_raw_height\"},\n"
+      << "  \"cfa_index_dump_format\": {\"dtype\": \"uint8\", \"layout\": \"raw_width_by_raw_height\", \"channels\": \"0=R,1=G,2=B,3=G2_or_alt\"}\n"
+      << "}\n";
+  return output.str();
+}
+
+bool RunAnalysisWithLibRaw(const std::string& source_path,
+                           const std::string& dump_mosaic_path,
+                           const std::string& dump_cfa_index_path,
+                           const std::string& dump_crop_geometry_path,
+                           const DecodeSummary& decode_summary,
+                           AnalysisSummary* analysis_summary,
+                           std::string* error_message) {
+  if (!dump_crop_geometry_path.empty()) {
+    const std::string crop_geometry_json = BuildCropGeometryJson(source_path, decode_summary);
+    if (!WriteTextFile(dump_crop_geometry_path, crop_geometry_json, error_message)) {
+      return false;
+    }
+    analysis_summary->wrote_crop_geometry = true;
+    analysis_summary->crop_geometry_path = dump_crop_geometry_path;
+  }
+
+  if (dump_mosaic_path.empty() && dump_cfa_index_path.empty()) {
+    return true;
+  }
+
+  LibRaw processor;
+  int result = processor.open_file(source_path.c_str());
+  if (result != LIBRAW_SUCCESS) {
+    *error_message = std::string("LibRaw open_file failed: ") + libraw_strerror(result);
+    return false;
+  }
+
+  result = processor.unpack();
+  if (result != LIBRAW_SUCCESS) {
+    *error_message = std::string("LibRaw unpack failed: ") + libraw_strerror(result);
+    processor.recycle();
+    return false;
+  }
+
+  const ushort* raw_image = processor.imgdata.rawdata.raw_image;
+  if (raw_image == nullptr) {
+    *error_message = "LibRaw unpack did not expose a Bayer raw_image buffer";
+    processor.recycle();
+    return false;
+  }
+
+  const size_t pixel_count = static_cast<size_t>(processor.imgdata.sizes.raw_width) *
+                             static_cast<size_t>(processor.imgdata.sizes.raw_height);
+
+  if (!dump_mosaic_path.empty()) {
+    if (!WriteBinaryFile(dump_mosaic_path,
+                         raw_image,
+                         pixel_count * sizeof(uint16_t),
+                         error_message)) {
+      processor.recycle();
+      return false;
+    }
+    analysis_summary->wrote_mosaic = true;
+    analysis_summary->mosaic_path = dump_mosaic_path;
+  }
+
+  if (!dump_cfa_index_path.empty()) {
+    std::vector<uint8_t> cfa_index(pixel_count);
+    for (unsigned row = 0; row < processor.imgdata.sizes.raw_height; ++row) {
+      for (unsigned col = 0; col < processor.imgdata.sizes.raw_width; ++col) {
+        const size_t index = static_cast<size_t>(row) * processor.imgdata.sizes.raw_width + col;
+        cfa_index[index] = static_cast<uint8_t>(processor.COLOR(row, col));
+      }
+    }
+
+    if (!WriteBinaryFile(dump_cfa_index_path,
+                         cfa_index.data(),
+                         cfa_index.size() * sizeof(uint8_t),
+                         error_message)) {
+      processor.recycle();
+      return false;
+    }
+    analysis_summary->wrote_cfa_index = true;
+    analysis_summary->cfa_index_path = dump_cfa_index_path;
+  }
+
+  processor.recycle();
+  return true;
+}
+
+void PrintAnalyzeJson(bool ok,
+                      const std::string& message,
+                      const std::string& source_path,
+                      bool source_exists,
+                      const DecodeSummary* decode_summary,
+                      const AnalysisSummary* analysis_summary) {
+  std::cout
+      << "{\n"
+      << "  \"diagnostics\": {\n"
+      << "    \"analysis_outputs\": "
+      << (analysis_summary ? BuildAnalysisSummaryJson(*analysis_summary) : "null") << ",\n"
+      << "    \"decode_summary\": "
+      << (decode_summary ? BuildDecodeSummaryJson(*decode_summary) : "null") << ",\n"
+      << "    \"source_exists\": " << (source_exists ? "true" : "false") << ",\n"
+      << "    \"source_path\": \"" << JsonEscape(source_path) << "\",\n"
+      << "    \"stage\": \"native-analyze\"\n"
+      << "  },\n"
+      << "  \"message\": \"" << JsonEscape(message) << "\",\n"
+      << "  \"ok\": " << (ok ? "true" : "false") << "\n"
+      << "}\n";
 }
 
 void PrintJsonFailure(const std::string& message,
@@ -629,6 +880,73 @@ int main(int argc, char** argv) {
                      std::filesystem::exists(output_path),
                      nullptr);
     return 1;
+  }
+
+  if (command == "analyze") {
+    if (argc != 4 || std::string(argv[2]) != "--request-json") {
+      return PrintUsage();
+    }
+
+    const std::string request_json = argv[3];
+    if (request_json.empty()) {
+      PrintAnalyzeJson(false, "request payload is empty", {}, false, nullptr, nullptr);
+      return 1;
+    }
+
+    const std::string source_path = FindJsonString(request_json, "source_path");
+    const std::string dump_mosaic_path = FindJsonString(request_json, "dump_mosaic_path");
+    const std::string dump_cfa_index_path = FindJsonString(request_json, "dump_cfa_index_path");
+    const std::string dump_crop_geometry_path = FindJsonString(request_json, "dump_crop_geometry_path");
+
+    if (source_path.empty()) {
+      PrintAnalyzeJson(false, "source_path is missing from request", {}, false, nullptr, nullptr);
+      return 1;
+    }
+
+    const bool source_exists = std::filesystem::exists(source_path);
+    if (!source_exists) {
+      PrintAnalyzeJson(false, "source file does not exist", source_path, source_exists, nullptr, nullptr);
+      return 1;
+    }
+
+    DecodeSummary decode_summary;
+    std::string decode_error;
+    bool has_decode_summary = false;
+    if (!DecodeWithLibRaw(source_path, &decode_summary, &decode_error, &has_decode_summary)) {
+      PrintAnalyzeJson(false,
+                       decode_error,
+                       source_path,
+                       source_exists,
+                       has_decode_summary ? &decode_summary : nullptr,
+                       nullptr);
+      return 1;
+    }
+
+    AnalysisSummary analysis_summary;
+    std::string analysis_error;
+    if (!RunAnalysisWithLibRaw(source_path,
+                               dump_mosaic_path,
+                               dump_cfa_index_path,
+                               dump_crop_geometry_path,
+                               decode_summary,
+                               &analysis_summary,
+                               &analysis_error)) {
+      PrintAnalyzeJson(false,
+                       analysis_error,
+                       source_path,
+                       source_exists,
+                       &decode_summary,
+                       &analysis_summary);
+      return 1;
+    }
+
+    PrintAnalyzeJson(true,
+                     "native analysis succeeded",
+                     source_path,
+                     source_exists,
+                     &decode_summary,
+                     &analysis_summary);
+    return 0;
   }
 
   if (command != "convert") {

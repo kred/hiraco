@@ -16,14 +16,16 @@ class ConversionRequest:
     preserve_all_metadata: bool = True
     validate_output: bool = True
     source_info: dict[str, Any] | None = None
+    predicted_detail_gain: float | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["source_path"] = str(self.source_path)
         payload["output_path"] = str(self.output_path)
         payload["compression"] = self.compression.value
+        if self.predicted_detail_gain is not None:
+            payload["predicted_detail_gain"] = float(self.predicted_detail_gain)
         return payload
-
 
 @dataclass(frozen=True)
 class NativeHelperResult:

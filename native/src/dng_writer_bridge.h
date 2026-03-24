@@ -29,6 +29,8 @@ struct SourceLinearDngMetadata {
   double as_shot_neutral[3] = {1.0, 1.0, 1.0};
   bool has_color_matrix1 = false;
   double color_matrix1[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  bool has_predicted_detail_gain = false;
+  double predicted_detail_gain = 1.0;
   bool has_default_crop = false;
   uint32_t default_crop_origin_h = 0;
   uint32_t default_crop_origin_v = 0;
