@@ -17,8 +17,10 @@
 #include "dng_xy_coord.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fftw3.h>
 #include <libraw/libraw.h>
 #include <memory>
 #include <string>
@@ -45,6 +47,7 @@ struct PreviewImage {
 struct LinearDngPayload {
   RasterImage raw_image;
   RasterImage rendered_preview_source;
+  RasterImage cfa_guide_image;
 };
 
 struct RenderSettings {
@@ -130,9 +133,9 @@ RenderSettings BuildRawRenderSettings(const SourceLinearDngMetadata& metadata) {
   settings.gamma_slope = 1.0f;
 
   if (IsOm3HighResMetadata(metadata)) {
-    settings.user_qual = 11;
-    settings.four_color_rgb = 1;
-    settings.green_matching = 1;
+    settings.user_qual = 12;
+    settings.four_color_rgb = 0;
+    settings.green_matching = 0;
   }
 
   ApplyLibRawEnvironmentOverrides(&settings);
@@ -156,13 +159,17 @@ RenderSettings BuildPreviewRenderSettings(const SourceLinearDngMetadata& metadat
   settings.gamma_slope = 4.5f;
 
   if (IsOm3HighResMetadata(metadata)) {
-    settings.user_qual = 11;
-    settings.four_color_rgb = 1;
-    settings.green_matching = 1;
+    settings.user_qual = 12;
+    settings.four_color_rgb = 0;
+    settings.green_matching = 0;
   }
 
   ApplyLibRawEnvironmentOverrides(&settings);
   return settings;
+}
+
+RenderSettings BuildCfaGuideRenderSettings(const SourceLinearDngMetadata& metadata) {
+  return BuildRawRenderSettings(metadata);
 }
 
 bool ShouldApplyOm3SourceDrivenLinearTransform(const SourceLinearDngMetadata& metadata,
@@ -243,106 +250,491 @@ void ApplyLinearDngRasterTransform(const SourceLinearDngMetadata& metadata,
 }
 
 void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
+                              const RasterImage* cfa_guide_image,
                               RasterImage* image) {
   if (!ShouldApplyPredictedDetailGain(metadata, *image)) {
     return;
   }
 
-  // 7x7 separable Gaussian kernel approximating sigma=2.0 for effective
-  // high-pass detail extraction.  The 1D kernel is
-  // [1, 6, 15, 20, 15, 6, 1] / 64 — a two-fold iterated Pascal row that
-  // yields sigma ≈ sqrt(3/2) ≈ 1.73, close enough to 2.0 for our purposes.
-  // The 2D normaliser is 64*64 = 4096.
-
-  const double gain = std::clamp(metadata.predicted_detail_gain, 1.0, 5.0);
+  const double base_gain = std::clamp(metadata.predicted_detail_gain, 1.0, 5.0);
   const uint32_t width = image->width;
   const uint32_t height = image->height;
   const uint32_t colors = image->colors;
-  const size_t row_stride = static_cast<size_t>(width) * colors;
-  
+  const size_t pixel_count = static_cast<size_t>(width) * height;
+
   if (colors != 3) {
     return;
   }
 
-  constexpr int kRadius = 3;
-  constexpr int kKernelSize = 2 * kRadius + 1;
-  const double k1D[kKernelSize] = {1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0};
-  constexpr double kNorm = 4096.0;  // 64 * 64
+  // BT.709 luma coefficients for linear light.
+  constexpr double kLumaR = 0.2126;
+  constexpr double kLumaG = 0.7152;
+  constexpr double kLumaB = 0.0722;
 
-  std::vector<double> y_rows[kKernelSize];
-  for (int i = 0; i < kKernelSize; ++i) {
-    y_rows[i].assign(width, 0.0);
+  // --- Stage 0: Extract luma channel (BT.709) ---
+  std::vector<double> luma(pixel_count);
+  for (size_t i = 0; i < pixel_count; ++i) {
+    const size_t px = i * colors;
+    luma[i] = kLumaR * image->pixels[px] +
+              kLumaG * image->pixels[px + 1] +
+              kLumaB * image->pixels[px + 2];
   }
 
-  auto load_y_row = [&](uint32_t row_idx, std::vector<double>* y_buffer) {
-    const uint32_t clamped_row = std::min(row_idx, height - 1);
-    const size_t offset = static_cast<size_t>(clamped_row) * row_stride;
-    for (uint32_t col = 0; col < width; ++col) {
-      const size_t px_idx = offset + col * colors;
-      (*y_buffer)[col] = 0.299 * static_cast<double>(image->pixels[px_idx]) +
-                         0.587 * static_cast<double>(image->pixels[px_idx + 1]) +
-                         0.114 * static_cast<double>(image->pixels[px_idx + 2]);
-    }
-  };
+  // Keep a copy of the original luma for ratio transfer.
+  std::vector<double> original_luma(luma);
 
-  // Pre-fill the row ring buffer.  For the very first row (row 0) the center
-  // sits at index kRadius.  Rows before the image are clamped to row 0.
-  for (int i = 0; i < kKernelSize; ++i) {
-    const int source_row = i - kRadius;  // may be negative
-    const uint32_t clamped = source_row < 0 ? 0u
-                             : (static_cast<uint32_t>(source_row) >= height
-                                    ? height - 1
-                                    : static_cast<uint32_t>(source_row));
-    load_y_row(clamped, &y_rows[i]);
-  }
-
-  for (uint32_t row = 0; row < height; ++row) {
-    const size_t output_row_offset = static_cast<size_t>(row) * row_stride;
-
-    for (uint32_t col = 0; col < width; ++col) {
-      // Compute column indices with clamped boundary handling.
-      uint32_t cols[kKernelSize];
-      for (int k = 0; k < kKernelSize; ++k) {
-        const int src_col = static_cast<int>(col) + k - kRadius;
-        cols[k] = src_col < 0 ? 0u
-                  : (static_cast<uint32_t>(src_col) >= width
-                         ? width - 1
-                         : static_cast<uint32_t>(src_col));
-      }
-
-      double blurred_y = 0.0;
-      for (int r = 0; r < kKernelSize; ++r) {
-        const auto& Y = y_rows[r];
-        double row_sum = 0.0;
-        for (int c = 0; c < kKernelSize; ++c) {
-          row_sum += k1D[c] * Y[cols[c]];
+  std::vector<double> confidence(pixel_count, 1.0);
+  if (cfa_guide_image != nullptr &&
+      cfa_guide_image->width == width &&
+      cfa_guide_image->height == height &&
+      cfa_guide_image->colors == 4) {
+    auto blur3 = [&](const std::vector<double>& src, std::vector<double>& dst) {
+      std::vector<double> tmp(pixel_count);
+      for (uint32_t row = 0; row < height; ++row) {
+        const size_t row_off = static_cast<size_t>(row) * width;
+        for (uint32_t col = 0; col < width; ++col) {
+          const uint32_t c0 = (col > 0) ? col - 1 : 0;
+          const uint32_t c2 = (col + 1 < width) ? col + 1 : width - 1;
+          tmp[row_off + col] = 0.25 * src[row_off + c0] +
+                               0.50 * src[row_off + col] +
+                               0.25 * src[row_off + c2];
         }
-        blurred_y += k1D[r] * row_sum;
       }
-      blurred_y /= kNorm;
 
-      const double center_y = y_rows[kRadius][col];
-      const double luma_detail = center_y - blurred_y;
-      const double luma_offset = (gain - 1.0) * luma_detail;
+      for (uint32_t col = 0; col < width; ++col) {
+        for (uint32_t row = 0; row < height; ++row) {
+          const uint32_t r0 = (row > 0) ? row - 1 : 0;
+          const uint32_t r2 = (row + 1 < height) ? row + 1 : height - 1;
+          const size_t idx = static_cast<size_t>(row) * width + col;
+          dst[idx] = 0.25 * tmp[static_cast<size_t>(r0) * width + col] +
+                     0.50 * tmp[idx] +
+                     0.25 * tmp[static_cast<size_t>(r2) * width + col];
+        }
+      }
+    };
 
-      for (uint32_t channel = 0; channel < colors; ++channel) {
-        const size_t px_idx = output_row_offset + static_cast<size_t>(col) * colors + channel;
-        const double source_value = static_cast<double>(image->pixels[px_idx]);
-        const double enhanced = source_value + luma_offset;
-        image->pixels[px_idx] = static_cast<uint16_t>(std::clamp(enhanced, 0.0, 65535.0));
+    std::vector<double> green_split(pixel_count);
+    std::vector<double> green_mean(pixel_count);
+    for (size_t i = 0; i < pixel_count; ++i) {
+      const size_t px = i * cfa_guide_image->colors;
+      const double green_a = cfa_guide_image->pixels[px + 1];
+      const double green_b = cfa_guide_image->pixels[px + 3];
+      green_split[i] = std::abs(green_a - green_b);
+      green_mean[i] = 0.5 * (green_a + green_b);
+    }
+
+    std::vector<double> smooth_split(pixel_count);
+    std::vector<double> smooth_green(pixel_count);
+    blur3(green_split, smooth_split);
+    blur3(green_mean, smooth_green);
+
+    std::vector<double> green_residual(pixel_count);
+    for (size_t i = 0; i < pixel_count; ++i) {
+      const double split_hp = std::max(green_split[i] - smooth_split[i], 0.0);
+      const double texture_scale = std::max(smooth_green[i], 256.0);
+      green_residual[i] = split_hp / texture_scale;
+    }
+
+    std::vector<double> sorted_residual(green_residual);
+    std::nth_element(sorted_residual.begin(),
+                     sorted_residual.begin() + pixel_count / 2,
+                     sorted_residual.end());
+    const double median_residual = sorted_residual[pixel_count / 2];
+    const double residual_scale = std::max(8.0 * median_residual, 0.0035);
+
+    for (size_t i = 0; i < pixel_count; ++i) {
+      const double norm = green_residual[i] / residual_scale;
+      const double atten = std::exp(-(norm * norm));
+      confidence[i] = std::clamp(atten, 0.15, 1.0);
+    }
+
+    // Suppress single-pixel mask speckle.
+    std::vector<double> smooth_conf(pixel_count);
+    blur3(confidence, smooth_conf);
+    blur3(smooth_conf, confidence);
+  }
+
+  // --- Stage 1: Wiener deconvolution (FFT-based) ---
+  // The sensor-shift composite has a near-Gaussian PSF with no frequency-
+  // domain zeros, making Wiener deconvolution well-posed.
+  // Uses mirror/reflection padding to avoid boundary discontinuities that
+  // produce periodic stipple artifacts with zero-padding.
+  {
+    const double psf_sigma = 1.0;
+    const double nsr = 0.004;
+
+    // Mirror-pad margins — enough to cover the PSF support and avoid
+    // wrap-around artefacts.  32 px border is ample for σ ≤ 2.
+    constexpr uint32_t kPadMargin = 32;
+    const uint32_t padded_w = width + 2 * kPadMargin;
+    const uint32_t padded_h = height + 2 * kPadMargin;
+
+    // Round up to efficient FFT size (next power of 2).
+    uint32_t fft_w = 1;
+    while (fft_w < padded_w) fft_w <<= 1;
+    uint32_t fft_h = 1;
+    while (fft_h < padded_h) fft_h <<= 1;
+
+    const size_t fft_n = static_cast<size_t>(fft_w) * fft_h;
+    const size_t complex_n = static_cast<size_t>(fft_h) * (fft_w / 2 + 1);
+
+    double* fft_in = fftw_alloc_real(fft_n);
+    fftw_complex* fft_out = fftw_alloc_complex(complex_n);
+
+    if (fft_in && fft_out) {
+      // Fill the padded buffer using reflection at the image boundaries.
+      std::fill(fft_in, fft_in + fft_n, 0.0);
+      for (uint32_t pr = 0; pr < padded_h; ++pr) {
+        // Reflect row index into [0, height-1].
+        int sr = static_cast<int>(pr) - static_cast<int>(kPadMargin);
+        if (sr < 0) sr = -sr;
+        if (sr >= static_cast<int>(height)) sr = 2 * static_cast<int>(height) - 2 - sr;
+        sr = std::clamp(sr, 0, static_cast<int>(height) - 1);
+
+        const size_t dst_row = static_cast<size_t>(pr) * fft_w;
+        const size_t src_row = static_cast<size_t>(sr) * width;
+
+        for (uint32_t pc = 0; pc < padded_w; ++pc) {
+          int sc = static_cast<int>(pc) - static_cast<int>(kPadMargin);
+          if (sc < 0) sc = -sc;
+          if (sc >= static_cast<int>(width)) sc = 2 * static_cast<int>(width) - 2 - sc;
+          sc = std::clamp(sc, 0, static_cast<int>(width) - 1);
+
+          fft_in[dst_row + pc] = luma[src_row + sc];
+        }
+        // Remaining columns (padded_w..fft_w-1) stay zero — they are
+        // outside the reflected region but the FFT size may be larger.
+      }
+
+      fftw_plan plan_fwd = fftw_plan_dft_r2c_2d(
+          static_cast<int>(fft_h), static_cast<int>(fft_w),
+          fft_in, fft_out, FFTW_ESTIMATE);
+
+      if (plan_fwd) {
+        fftw_execute(plan_fwd);
+        fftw_destroy_plan(plan_fwd);
+
+        // Apply Wiener filter in frequency domain, combined with a CFA
+        // frequency notch to suppress Bayer pattern residual.
+        //
+        // The demosaiced green channel retains Gr/Gb residual at the CFA
+        // frequency (0.5 cycles/pixel in each axis).  Since luma is ~71%
+        // green, the Wiener gain would amplify this into a visible dotted
+        // pattern.  A narrow Gaussian notch at the three CFA frequencies
+        // — (0.5, 0), (0, 0.5), (0.5, 0.5) — kills the pattern while
+        // leaving all other frequencies untouched.
+        const double two_pi2_sigma2 = 2.0 * M_PI * M_PI * psf_sigma * psf_sigma;
+        const uint32_t half_w = fft_w / 2 + 1;
+
+        // CFA notch: Gaussian dip centered at normalized freq 0.5 in
+        // each axis.  σ_notch controls width; 0.04 ≈ ±4 % of Nyquist.
+        constexpr double kNotchSigma = 0.04;
+        constexpr double kNotchInvTwoSigma2 = 1.0 / (2.0 * kNotchSigma * kNotchSigma);
+
+        for (uint32_t row = 0; row < fft_h; ++row) {
+          double fy = static_cast<double>(row);
+          if (fy > fft_h / 2.0) fy -= fft_h;
+          fy /= fft_h;  // normalized: [-0.5, 0.5)
+
+          for (uint32_t col = 0; col < half_w; ++col) {
+            const double fx = static_cast<double>(col) / fft_w;
+
+            // Wiener filter for PSF deconvolution.
+            const double freq_sq = fx * fx + fy * fy;
+            const double H = std::exp(-two_pi2_sigma2 * freq_sq);
+            const double H2 = H * H;
+            const double wiener = H / (H2 + nsr);
+
+            // CFA notch: suppress (0.5,0), (0,0.5), (0.5,0.5).
+            const double dfx_half = fx - 0.5;
+            const double dfy_half = std::abs(fy) - 0.5;  // fy or -fy → both handled
+            const double notch_h  = std::exp(-(dfx_half * dfx_half) * kNotchInvTwoSigma2);  // near (0.5, 0)
+            const double notch_v  = std::exp(-(dfy_half * dfy_half) * kNotchInvTwoSigma2);  // near (0, 0.5)
+            const double notch_d  = std::exp(-(dfx_half * dfx_half + dfy_half * dfy_half) * kNotchInvTwoSigma2);  // near (0.5, 0.5)
+            // Combined notch: 1 − max(individual notches)
+            const double notch_atten = 1.0 - std::max({notch_h * (std::exp(-(fy * fy) * kNotchInvTwoSigma2)),
+                                                         notch_v * (std::exp(-(fx * fx) * kNotchInvTwoSigma2)),
+                                                         notch_d});
+            const double cfa_notch = std::max(notch_atten, 0.0);
+
+            const size_t idx = static_cast<size_t>(row) * half_w + col;
+            fft_out[idx][0] *= wiener * cfa_notch;
+            fft_out[idx][1] *= wiener * cfa_notch;
+          }
+        }
+
+        fftw_plan plan_inv = fftw_plan_dft_c2r_2d(
+            static_cast<int>(fft_h), static_cast<int>(fft_w),
+            fft_out, fft_in, FFTW_ESTIMATE);
+
+        if (plan_inv) {
+          fftw_execute(plan_inv);
+          fftw_destroy_plan(plan_inv);
+
+          // Extract the central (un-padded) region, normalised.
+          const double norm = 1.0 / static_cast<double>(fft_n);
+          for (uint32_t row = 0; row < height; ++row) {
+            const size_t src_offset =
+                static_cast<size_t>(row + kPadMargin) * fft_w + kPadMargin;
+            const size_t dst_offset = static_cast<size_t>(row) * width;
+            for (uint32_t col = 0; col < width; ++col) {
+              luma[dst_offset + col] = fft_in[src_offset + col] * norm;
+            }
+          }
+
+          for (size_t i = 0; i < pixel_count; ++i) {
+            luma[i] = original_luma[i] + confidence[i] * (luma[i] - original_luma[i]);
+          }
+        }
       }
     }
 
-    if (row + 1 >= height) {
-      continue;
+    if (fft_out) fftw_free(fft_out);
+    if (fft_in) fftw_free(fft_in);
+  }
+
+  // --- Stage 2: Multi-scale à trous wavelet detail enhancement ---
+  // Operates at full resolution at every scale using dilated B3-spline
+  // convolution.  Each scale captures a different frequency band and
+  // receives an independent gain.
+  {
+    constexpr int kNumScales = 4;
+    // Fine-scale gains — slightly reduced from v1 to avoid noise amplification.
+    const double scale_gains[kNumScales] = {1.4, 1.25, 1.1, 1.0};
+
+    // B3-spline 1D kernel: [1, 4, 6, 4, 1] / 16
+    constexpr int kHalf = 2;
+    constexpr double kKernel[5] = {1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0,
+                                   4.0 / 16.0, 1.0 / 16.0};
+
+    std::vector<double> approx_prev(luma);
+    std::vector<double> detail_accum(pixel_count, 0.0);
+    std::vector<double> h_pass(pixel_count);
+    std::vector<double> approx_cur(pixel_count);
+
+    for (int scale = 0; scale < kNumScales; ++scale) {
+      const int step = 1 << scale;  // dilation: 1, 2, 4, 8
+
+      // Horizontal pass.
+      for (uint32_t row = 0; row < height; ++row) {
+        const size_t row_off = static_cast<size_t>(row) * width;
+        for (uint32_t col = 0; col < width; ++col) {
+          double sum = 0.0;
+          for (int k = -kHalf; k <= kHalf; ++k) {
+            int sc = static_cast<int>(col) + k * step;
+            if (sc < 0) sc = 0;
+            if (sc >= static_cast<int>(width)) sc = static_cast<int>(width) - 1;
+            sum += kKernel[k + kHalf] * approx_prev[row_off + sc];
+          }
+          h_pass[row_off + col] = sum;
+        }
+      }
+
+      // Vertical pass.
+      for (uint32_t col = 0; col < width; ++col) {
+        for (uint32_t row = 0; row < height; ++row) {
+          double sum = 0.0;
+          for (int k = -kHalf; k <= kHalf; ++k) {
+            int sr = static_cast<int>(row) + k * step;
+            if (sr < 0) sr = 0;
+            if (sr >= static_cast<int>(height)) sr = static_cast<int>(height) - 1;
+            sum += kKernel[k + kHalf] * h_pass[static_cast<size_t>(sr) * width + col];
+          }
+          approx_cur[static_cast<size_t>(row) * width + col] = sum;
+        }
+      }
+
+      // Detail = previous_approx - current_approx.
+      // Apply soft noise thresholding (BayesShrink-style) at finest
+      // scales to suppress residual Wiener deconvolution noise.
+      const double extra_gain = scale_gains[scale] - 1.0;
+      if (extra_gain > 1e-6) {
+        // Estimate noise σ at this scale using robust MAD estimator.
+        // σ_noise ≈ median(|detail|) / 0.6745
+        std::vector<double> abs_details(pixel_count);
+        for (size_t i = 0; i < pixel_count; ++i) {
+          abs_details[i] = std::abs(approx_prev[i] - approx_cur[i]);
+        }
+        std::nth_element(abs_details.begin(),
+                         abs_details.begin() + pixel_count / 2,
+                         abs_details.end());
+        const double median_abs = abs_details[pixel_count / 2];
+        const double sigma_noise = median_abs / 0.6745;
+        // Soft threshold = σ²_noise / σ_signal
+        // with σ_signal estimated from the detail coefficients.
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < pixel_count; ++i) {
+          const double d = approx_prev[i] - approx_cur[i];
+          sum_sq += d * d;
+        }
+        const double sigma_sq_total =
+            sum_sq / static_cast<double>(pixel_count);
+        const double sigma_sq_noise = sigma_noise * sigma_noise;
+        const double sigma_sq_signal =
+            std::max(sigma_sq_total - sigma_sq_noise, 1e-10);
+        // Use 60% of BayesShrink threshold for gentler denoising that
+        // preserves more genuine detail.
+        const double threshold =
+            0.6 * sigma_sq_noise / std::sqrt(sigma_sq_signal);
+
+        for (size_t i = 0; i < pixel_count; ++i) {
+          double detail = approx_prev[i] - approx_cur[i];
+          // Soft-threshold: shrink toward zero.
+          if (detail > threshold)
+            detail -= threshold;
+          else if (detail < -threshold)
+            detail += threshold;
+          else
+            detail = 0.0;
+
+          detail_accum[i] += extra_gain * confidence[i] * detail;
+        }
+      }
+
+      approx_prev.swap(approx_cur);
     }
 
-    // Shift the ring buffer up by one row.
-    for (int i = 0; i < kKernelSize - 1; ++i) {
-      y_rows[i].swap(y_rows[i + 1]);
+    // Add accumulated wavelet detail to the (Wiener-deconvolved) luma.
+    for (size_t i = 0; i < pixel_count; ++i) {
+      luma[i] += detail_accum[i];
     }
-    const uint32_t next_row = row + 1 + kRadius;
-    load_y_row(next_row < height ? next_row : height - 1, &y_rows[kKernelSize - 1]);
+  }
+
+  // --- Stage 3: Guided-filter based edge-aware refinement ---
+  // Applies a final sharpening pass using a guided filter (self-guided)
+  // as the smoothing base, avoiding halos at strong edges.
+  {
+    constexpr int kGfRadius = 6;
+    constexpr double kGfEps = 0.001 * 65535.0 * 65535.0;
+    const double gf_gain = 0.35 * (base_gain - 1.0);
+
+    // Integral images for O(1)-per-pixel box filtering.
+    const size_t integral_w = static_cast<size_t>(width) + 1;
+    const size_t integral_h = static_cast<size_t>(height) + 1;
+    const size_t integral_n = integral_w * integral_h;
+
+    std::vector<double> sum_I(integral_n, 0.0);
+    std::vector<double> sum_II(integral_n, 0.0);
+
+    // Build integral images for luma (I) and I*I.
+    for (uint32_t row = 0; row < height; ++row) {
+      double row_sum_I = 0.0;
+      double row_sum_II = 0.0;
+      for (uint32_t col = 0; col < width; ++col) {
+        const double val = luma[static_cast<size_t>(row) * width + col];
+        row_sum_I += val;
+        row_sum_II += val * val;
+        const size_t idx = static_cast<size_t>(row + 1) * integral_w + (col + 1);
+        sum_I[idx] = row_sum_I + sum_I[idx - integral_w];
+        sum_II[idx] = row_sum_II + sum_II[idx - integral_w];
+      }
+    }
+
+    // Box-filter helper: sum over rect [r0..r1, c0..c1] inclusive.
+    auto box_sum = [&](const std::vector<double>& integral,
+                       int r0, int c0, int r1, int c1) -> double {
+      r0 = std::max(r0, 0);
+      c0 = std::max(c0, 0);
+      r1 = std::min(r1, static_cast<int>(height) - 1);
+      c1 = std::min(c1, static_cast<int>(width) - 1);
+      const size_t a = static_cast<size_t>(r1 + 1) * integral_w + (c1 + 1);
+      const size_t b = static_cast<size_t>(r0) * integral_w + (c1 + 1);
+      const size_t c = static_cast<size_t>(r1 + 1) * integral_w + c0;
+      const size_t d = static_cast<size_t>(r0) * integral_w + c0;
+      return integral[a] - integral[b] - integral[c] + integral[d];
+    };
+
+    // Compute guided-filter smoothed luma and apply residual gain.
+    std::vector<double> gf_a(pixel_count);
+    std::vector<double> gf_b(pixel_count);
+
+    for (uint32_t row = 0; row < height; ++row) {
+      for (uint32_t col = 0; col < width; ++col) {
+        const int r0 = static_cast<int>(row) - kGfRadius;
+        const int c0 = static_cast<int>(col) - kGfRadius;
+        const int r1 = static_cast<int>(row) + kGfRadius;
+        const int c1 = static_cast<int>(col) + kGfRadius;
+
+        const int cr0 = std::max(r0, 0);
+        const int cc0 = std::max(c0, 0);
+        const int cr1 = std::min(r1, static_cast<int>(height) - 1);
+        const int cc1 = std::min(c1, static_cast<int>(width) - 1);
+        const double count = static_cast<double>((cr1 - cr0 + 1)) * (cc1 - cc0 + 1);
+
+        const double mean_I = box_sum(sum_I, r0, c0, r1, c1) / count;
+        const double mean_II = box_sum(sum_II, r0, c0, r1, c1) / count;
+        const double var_I = mean_II - mean_I * mean_I;
+
+        const size_t idx = static_cast<size_t>(row) * width + col;
+        gf_a[idx] = var_I / (var_I + kGfEps);
+        gf_b[idx] = mean_I * (1.0 - gf_a[idx]);
+      }
+    }
+
+    // Build integral images for a and b to average them.
+    std::vector<double> sum_a(integral_n, 0.0);
+    std::vector<double> sum_b(integral_n, 0.0);
+    for (uint32_t row = 0; row < height; ++row) {
+      double rs_a = 0.0, rs_b = 0.0;
+      for (uint32_t col = 0; col < width; ++col) {
+        const size_t idx = static_cast<size_t>(row) * width + col;
+        rs_a += gf_a[idx];
+        rs_b += gf_b[idx];
+        const size_t ii = static_cast<size_t>(row + 1) * integral_w + (col + 1);
+        sum_a[ii] = rs_a + sum_a[ii - integral_w];
+        sum_b[ii] = rs_b + sum_b[ii - integral_w];
+      }
+    }
+
+    for (uint32_t row = 0; row < height; ++row) {
+      for (uint32_t col = 0; col < width; ++col) {
+        const int r0 = static_cast<int>(row) - kGfRadius;
+        const int c0 = static_cast<int>(col) - kGfRadius;
+        const int r1 = static_cast<int>(row) + kGfRadius;
+        const int c1 = static_cast<int>(col) + kGfRadius;
+
+        const int cr0 = std::max(r0, 0);
+        const int cc0 = std::max(c0, 0);
+        const int cr1 = std::min(r1, static_cast<int>(height) - 1);
+        const int cc1 = std::min(c1, static_cast<int>(width) - 1);
+        const double count = static_cast<double>((cr1 - cr0 + 1)) * (cc1 - cc0 + 1);
+
+        const double mean_a = box_sum(sum_a, r0, c0, r1, c1) / count;
+        const double mean_b = box_sum(sum_b, r0, c0, r1, c1) / count;
+
+        const size_t idx = static_cast<size_t>(row) * width + col;
+        const double smoothed = mean_a * luma[idx] + mean_b;
+        const double detail = luma[idx] - smoothed;
+
+        // Adaptive gain: more gain in textured areas (higher local variance),
+        // less in smooth areas; and intensity modulation for shadow boost.
+        const double intensity_factor = std::pow(
+            std::max(luma[idx], 1.0) / 65535.0, -0.3);
+        const double clamped_ifactor = std::clamp(intensity_factor, 0.5, 3.0);
+
+        luma[idx] += gf_gain * clamped_ifactor * confidence[idx] * detail;
+      }
+    }
+  }
+
+  // --- Stage 4: Multiplicative ratio transfer to RGB ---
+  // CFA residual has been suppressed in Stage 1 (frequency-domain notch),
+  // so the per-pixel ratio is clean.
+  constexpr double kMinLuma = 1.0;
+  constexpr double kMinRatio = 0.3;
+  constexpr double kMaxRatio = 4.0;
+
+  for (size_t i = 0; i < pixel_count; ++i) {
+    const double orig_y = std::max(original_luma[i], kMinLuma);
+    const double enhanced_y = std::max(luma[i], 0.0);
+    double ratio = enhanced_y / orig_y;
+    ratio = std::clamp(ratio, kMinRatio, kMaxRatio);
+
+    const size_t px = i * colors;
+    for (uint32_t ch = 0; ch < colors; ++ch) {
+      const double val = static_cast<double>(image->pixels[px + ch]) * ratio;
+      image->pixels[px + ch] = static_cast<uint16_t>(std::clamp(val, 0.0, 65535.0));
+    }
   }
 }
 
@@ -369,6 +761,105 @@ std::string UnsupportedCompressionMessage(const std::string& compression) {
   return "Unsupported compression requested for the current DNG writer path";
 }
 
+bool ExtractCfaGuideImage(const std::string& source_path,
+                          const SourceLinearDngMetadata& metadata,
+                          RasterImage* guide,
+                          std::string* error_message) {
+  guide->width = 0;
+  guide->height = 0;
+  guide->colors = 0;
+  guide->bits = 0;
+  guide->pixels.clear();
+
+  LibRaw processor;
+  int result = processor.open_file(source_path.c_str());
+  if (result != LIBRAW_SUCCESS) {
+    *error_message = std::string("LibRaw open_file failed: ") + libraw_strerror(result);
+    return false;
+  }
+
+  result = processor.unpack();
+  if (result != LIBRAW_SUCCESS) {
+    *error_message = std::string("LibRaw unpack failed: ") + libraw_strerror(result);
+    processor.recycle();
+    return false;
+  }
+
+  const ushort* raw = processor.imgdata.rawdata.raw_image;
+  const uint32_t width = processor.imgdata.sizes.raw_width;
+  const uint32_t height = processor.imgdata.sizes.raw_height;
+  if (raw == nullptr || width == 0 || height == 0) {
+    *error_message = "LibRaw raw mosaic not available for CFA guide extraction";
+    processor.recycle();
+    return false;
+  }
+
+  guide->width = width;
+  guide->height = height;
+  guide->colors = 4;
+  guide->bits = 16;
+  guide->pixels.resize(static_cast<size_t>(width) * height * guide->colors, 0);
+
+  const double black_level = metadata.has_black_level ? metadata.black_level : 0.0;
+
+  auto raw_sample = [&](int row, int col, int target_color) -> double {
+    row = std::clamp(row, 0, static_cast<int>(height) - 1);
+    col = std::clamp(col, 0, static_cast<int>(width) - 1);
+    if (processor.COLOR(row, col) != target_color) {
+      return -1.0;
+    }
+    const size_t idx = static_cast<size_t>(row) * width + col;
+    return std::max(static_cast<double>(raw[idx]) - black_level, 0.0);
+  };
+
+  for (uint32_t row = 0; row < height; ++row) {
+    for (uint32_t col = 0; col < width; ++col) {
+      const size_t px = (static_cast<size_t>(row) * width + col) * guide->colors;
+
+      double green_a = 0.0;
+      double green_b = 0.0;
+
+      const int color = processor.COLOR(static_cast<int>(row), static_cast<int>(col));
+
+      if (color == 1) {
+        green_a = raw_sample(static_cast<int>(row), static_cast<int>(col), 1);
+        const double d1 = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col) - 1, 3);
+        const double d2 = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col) + 1, 3);
+        const double d3 = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col) - 1, 3);
+        const double d4 = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col) + 1, 3);
+        green_b = 0.25 * (std::max(d1, 0.0) + std::max(d2, 0.0) + std::max(d3, 0.0) + std::max(d4, 0.0));
+      } else if (color == 3) {
+        green_b = raw_sample(static_cast<int>(row), static_cast<int>(col), 3);
+        const double d1 = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col) - 1, 1);
+        const double d2 = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col) + 1, 1);
+        const double d3 = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col) - 1, 1);
+        const double d4 = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col) + 1, 1);
+        green_a = 0.25 * (std::max(d1, 0.0) + std::max(d2, 0.0) + std::max(d3, 0.0) + std::max(d4, 0.0));
+      } else if (color == 0) {
+        const double g1l = raw_sample(static_cast<int>(row), static_cast<int>(col) - 1, 1);
+        const double g1r = raw_sample(static_cast<int>(row), static_cast<int>(col) + 1, 1);
+        const double g2u = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col), 3);
+        const double g2d = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col), 3);
+        green_a = 0.5 * (std::max(g1l, 0.0) + std::max(g1r, 0.0));
+        green_b = 0.5 * (std::max(g2u, 0.0) + std::max(g2d, 0.0));
+      } else {
+        const double g1u = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col), 1);
+        const double g1d = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col), 1);
+        const double g2l = raw_sample(static_cast<int>(row), static_cast<int>(col) - 1, 3);
+        const double g2r = raw_sample(static_cast<int>(row), static_cast<int>(col) + 1, 3);
+        green_a = 0.5 * (std::max(g1u, 0.0) + std::max(g1d, 0.0));
+        green_b = 0.5 * (std::max(g2l, 0.0) + std::max(g2r, 0.0));
+      }
+
+      guide->pixels[px + 1] = static_cast<uint16_t>(std::clamp(green_a, 0.0, 65535.0));
+      guide->pixels[px + 3] = static_cast<uint16_t>(std::clamp(green_b, 0.0, 65535.0));
+    }
+  }
+
+  processor.recycle();
+  return true;
+}
+
 RasterImage MakeSyntheticRgbImage() {
   RasterImage image;
   image.width = 48;
@@ -392,7 +883,8 @@ RasterImage MakeSyntheticRgbImage() {
 bool RenderLibRawImage(const std::string& source_path,
                        const RenderSettings& settings,
                        RasterImage* output,
-                       std::string* error_message) {
+                       std::string* error_message,
+                       int expected_colors = 3) {
   LibRaw processor;
 
   int result = processor.open_file(source_path.c_str());
@@ -441,7 +933,8 @@ bool RenderLibRawImage(const std::string& source_path,
     return false;
   }
 
-  if (processed->bits != 16 || processed->colors != 3) {
+  if (processed->bits != 16 ||
+      (expected_colors > 0 && processed->colors != expected_colors)) {
     *error_message = "LibRaw produced an unexpected processed image format";
     LibRaw::dcraw_clear_mem(processed);
     processor.recycle();
@@ -479,6 +972,18 @@ bool BuildLinearDngPayload(const std::string& source_path,
 
   if (!RenderLibRawImage(source_path, preview_settings, &payload->rendered_preview_source, error_message)) {
     return false;
+  }
+
+  if (ShouldApplyPredictedDetailGain(metadata, payload->raw_image)) {
+    std::string cfa_guide_error;
+    if (ExtractCfaGuideImage(source_path,
+                             metadata,
+                             &payload->cfa_guide_image,
+                             &cfa_guide_error)) {
+      // guide available
+    } else {
+      payload->cfa_guide_image = RasterImage();
+    }
   }
 
   return true;
@@ -727,7 +1232,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       return result;
     }
 
-    ApplyPredictedDetailGain(metadata, &payload.raw_image);
+    ApplyPredictedDetailGain(metadata, &payload.cfa_guide_image, &payload.raw_image);
     ApplyLinearDngRasterTransform(metadata, &payload.raw_image);
 
     PreviewImage preview_image = BuildPreviewImage(payload.rendered_preview_source, 1024);

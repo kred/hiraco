@@ -42,6 +42,24 @@ if(NOT LIBRAW_INCLUDE_DIR OR NOT LIBRAW_LIBRARY)
   message(FATAL_ERROR "LibRaw not found. Install libraw or adjust include/library hints.")
 endif()
 
+find_path(FFTW3_INCLUDE_DIR
+  NAMES fftw3.h
+  HINTS
+    /opt/homebrew/include
+    /usr/local/include
+)
+
+find_library(FFTW3_LIBRARY
+  NAMES fftw3
+  HINTS
+    /opt/homebrew/lib
+    /usr/local/lib
+)
+
+if(NOT FFTW3_INCLUDE_DIR OR NOT FFTW3_LIBRARY)
+  message(FATAL_ERROR "FFTW3 not found. Install fftw (e.g. brew install fftw) or adjust include/library hints.")
+endif()
+
 find_library(COREFOUNDATION_LIBRARY CoreFoundation)
 find_library(CORESERVICES_LIBRARY CoreServices)
 find_library(ZLIB_LIBRARY z)
@@ -145,8 +163,8 @@ add_executable(hiraco-native
   src/main.cpp
 )
 
-target_include_directories(hiraco-native PRIVATE ${LIBRAW_INCLUDE_DIR})
-target_link_libraries(hiraco-native PRIVATE ${LIBRAW_LIBRARY})
+target_include_directories(hiraco-native PRIVATE ${LIBRAW_INCLUDE_DIR} ${FFTW3_INCLUDE_DIR})
+target_link_libraries(hiraco-native PRIVATE ${LIBRAW_LIBRARY} ${FFTW3_LIBRARY})
 target_compile_definitions(hiraco-native PRIVATE
   HIRACO_ENABLE_DNG_SDK=1
   HIRACO_DNG_SDK_ROOT="${HIRACO_DNG_SDK_ROOT}"
