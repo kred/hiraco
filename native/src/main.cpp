@@ -281,6 +281,46 @@ SourceLinearDngMetadata ParseSourceLinearDngMetadata(const std::string& request_
   metadata.stack_mean_width = stack_mean_width;
   metadata.stack_mean_height = stack_mean_height;
 
+  metadata.stack_guide_path = FindJsonString(request_json, "om3_stack_guide_path");
+  unsigned stack_guide_width = 0;
+  unsigned stack_guide_height = 0;
+  metadata.has_stack_guide_map =
+      !metadata.stack_guide_path.empty() &&
+      FindJsonUnsigned(request_json, "om3_stack_guide_width", &stack_guide_width) &&
+      FindJsonUnsigned(request_json, "om3_stack_guide_height", &stack_guide_height);
+  metadata.stack_guide_width = stack_guide_width;
+  metadata.stack_guide_height = stack_guide_height;
+
+  metadata.stack_tensor_x_path = FindJsonString(request_json, "om3_stack_tensor_x_path");
+  unsigned stack_tensor_x_width = 0;
+  unsigned stack_tensor_x_height = 0;
+  metadata.has_stack_tensor_x_map =
+      !metadata.stack_tensor_x_path.empty() &&
+      FindJsonUnsigned(request_json, "om3_stack_tensor_x_width", &stack_tensor_x_width) &&
+      FindJsonUnsigned(request_json, "om3_stack_tensor_x_height", &stack_tensor_x_height);
+  metadata.stack_tensor_x_width = stack_tensor_x_width;
+  metadata.stack_tensor_x_height = stack_tensor_x_height;
+
+  metadata.stack_tensor_y_path = FindJsonString(request_json, "om3_stack_tensor_y_path");
+  unsigned stack_tensor_y_width = 0;
+  unsigned stack_tensor_y_height = 0;
+  metadata.has_stack_tensor_y_map =
+      !metadata.stack_tensor_y_path.empty() &&
+      FindJsonUnsigned(request_json, "om3_stack_tensor_y_width", &stack_tensor_y_width) &&
+      FindJsonUnsigned(request_json, "om3_stack_tensor_y_height", &stack_tensor_y_height);
+  metadata.stack_tensor_y_width = stack_tensor_y_width;
+  metadata.stack_tensor_y_height = stack_tensor_y_height;
+
+  metadata.stack_tensor_coherence_path = FindJsonString(request_json, "om3_stack_tensor_coherence_path");
+  unsigned stack_tensor_coherence_width = 0;
+  unsigned stack_tensor_coherence_height = 0;
+  metadata.has_stack_tensor_coherence_map =
+      !metadata.stack_tensor_coherence_path.empty() &&
+      FindJsonUnsigned(request_json, "om3_stack_tensor_coherence_width", &stack_tensor_coherence_width) &&
+      FindJsonUnsigned(request_json, "om3_stack_tensor_coherence_height", &stack_tensor_coherence_height);
+  metadata.stack_tensor_coherence_width = stack_tensor_coherence_width;
+  metadata.stack_tensor_coherence_height = stack_tensor_coherence_height;
+
   metadata.stack_alias_path = FindJsonString(request_json, "om3_stack_alias_path");
   unsigned stack_alias_width = 0;
   unsigned stack_alias_height = 0;

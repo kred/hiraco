@@ -251,6 +251,116 @@ bool LoadStackMeanMap(const SourceLinearDngMetadata& metadata,
                       error_message);
 }
 
+bool LoadStackGuideMap(const SourceLinearDngMetadata& metadata,
+                       std::vector<double>* guide_map,
+                       std::string* error_message) {
+  if (guide_map == nullptr) {
+    return false;
+  }
+  guide_map->clear();
+
+  if (metadata.has_stack_guide_map &&
+      metadata.stack_guide_width > 0 &&
+      metadata.stack_guide_height > 0 &&
+      !metadata.stack_guide_path.empty()) {
+    return LoadFloatMap(metadata.stack_guide_path,
+                        metadata.stack_guide_width,
+                        metadata.stack_guide_height,
+                        "OM-3 stack guide map",
+                        guide_map,
+                        error_message);
+  }
+
+  return LoadStackMeanMap(metadata, guide_map, error_message);
+}
+
+bool LoadStackTensorXMap(const SourceLinearDngMetadata& metadata,
+                         std::vector<double>* tensor_map,
+                         std::string* error_message) {
+  if (tensor_map == nullptr) {
+    return false;
+  }
+  tensor_map->clear();
+
+  if (!metadata.has_stack_tensor_x_map ||
+      metadata.stack_tensor_x_width == 0 ||
+      metadata.stack_tensor_x_height == 0 ||
+      metadata.stack_tensor_x_path.empty()) {
+    return true;
+  }
+
+  if (!LoadFloatMap(metadata.stack_tensor_x_path,
+                    metadata.stack_tensor_x_width,
+                    metadata.stack_tensor_x_height,
+                    "OM-3 stack tensor-x map",
+                    tensor_map,
+                    error_message)) {
+    return false;
+  }
+  for (double& value : *tensor_map) {
+    value = std::clamp(value, 0.0, 1.0);
+  }
+  return true;
+}
+
+bool LoadStackTensorYMap(const SourceLinearDngMetadata& metadata,
+                         std::vector<double>* tensor_map,
+                         std::string* error_message) {
+  if (tensor_map == nullptr) {
+    return false;
+  }
+  tensor_map->clear();
+
+  if (!metadata.has_stack_tensor_y_map ||
+      metadata.stack_tensor_y_width == 0 ||
+      metadata.stack_tensor_y_height == 0 ||
+      metadata.stack_tensor_y_path.empty()) {
+    return true;
+  }
+
+  if (!LoadFloatMap(metadata.stack_tensor_y_path,
+                    metadata.stack_tensor_y_width,
+                    metadata.stack_tensor_y_height,
+                    "OM-3 stack tensor-y map",
+                    tensor_map,
+                    error_message)) {
+    return false;
+  }
+  for (double& value : *tensor_map) {
+    value = std::clamp(value, 0.0, 1.0);
+  }
+  return true;
+}
+
+bool LoadStackTensorCoherenceMap(const SourceLinearDngMetadata& metadata,
+                                 std::vector<double>* coherence_map,
+                                 std::string* error_message) {
+  if (coherence_map == nullptr) {
+    return false;
+  }
+  coherence_map->clear();
+
+  if (!metadata.has_stack_tensor_coherence_map ||
+      metadata.stack_tensor_coherence_width == 0 ||
+      metadata.stack_tensor_coherence_height == 0 ||
+      metadata.stack_tensor_coherence_path.empty()) {
+    return true;
+  }
+
+  if (!LoadFloatMap(metadata.stack_tensor_coherence_path,
+                    metadata.stack_tensor_coherence_width,
+                    metadata.stack_tensor_coherence_height,
+                    "OM-3 stack tensor-coherence map",
+                    coherence_map,
+                    error_message)) {
+    return false;
+  }
+  for (double& value : *coherence_map) {
+    value = std::clamp(value, 0.0, 1.0);
+  }
+  return true;
+}
+
 bool LoadStackAliasMap(const SourceLinearDngMetadata& metadata,
                        std::vector<double>* alias_map,
                        std::string* error_message) {
@@ -1407,12 +1517,12 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
                    height,
                    &upsampled_stability);
 
-  std::vector<double> stack_mean;
-  if (!LoadStackMeanMap(metadata, &stack_mean, error_message)) {
+  std::vector<double> stack_guide;
+  if (!LoadStackGuideMap(metadata, &stack_guide, error_message)) {
     return false;
   }
 
-  std::vector<double> upsampled_stack_mean;
+  std::vector<double> upsampled_stack_guide;
 
   std::vector<double> stack_alias;
   if (!LoadStackAliasMap(metadata, &stack_alias, error_message)) {
@@ -1426,6 +1536,42 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
                    width,
                    height,
                    &upsampled_stack_alias);
+
+  std::vector<double> stack_tensor_x;
+  if (!LoadStackTensorXMap(metadata, &stack_tensor_x, error_message)) {
+    return false;
+  }
+  std::vector<double> upsampled_stack_tensor_x;
+  UpsampleFloatMap(stack_tensor_x,
+                   metadata.stack_tensor_x_width,
+                   metadata.stack_tensor_x_height,
+                   width,
+                   height,
+                   &upsampled_stack_tensor_x);
+
+  std::vector<double> stack_tensor_y;
+  if (!LoadStackTensorYMap(metadata, &stack_tensor_y, error_message)) {
+    return false;
+  }
+  std::vector<double> upsampled_stack_tensor_y;
+  UpsampleFloatMap(stack_tensor_y,
+                   metadata.stack_tensor_y_width,
+                   metadata.stack_tensor_y_height,
+                   width,
+                   height,
+                   &upsampled_stack_tensor_y);
+
+  std::vector<double> stack_tensor_coherence;
+  if (!LoadStackTensorCoherenceMap(metadata, &stack_tensor_coherence, error_message)) {
+    return false;
+  }
+  std::vector<double> upsampled_stack_tensor_coherence;
+  UpsampleFloatMap(stack_tensor_coherence,
+                   metadata.stack_tensor_coherence_width,
+                   metadata.stack_tensor_coherence_height,
+                   width,
+                   height,
+                   &upsampled_stack_tensor_coherence);
 
   std::vector<double> green(pixel_count, 0.0);
   for (uint32_t row = 0; row < height; ++row) {
@@ -1491,9 +1637,9 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
     return (1.0 - wy) * top + wy * bottom;
   };
 
-  if (!stack_mean.empty()) {
-    const uint32_t guide_width = metadata.stack_mean_width;
-    const uint32_t guide_height = metadata.stack_mean_height;
+  if (!stack_guide.empty()) {
+    const uint32_t guide_width = metadata.has_stack_guide_map ? metadata.stack_guide_width : metadata.stack_mean_width;
+    const uint32_t guide_height = metadata.has_stack_guide_map ? metadata.stack_guide_height : metadata.stack_mean_height;
     std::vector<double> low_res_green(static_cast<size_t>(guide_width) * guide_height, 0.0);
 
     for (uint32_t row = 0; row < guide_height; ++row) {
@@ -1511,8 +1657,8 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
     double sum_green = 0.0;
     double sum_guide_sq = 0.0;
     double sum_guide_green = 0.0;
-    for (size_t idx = 0; idx < stack_mean.size(); ++idx) {
-      const double guide_value = stack_mean[idx];
+    for (size_t idx = 0; idx < stack_guide.size(); ++idx) {
+      const double guide_value = stack_guide[idx];
       const double green_value = low_res_green[idx];
       sum_guide += guide_value;
       sum_green += green_value;
@@ -1520,7 +1666,7 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
       sum_guide_green += guide_value * green_value;
     }
 
-    const double count = static_cast<double>(stack_mean.size());
+    const double count = static_cast<double>(stack_guide.size());
     const double mean_guide = sum_guide / count;
     const double mean_green = sum_green / count;
     const double var_guide = sum_guide_sq / count - mean_guide * mean_guide;
@@ -1536,12 +1682,12 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
     gain = std::clamp(gain, 0.05, 64.0);
     const double bias = mean_green - gain * mean_guide;
 
-    std::vector<double> stack_mean_scaled(stack_mean.size(), 0.0);
-    for (size_t idx = 0; idx < stack_mean.size(); ++idx) {
-      stack_mean_scaled[idx] = std::clamp(gain * stack_mean[idx] + bias, 0.0, 65535.0 - pedestal);
+    std::vector<double> stack_guide_scaled(stack_guide.size(), 0.0);
+    for (size_t idx = 0; idx < stack_guide.size(); ++idx) {
+      stack_guide_scaled[idx] = std::clamp(gain * stack_guide[idx] + bias, 0.0, 65535.0 - pedestal);
     }
 
-    upsampled_stack_mean.resize(pixel_count, 0.0);
+    upsampled_stack_guide.resize(pixel_count, 0.0);
     for (uint32_t row = 0; row < height; ++row) {
       const double guide_row =
           (static_cast<double>(row) + 0.5) * static_cast<double>(guide_height) / static_cast<double>(height) - 0.5;
@@ -1579,15 +1725,15 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
         const double w11 = base_w11 * std::exp(-(low_g11 - green_center) * (low_g11 - green_center) * inv_sigma_sq);
         const double weight_sum = w00 + w01 + w10 + w11;
 
-        const double s00 = stack_mean_scaled[static_cast<size_t>(sy0) * guide_width + sx0];
-        const double s01 = stack_mean_scaled[static_cast<size_t>(sy0) * guide_width + sx1];
-        const double s10 = stack_mean_scaled[static_cast<size_t>(sy1) * guide_width + sx0];
-        const double s11 = stack_mean_scaled[static_cast<size_t>(sy1) * guide_width + sx1];
+        const double s00 = stack_guide_scaled[static_cast<size_t>(sy0) * guide_width + sx0];
+        const double s01 = stack_guide_scaled[static_cast<size_t>(sy0) * guide_width + sx1];
+        const double s10 = stack_guide_scaled[static_cast<size_t>(sy1) * guide_width + sx0];
+        const double s11 = stack_guide_scaled[static_cast<size_t>(sy1) * guide_width + sx1];
         if (weight_sum > 1e-12) {
-          upsampled_stack_mean[out_idx] =
+          upsampled_stack_guide[out_idx] =
               (w00 * s00 + w01 * s01 + w10 * s10 + w11 * s11) / weight_sum;
         } else {
-          upsampled_stack_mean[out_idx] =
+          upsampled_stack_guide[out_idx] =
               base_w00 * s00 + base_w01 * s01 + base_w10 * s10 + base_w11 * s11;
         }
       }
@@ -1621,15 +1767,15 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
         const double grad_v = std::abs(g_up - g_down) +
                               0.5 * std::abs(2.0 * center - same_up - same_down);
 
-        const double guide_center = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col));
-        const double guide_left = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) - 1);
-        const double guide_right = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) + 1);
-        const double guide_up = sample_buffer(upsampled_stack_mean, static_cast<int>(row) - 1, static_cast<int>(col));
-        const double guide_down = sample_buffer(upsampled_stack_mean, static_cast<int>(row) + 1, static_cast<int>(col));
-        const double guide_same_left = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) - 2);
-        const double guide_same_right = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) + 2);
-        const double guide_same_up = sample_buffer(upsampled_stack_mean, static_cast<int>(row) - 2, static_cast<int>(col));
-        const double guide_same_down = sample_buffer(upsampled_stack_mean, static_cast<int>(row) + 2, static_cast<int>(col));
+        const double guide_center = sample_buffer(upsampled_stack_guide, static_cast<int>(row), static_cast<int>(col));
+        const double guide_left = sample_buffer(upsampled_stack_guide, static_cast<int>(row), static_cast<int>(col) - 1);
+        const double guide_right = sample_buffer(upsampled_stack_guide, static_cast<int>(row), static_cast<int>(col) + 1);
+        const double guide_up = sample_buffer(upsampled_stack_guide, static_cast<int>(row) - 1, static_cast<int>(col));
+        const double guide_down = sample_buffer(upsampled_stack_guide, static_cast<int>(row) + 1, static_cast<int>(col));
+        const double guide_same_left = sample_buffer(upsampled_stack_guide, static_cast<int>(row), static_cast<int>(col) - 2);
+        const double guide_same_right = sample_buffer(upsampled_stack_guide, static_cast<int>(row), static_cast<int>(col) + 2);
+        const double guide_same_up = sample_buffer(upsampled_stack_guide, static_cast<int>(row) - 2, static_cast<int>(col));
+        const double guide_same_down = sample_buffer(upsampled_stack_guide, static_cast<int>(row) + 2, static_cast<int>(col));
 
         const double guide_grad_h =
             std::abs(guide_left - guide_right) +
@@ -1646,8 +1792,16 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
             std::clamp(0.08 + 0.12 * guide_conf + 0.10 * alias_conf, 0.08, 0.30);
         const double combined_grad_h = (1.0 - guide_mix) * grad_h + guide_mix * guide_grad_h;
         const double combined_grad_v = (1.0 - guide_mix) * grad_v + guide_mix * guide_grad_v;
-        const double weight_h = 1.0 / (combined_grad_h + 1.0);
-        const double weight_v = 1.0 / (combined_grad_v + 1.0);
+        const double tensor_h =
+            upsampled_stack_tensor_x.empty() ? 0.5 : upsampled_stack_tensor_x[idx];
+        const double tensor_v =
+            upsampled_stack_tensor_y.empty() ? 0.5 : upsampled_stack_tensor_y[idx];
+        const double tensor_coh =
+            upsampled_stack_tensor_coherence.empty() ? 0.0 : upsampled_stack_tensor_coherence[idx];
+        const double tensor_penalty_h = 1.0 + 0.85 * tensor_coh * tensor_h;
+        const double tensor_penalty_v = 1.0 + 0.85 * tensor_coh * tensor_v;
+        const double weight_h = 1.0 / ((combined_grad_h + 1.0) * tensor_penalty_h);
+        const double weight_v = 1.0 / ((combined_grad_v + 1.0) * tensor_penalty_v);
 
         double estimate = 0.0;
         if (std::max(weight_h, weight_v) > 1.8 * std::min(weight_h, weight_v)) {
@@ -1727,15 +1881,15 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
         double mask = upsampled_stability[idx] * std::clamp(split_confidence, 0.20, 1.0);
         double detail_boost = 1.0 + 0.28 * alias_conf;
         double cap_scale = 1.0 + 0.18 * alias_conf;
-        if (!upsampled_stack_mean.empty()) {
+        if (!upsampled_stack_guide.empty()) {
           const double guide_left =
-              sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) - 1);
+              sample_buffer(upsampled_stack_guide, static_cast<int>(row), static_cast<int>(col) - 1);
           const double guide_right =
-              sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) + 1);
+              sample_buffer(upsampled_stack_guide, static_cast<int>(row), static_cast<int>(col) + 1);
           const double guide_up =
-              sample_buffer(upsampled_stack_mean, static_cast<int>(row) - 1, static_cast<int>(col));
+              sample_buffer(upsampled_stack_guide, static_cast<int>(row) - 1, static_cast<int>(col));
           const double guide_down =
-              sample_buffer(upsampled_stack_mean, static_cast<int>(row) + 1, static_cast<int>(col));
+              sample_buffer(upsampled_stack_guide, static_cast<int>(row) + 1, static_cast<int>(col));
           const double guide_edge =
               std::max(std::abs(guide_left - guide_right), std::abs(guide_up - guide_down));
           const double guide_edge_conf =
@@ -1783,10 +1937,10 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
     double guide_term0 = 0.0;
     double guide_term1 = 0.0;
     double guide_weight = 0.0;
-    if (!upsampled_stack_mean.empty()) {
-      const double guide_center = upsampled_stack_mean[idxc];
-      guide_term0 = std::abs(upsampled_stack_mean[idx0] - guide_center);
-      guide_term1 = std::abs(upsampled_stack_mean[idx1] - guide_center);
+    if (!upsampled_stack_guide.empty()) {
+      const double guide_center = upsampled_stack_guide[idxc];
+      guide_term0 = std::abs(upsampled_stack_guide[idx0] - guide_center);
+      guide_term1 = std::abs(upsampled_stack_guide[idx1] - guide_center);
       const double guide_conf =
           upsampled_stability.empty() ? 1.0 : upsampled_stability[idxc];
       const double alias_conf =
@@ -1819,9 +1973,9 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
     double guide_diag_a = 0.0;
     double guide_diag_b = 0.0;
     double guide_weight = 0.0;
-    if (!upsampled_stack_mean.empty()) {
-      guide_diag_a = std::abs(upsampled_stack_mean[idx_nw] - upsampled_stack_mean[idx_se]);
-      guide_diag_b = std::abs(upsampled_stack_mean[idx_ne] - upsampled_stack_mean[idx_sw]);
+    if (!upsampled_stack_guide.empty()) {
+      guide_diag_a = std::abs(upsampled_stack_guide[idx_nw] - upsampled_stack_guide[idx_se]);
+      guide_diag_b = std::abs(upsampled_stack_guide[idx_ne] - upsampled_stack_guide[idx_sw]);
       const size_t idxc = static_cast<size_t>(row) * width + col;
       const double guide_conf =
           upsampled_stability.empty() ? 1.0 : upsampled_stability[idxc];

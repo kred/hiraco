@@ -3,14 +3,33 @@
 Status note as of 2026-03-25:
 
 - The OM-3 hand-held high-res `.ORF` used in `reference3` should currently be treated as a Bayer/CFA mosaic (`8172x6132`) with crop margins, not as a demosaic-free full-color bitmap.
+- The companion `.ORI` files seen in `reference2` should be treated as fallback single-frame captures, not as the target geometry for Olympus high-res reconstruction. Their crop geometry matches the standard 20 MP frame (`5184x3888`), while the high-res `.ORF` and the OM Workspace TIFF align on the high-res crop (`8160x6120`).
 - The OM-3 high-res path in `hiraco` now defaults to a CFA-domain camera-space reconstruction before DNG packaging. The older `LibRaw decode/render -> optional detail processing -> linear DNG packaging` flow is still available as a fallback path.
 - The first generation of OM-3 raw-domain reconstruction had a raster/metadata domain mismatch. That contract issue is now corrected: the custom OM-3 path stays in camera space and writes a pedestal-bearing stage-3 image that matches the attached camera profile metadata.
 - `UnknownBlock3` in OM-3 hand-held high-res files is not opaque random metadata. Interpreted as a `124x128` little-endian `u32` grid, it contains eight aligned low-resolution scene tiles (`4x2` layout of `31x64` tiles), which appear to summarize the source stack.
+- Across the checked OM-3 samples, the hidden maker-note blocks split into distinct roles:
+  - `UnknownBlock2` is constant across standard, tripod high-res, hand-held high-res, and `.ORI` fallback files, so it is likely static calibration or process metadata rather than capture-specific guidance.
+  - `UnknownBlock3` and `UnknownBlock4` are duplicated between a high-res `.ORF` and its paired fallback `.ORI`, so they appear to be capture-wide stack metadata rather than file-format-specific output state.
+  - `UnknownBlock1` changes between the high-res `.ORF` and the paired `.ORI`, even when `UnknownBlock3/4` stay identical, so it is a strong candidate for per-file geometry, mode, or processing-state metadata.
 - `hiraco` now extracts three guidance signals from those eight hidden tiles on the Python side and passes them into the native CFA-domain renderer:
   - a coarse stability/confidence map,
-  - a low-resolution mean guide image,
-  - and an alias/detail-potential map derived from inter-tile variation.
+  - a sharpness-weighted low-resolution guide image,
+  - an alias/detail-potential map derived from inter-tile variation,
+  - and low-resolution structure-tensor orientation maps.
 - The current OM-3 reconstruction experiments use those maps as guide-aware priors for CFA interpolation and detail lifting. This is still well short of OM Workspace quality, but it is now using single-ORF Olympus-specific stack information instead of relying only on LibRaw's rendered Bayer composite.
+- `UnknownBlock1` is now looking like a structured per-file geometry/state header rather than opaque metadata. The strongest hypotheses so far are:
+  - `u32[0]` / byte `0x00`: ASCII magic `SDMO` (`0x4f4d4453` little-endian).
+  - `u32[17]` / byte `0x44`: capture-state word. The low halfword is `0x16`, `0x17`, or `0x1c` across the sample set, so it likely encodes burst/session index or mode subtype rather than geometry.
+  - `u32[18]` / byte `0x48`: mostly constant `0x1e3c` (`7740`), with the tripod sample setting the high byte to `0x01`; likely a mode/state flag plus a fixed geometry constant.
+  - `u32[19]` / byte `0x4c`: `0x01000000` only on hand-held high-res ORFs, zero on tripod ORFs and ORIs; very likely a high-res mode bit.
+  - `u32[22]` / byte `0x58`: clear mode code / bitfield. Observed values are `0x2000` (hand-held high-res), `0x4000` (tripod high-res), and `0x0008` (ORI fallback).
+  - `u32[23]` and `u32[47]` / bytes `0x5c` and `0xbc`: packed geometry tuples. The high halfword matches the raw image height exactly (`6132`, `7792`, `3912`), while the low halfword looks like an internal working stride / padded width (`8280`, `10440`, `5360`).
+  - `u32[41]` / byte `0xa4`: exact half-resolution geometry, e.g. `4086x3066`, `5192x3896`, `2604x1956`. This strongly suggests a pyramid or intermediate working-level size.
+  - `u32[43..45]` / bytes `0xac..0xb4`: repeated full-size geometry tuple. Interpretable as `1, width, 1, height, width` for the working raster.
+  - `u32[55]` / byte `0xdc`: crop dimensions in 16-pixel blocks. It matches `crop_width / 16` and `crop_height / 16` on the reference files (`510x382`, `648x486`, `324x244`).
+  - `u32[25]` / byte `0x64`: deliberate sentinel `0x76543210`.
+  - `u32[26..33]` / bytes `0x68..0x87`: repeated `0x03FC03FC` pedestal table, matching the ORF black level `1020`.
+  - The remaining words in the `u32[40..63]` region appear to be secondary geometry / grid descriptors. They vary systematically with mode, but I have not fully decoded them yet.
 - Any section below that assumes Olympus high-res ORFs "nullify the need for Bayer demosaicing" should be read as historical investigation context, not current ground truth.
 
 This document details the architectural processes, design logic, and underlying algorithmic implementations used in `hiraco` to convert Olympus/OM-System High-Resolution sensor-shift composite `.ORF` files into well-formed, widely readable `.dng` files using LibRaw and the Adobe DNG SDK.

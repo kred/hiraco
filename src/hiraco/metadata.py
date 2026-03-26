@@ -465,7 +465,20 @@ def extract_om3_stack_guidance(path: Path, output_dir: Path) -> dict[str, Any] |
 
     stack = np.stack(tiles, axis=0)
     mean = stack.mean(axis=0)
+    gradients_y, gradients_x = np.gradient(stack, axis=(1, 2))
+    sharpness = np.sqrt(gradients_x * gradients_x + gradients_y * gradients_y)
+    sharpness_scale = np.maximum(sharpness.std(axis=0, keepdims=True), 1e-6)
+    sharpness_offset = sharpness - sharpness.max(axis=0, keepdims=True)
+    sharpness_weights = np.exp(np.clip(4.0 * sharpness_offset / sharpness_scale, -12.0, 0.0))
+    guide = (sharpness_weights * stack).sum(axis=0) / np.maximum(sharpness_weights.sum(axis=0), 1e-6)
     std = stack.std(axis=0)
+    tensor_x = np.mean(gradients_x * gradients_x, axis=0).astype(np.float32)
+    tensor_xy = np.mean(gradients_x * gradients_y, axis=0).astype(np.float32)
+    tensor_y = np.mean(gradients_y * gradients_y, axis=0).astype(np.float32)
+    tensor_trace = tensor_x + tensor_y
+    tensor_coherence = np.sqrt(np.square(tensor_x - tensor_y) + 4.0 * np.square(tensor_xy)) / np.maximum(tensor_trace, 1e-6)
+    tensor_x_ratio = tensor_x / np.maximum(tensor_trace, 1e-6)
+    tensor_y_ratio = tensor_y / np.maximum(tensor_trace, 1e-6)
     relative_std = std / np.maximum(mean, 1.0)
     scale = float(np.percentile(relative_std, 90))
     if scale <= 1e-6:
@@ -486,6 +499,14 @@ def extract_om3_stack_guidance(path: Path, output_dir: Path) -> dict[str, Any] |
     stability.astype("<f4").tofile(stability_path)
     mean_path = output_dir / f"{path.stem}_stack_mean.f32"
     mean.astype("<f4").tofile(mean_path)
+    guide_path = output_dir / f"{path.stem}_stack_guide.f32"
+    guide.astype("<f4").tofile(guide_path)
+    tensor_x_path = output_dir / f"{path.stem}_stack_tensor_x.f32"
+    tensor_x_ratio.astype("<f4").tofile(tensor_x_path)
+    tensor_y_path = output_dir / f"{path.stem}_stack_tensor_y.f32"
+    tensor_y_ratio.astype("<f4").tofile(tensor_y_path)
+    tensor_coherence_path = output_dir / f"{path.stem}_stack_tensor_coherence.f32"
+    tensor_coherence.astype("<f4").tofile(tensor_coherence_path)
     alias_path = output_dir / f"{path.stem}_stack_alias.f32"
     alias.astype("<f4").tofile(alias_path)
 
@@ -496,6 +517,18 @@ def extract_om3_stack_guidance(path: Path, output_dir: Path) -> dict[str, Any] |
         "om3_stack_mean_path": str(mean_path),
         "om3_stack_mean_width": tile_width,
         "om3_stack_mean_height": tile_height,
+        "om3_stack_guide_path": str(guide_path),
+        "om3_stack_guide_width": tile_width,
+        "om3_stack_guide_height": tile_height,
+        "om3_stack_tensor_x_path": str(tensor_x_path),
+        "om3_stack_tensor_x_width": tile_width,
+        "om3_stack_tensor_x_height": tile_height,
+        "om3_stack_tensor_y_path": str(tensor_y_path),
+        "om3_stack_tensor_y_width": tile_width,
+        "om3_stack_tensor_y_height": tile_height,
+        "om3_stack_tensor_coherence_path": str(tensor_coherence_path),
+        "om3_stack_tensor_coherence_width": tile_width,
+        "om3_stack_tensor_coherence_height": tile_height,
         "om3_stack_alias_path": str(alias_path),
         "om3_stack_alias_width": tile_width,
         "om3_stack_alias_height": tile_height,
