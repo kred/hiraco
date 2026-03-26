@@ -1,5 +1,18 @@
 # High-Resolution RAW Compilation & Conversion Pipeline
 
+Status note as of 2026-03-25:
+
+- The OM-3 hand-held high-res `.ORF` used in `reference3` should currently be treated as a Bayer/CFA mosaic (`8172x6132`) with crop margins, not as a demosaic-free full-color bitmap.
+- The OM-3 high-res path in `hiraco` now defaults to a CFA-domain camera-space reconstruction before DNG packaging. The older `LibRaw decode/render -> optional detail processing -> linear DNG packaging` flow is still available as a fallback path.
+- The first generation of OM-3 raw-domain reconstruction had a raster/metadata domain mismatch. That contract issue is now corrected: the custom OM-3 path stays in camera space and writes a pedestal-bearing stage-3 image that matches the attached camera profile metadata.
+- `UnknownBlock3` in OM-3 hand-held high-res files is not opaque random metadata. Interpreted as a `124x128` little-endian `u32` grid, it contains eight aligned low-resolution scene tiles (`4x2` layout of `31x64` tiles), which appear to summarize the source stack.
+- `hiraco` now extracts three guidance signals from those eight hidden tiles on the Python side and passes them into the native CFA-domain renderer:
+  - a coarse stability/confidence map,
+  - a low-resolution mean guide image,
+  - and an alias/detail-potential map derived from inter-tile variation.
+- The current OM-3 reconstruction experiments use those maps as guide-aware priors for CFA interpolation and detail lifting. This is still well short of OM Workspace quality, but it is now using single-ORF Olympus-specific stack information instead of relying only on LibRaw's rendered Bayer composite.
+- Any section below that assumes Olympus high-res ORFs "nullify the need for Bayer demosaicing" should be read as historical investigation context, not current ground truth.
+
 This document details the architectural processes, design logic, and underlying algorithmic implementations used in `hiraco` to convert Olympus/OM-System High-Resolution sensor-shift composite `.ORF` files into well-formed, widely readable `.dng` files using LibRaw and the Adobe DNG SDK.
 
 ## 1. High-Resolution Image Reconstruction

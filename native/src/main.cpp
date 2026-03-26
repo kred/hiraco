@@ -261,6 +261,36 @@ SourceLinearDngMetadata ParseSourceLinearDngMetadata(const std::string& request_
   metadata.has_predicted_detail_gain =
       FindJsonDouble(request_json, "predicted_detail_gain", &metadata.predicted_detail_gain);
 
+  metadata.stack_stability_path = FindJsonString(request_json, "om3_stack_stability_path");
+  unsigned stack_stability_width = 0;
+  unsigned stack_stability_height = 0;
+  metadata.has_stack_stability_map =
+      !metadata.stack_stability_path.empty() &&
+      FindJsonUnsigned(request_json, "om3_stack_stability_width", &stack_stability_width) &&
+      FindJsonUnsigned(request_json, "om3_stack_stability_height", &stack_stability_height);
+  metadata.stack_stability_width = stack_stability_width;
+  metadata.stack_stability_height = stack_stability_height;
+
+  metadata.stack_mean_path = FindJsonString(request_json, "om3_stack_mean_path");
+  unsigned stack_mean_width = 0;
+  unsigned stack_mean_height = 0;
+  metadata.has_stack_mean_map =
+      !metadata.stack_mean_path.empty() &&
+      FindJsonUnsigned(request_json, "om3_stack_mean_width", &stack_mean_width) &&
+      FindJsonUnsigned(request_json, "om3_stack_mean_height", &stack_mean_height);
+  metadata.stack_mean_width = stack_mean_width;
+  metadata.stack_mean_height = stack_mean_height;
+
+  metadata.stack_alias_path = FindJsonString(request_json, "om3_stack_alias_path");
+  unsigned stack_alias_width = 0;
+  unsigned stack_alias_height = 0;
+  metadata.has_stack_alias_map =
+      !metadata.stack_alias_path.empty() &&
+      FindJsonUnsigned(request_json, "om3_stack_alias_width", &stack_alias_width) &&
+      FindJsonUnsigned(request_json, "om3_stack_alias_height", &stack_alias_height);
+  metadata.stack_alias_width = stack_alias_width;
+  metadata.stack_alias_height = stack_alias_height;
+
   unsigned crop_left = 0;
   unsigned crop_top = 0;
   unsigned crop_width = 0;

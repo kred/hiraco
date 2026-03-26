@@ -7,7 +7,7 @@ from pathlib import Path
 from hiraco import __version__
 from hiraco.config import AppPaths, CompressionMode
 from hiraco.metadata_copy import copy_metadata
-from hiraco.metadata import compact_source_summary
+from hiraco.metadata import compact_source_summary, extract_om3_stack_guidance
 from hiraco.native_build import build_native_helper
 from hiraco.native_contract import ConversionRequest
 from hiraco.native_helper import NativeHelperMissingError, run_conversion
@@ -59,6 +59,17 @@ def handle_convert(args: argparse.Namespace) -> int:
         print(f"preflight inspection failed: {exc}")
         return 2
 
+    try:
+        stack_guidance = extract_om3_stack_guidance(
+            args.source,
+            workspace_root / "tmp" / "stack_guidance",
+        )
+    except Exception as exc:
+        print(f"stack guidance extraction failed: {exc}")
+        return 2
+    if stack_guidance:
+        source_info.update(stack_guidance)
+
     request = ConversionRequest(
         source_path=args.source,
         output_path=args.output,
@@ -105,4 +116,3 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.handler(args)
-

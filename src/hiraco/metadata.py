@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 class MetadataToolError(RuntimeError):
     pass
@@ -431,6 +433,72 @@ def compact_source_summary(path: Path) -> dict[str, Any]:
         "linear_dng_as_shot_neutral_1": None if as_shot_neutral is None else as_shot_neutral[1],
         "linear_dng_as_shot_neutral_2": None if as_shot_neutral is None else as_shot_neutral[2],
         **flattened_color_matrix,
+    }
+
+
+def extract_om3_stack_guidance(path: Path, output_dir: Path) -> dict[str, Any] | None:
+    decoded_label = _decoded_stacked_image_label(path)
+    if decoded_label != "Hand-held high resolution (11 12)":
+        return None
+
+    record = inspect_olympus_makernote_blocks(path)
+    payload = record["blocks"]["UnknownBlock3"]["payload"]
+    if len(payload) != 63488:
+        return None
+
+    grid = np.frombuffer(payload, dtype="<u4")
+    if grid.size != 124 * 128:
+        return None
+
+    grid = grid.reshape(124, 128).astype(np.float32)
+    tile_height = 31
+    tile_width = 64
+    tiles = []
+    for tile_y in range(4):
+        for tile_x in range(2):
+            tiles.append(
+                grid[
+                    tile_y * tile_height : (tile_y + 1) * tile_height,
+                    tile_x * tile_width : (tile_x + 1) * tile_width,
+                ]
+            )
+
+    stack = np.stack(tiles, axis=0)
+    mean = stack.mean(axis=0)
+    std = stack.std(axis=0)
+    relative_std = std / np.maximum(mean, 1.0)
+    scale = float(np.percentile(relative_std, 90))
+    if scale <= 1e-6:
+        stability = np.ones_like(relative_std, dtype=np.float32)
+        alias = np.zeros_like(relative_std, dtype=np.float32)
+    else:
+        stability = np.exp(-np.square(relative_std / scale)).astype(np.float32)
+        normalized = (relative_std / scale).astype(np.float32)
+        alias = normalized * np.exp(-0.5 * np.square(normalized))
+        alias_max = float(alias.max())
+        if alias_max > 1e-6:
+            alias = (alias / alias_max).astype(np.float32)
+        else:
+            alias = np.zeros_like(alias, dtype=np.float32)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stability_path = output_dir / f"{path.stem}_stack_stability.f32"
+    stability.astype("<f4").tofile(stability_path)
+    mean_path = output_dir / f"{path.stem}_stack_mean.f32"
+    mean.astype("<f4").tofile(mean_path)
+    alias_path = output_dir / f"{path.stem}_stack_alias.f32"
+    alias.astype("<f4").tofile(alias_path)
+
+    return {
+        "om3_stack_stability_path": str(stability_path),
+        "om3_stack_stability_width": tile_width,
+        "om3_stack_stability_height": tile_height,
+        "om3_stack_mean_path": str(mean_path),
+        "om3_stack_mean_width": tile_width,
+        "om3_stack_mean_height": tile_height,
+        "om3_stack_alias_path": str(alias_path),
+        "om3_stack_alias_width": tile_width,
+        "om3_stack_alias_height": tile_height,
     }
 
 

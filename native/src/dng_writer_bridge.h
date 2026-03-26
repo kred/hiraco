@@ -31,6 +31,18 @@ struct SourceLinearDngMetadata {
   double color_matrix1[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_predicted_detail_gain = false;
   double predicted_detail_gain = 1.0;
+  bool has_stack_stability_map = false;
+  std::string stack_stability_path;
+  uint32_t stack_stability_width = 0;
+  uint32_t stack_stability_height = 0;
+  bool has_stack_mean_map = false;
+  std::string stack_mean_path;
+  uint32_t stack_mean_width = 0;
+  uint32_t stack_mean_height = 0;
+  bool has_stack_alias_map = false;
+  std::string stack_alias_path;
+  uint32_t stack_alias_width = 0;
+  uint32_t stack_alias_height = 0;
   bool has_default_crop = false;
   uint32_t default_crop_origin_h = 0;
   uint32_t default_crop_origin_v = 0;

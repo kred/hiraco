@@ -17,10 +17,12 @@
 #include "dng_xy_coord.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fftw3.h>
+#include <fstream>
 #include <libraw/libraw.h>
 #include <memory>
 #include <string>
@@ -48,6 +50,7 @@ struct LinearDngPayload {
   RasterImage raw_image;
   RasterImage rendered_preview_source;
   RasterImage cfa_guide_image;
+  bool raw_image_is_camera_space = false;
 };
 
 struct RenderSettings {
@@ -104,6 +107,225 @@ bool ReadEnvFloat(const char* name, float* value) {
 
   *value = parsed;
   return true;
+}
+
+bool EnvFlagEnabled(const char* name, bool default_value) {
+  int value = default_value ? 1 : 0;
+  if (!ReadEnvInt(name, &value)) {
+    return default_value;
+  }
+  return value != 0;
+}
+
+bool ShouldUseExperimentalOm3RawReconstruction(const SourceLinearDngMetadata& metadata) {
+  return IsOm3HighResMetadata(metadata) &&
+         EnvFlagEnabled("HIRACO_OM3_EXPERIMENTAL_RAW_RECON", true);
+}
+
+double RawDomainBlackLevel(const LibRaw& processor) {
+  const unsigned black = processor.imgdata.color.black;
+  if (black > 0) {
+    return static_cast<double>(black);
+  }
+
+  double sum = 0.0;
+  int count = 0;
+  for (int index = 0; index < 4; ++index) {
+    if (processor.imgdata.color.cblack[index] > 0) {
+      sum += static_cast<double>(processor.imgdata.color.cblack[index]);
+      ++count;
+    }
+  }
+  return count > 0 ? sum / count : 0.0;
+}
+
+double RawDomainWhiteLevel(const LibRaw& processor) {
+  const unsigned maximum = processor.imgdata.color.maximum;
+  if (maximum > 0) {
+    return static_cast<double>(maximum);
+  }
+
+  unsigned linear_max = 0;
+  for (int index = 0; index < 4; ++index) {
+    linear_max = std::max(linear_max, processor.imgdata.color.linear_max[index]);
+  }
+  if (linear_max > 0) {
+    return static_cast<double>(linear_max);
+  }
+
+  const unsigned raw_bps = processor.imgdata.color.raw_bps;
+  if (raw_bps > 0 && raw_bps < 31) {
+    return static_cast<double>((1u << raw_bps) - 1u);
+  }
+
+  return 16383.0;
+}
+
+bool LoadFloatMap(const std::string& path,
+                  uint32_t width,
+                  uint32_t height,
+                  const char* label,
+                  std::vector<double>* output,
+                  std::string* error_message) {
+  if (output == nullptr) {
+    return false;
+  }
+  output->clear();
+
+  if (path.empty() || width == 0 || height == 0) {
+    return true;
+  }
+
+  const size_t sample_count = static_cast<size_t>(width) * height;
+  std::vector<float> raw_map(sample_count, 0.0f);
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    *error_message = std::string("Failed to open ") + label;
+    return false;
+  }
+
+  input.read(reinterpret_cast<char*>(raw_map.data()),
+             static_cast<std::streamsize>(sample_count * sizeof(float)));
+  if (!input || input.gcount() != static_cast<std::streamsize>(sample_count * sizeof(float))) {
+    *error_message = std::string("Failed to read ") + label;
+    return false;
+  }
+
+  output->resize(sample_count, 0.0);
+  for (size_t i = 0; i < sample_count; ++i) {
+    (*output)[i] = static_cast<double>(raw_map[i]);
+  }
+  return true;
+}
+
+bool LoadStackStabilityMap(const SourceLinearDngMetadata& metadata,
+                           std::vector<double>* stability_map,
+                           std::string* error_message) {
+  if (stability_map == nullptr) {
+    return false;
+  }
+  stability_map->clear();
+
+  if (!metadata.has_stack_stability_map ||
+      metadata.stack_stability_width == 0 ||
+      metadata.stack_stability_height == 0 ||
+      metadata.stack_stability_path.empty()) {
+    return true;
+  }
+
+  if (!LoadFloatMap(metadata.stack_stability_path,
+                    metadata.stack_stability_width,
+                    metadata.stack_stability_height,
+                    "OM-3 stack stability map",
+                    stability_map,
+                    error_message)) {
+    return false;
+  }
+
+  for (double& value : *stability_map) {
+    value = std::clamp(value, 0.0, 1.0);
+  }
+  return true;
+}
+
+bool LoadStackMeanMap(const SourceLinearDngMetadata& metadata,
+                      std::vector<double>* mean_map,
+                      std::string* error_message) {
+  if (mean_map == nullptr) {
+    return false;
+  }
+  mean_map->clear();
+
+  if (!metadata.has_stack_mean_map ||
+      metadata.stack_mean_width == 0 ||
+      metadata.stack_mean_height == 0 ||
+      metadata.stack_mean_path.empty()) {
+    return true;
+  }
+
+  return LoadFloatMap(metadata.stack_mean_path,
+                      metadata.stack_mean_width,
+                      metadata.stack_mean_height,
+                      "OM-3 stack mean map",
+                      mean_map,
+                      error_message);
+}
+
+bool LoadStackAliasMap(const SourceLinearDngMetadata& metadata,
+                       std::vector<double>* alias_map,
+                       std::string* error_message) {
+  if (alias_map == nullptr) {
+    return false;
+  }
+  alias_map->clear();
+
+  if (!metadata.has_stack_alias_map ||
+      metadata.stack_alias_width == 0 ||
+      metadata.stack_alias_height == 0 ||
+      metadata.stack_alias_path.empty()) {
+    return true;
+  }
+
+  if (!LoadFloatMap(metadata.stack_alias_path,
+                    metadata.stack_alias_width,
+                    metadata.stack_alias_height,
+                    "OM-3 stack alias map",
+                    alias_map,
+                    error_message)) {
+    return false;
+  }
+
+  for (double& value : *alias_map) {
+    value = std::clamp(value, 0.0, 1.0);
+  }
+  return true;
+}
+
+void UpsampleFloatMap(const std::vector<double>& source,
+                      uint32_t source_width,
+                      uint32_t source_height,
+                      uint32_t target_width,
+                      uint32_t target_height,
+                      std::vector<double>* target) {
+  if (target == nullptr) {
+    return;
+  }
+  target->clear();
+
+  if (source.empty() || source_width == 0 || source_height == 0 ||
+      target_width == 0 || target_height == 0) {
+    return;
+  }
+
+  target->resize(static_cast<size_t>(target_width) * target_height, 0.0);
+
+  const double scale_x = static_cast<double>(source_width) / static_cast<double>(target_width);
+  const double scale_y = static_cast<double>(source_height) / static_cast<double>(target_height);
+  for (uint32_t row = 0; row < target_height; ++row) {
+    const double y = (static_cast<double>(row) + 0.5) * scale_y - 0.5;
+    const int y0 = static_cast<int>(std::floor(y));
+    const int y1 = y0 + 1;
+    const double wy = y - std::floor(y);
+    const uint32_t sy0 = static_cast<uint32_t>(std::clamp(y0, 0, static_cast<int>(source_height) - 1));
+    const uint32_t sy1 = static_cast<uint32_t>(std::clamp(y1, 0, static_cast<int>(source_height) - 1));
+    for (uint32_t col = 0; col < target_width; ++col) {
+      const double x = (static_cast<double>(col) + 0.5) * scale_x - 0.5;
+      const int x0 = static_cast<int>(std::floor(x));
+      const int x1 = x0 + 1;
+      const double wx = x - std::floor(x);
+      const uint32_t sx0 = static_cast<uint32_t>(std::clamp(x0, 0, static_cast<int>(source_width) - 1));
+      const uint32_t sx1 = static_cast<uint32_t>(std::clamp(x1, 0, static_cast<int>(source_width) - 1));
+
+      const double v00 = source[static_cast<size_t>(sy0) * source_width + sx0];
+      const double v01 = source[static_cast<size_t>(sy0) * source_width + sx1];
+      const double v10 = source[static_cast<size_t>(sy1) * source_width + sx0];
+      const double v11 = source[static_cast<size_t>(sy1) * source_width + sx1];
+      const double top = (1.0 - wx) * v00 + wx * v01;
+      const double bottom = (1.0 - wx) * v10 + wx * v11;
+      (*target)[static_cast<size_t>(row) * target_width + col] =
+          (1.0 - wy) * top + wy * bottom;
+    }
+  }
 }
 
 void ApplyLibRawEnvironmentOverrides(RenderSettings* settings) {
@@ -283,7 +505,12 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // Keep a copy of the original luma for ratio transfer.
   std::vector<double> original_luma(luma);
 
+  const bool enable_stage1 = EnvFlagEnabled("HIRACO_DETAIL_STAGE1", false);
+  const bool enable_stage2 = EnvFlagEnabled("HIRACO_DETAIL_STAGE2", true);
+  const bool enable_stage3 = EnvFlagEnabled("HIRACO_DETAIL_STAGE3", true);
+
   std::vector<double> confidence(pixel_count, 1.0);
+
   if (cfa_guide_image != nullptr &&
       cfa_guide_image->width == width &&
       cfa_guide_image->height == height &&
@@ -345,7 +572,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     for (size_t i = 0; i < pixel_count; ++i) {
       const double norm = green_residual[i] / residual_scale;
       const double atten = std::exp(-(norm * norm));
-      confidence[i] = std::clamp(atten, 0.15, 1.0);
+      confidence[i] *= std::clamp(atten, 0.15, 1.0);
     }
 
     // Suppress single-pixel mask speckle.
@@ -359,9 +586,11 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // domain zeros, making Wiener deconvolution well-posed.
   // Uses mirror/reflection padding to avoid boundary discontinuities that
   // produce periodic stipple artifacts with zero-padding.
-  {
-    const double psf_sigma = 1.0;
-    const double nsr = 0.004;
+  if (enable_stage1) {
+    float psf_sigma = 1.05f;
+    float nsr = 0.004f;
+    ReadEnvFloat("HIRACO_STAGE1_PSF_SIGMA", &psf_sigma);
+    ReadEnvFloat("HIRACO_STAGE1_NSR", &nsr);
 
     // Mirror-pad margins — enough to cover the PSF support and avoid
     // wrap-around artefacts.  32 px border is ample for σ ≤ 2.
@@ -497,7 +726,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // Operates at full resolution at every scale using dilated B3-spline
   // convolution.  Each scale captures a different frequency band and
   // receives an independent gain.
-  {
+  if (enable_stage2) {
     constexpr int kNumScales = 4;
     // Fine-scale gains — slightly reduced from v1 to avoid noise amplification.
     const double scale_gains[kNumScales] = {1.4, 1.25, 1.1, 1.0};
@@ -603,7 +832,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // --- Stage 3: Guided-filter based edge-aware refinement ---
   // Applies a final sharpening pass using a guided filter (self-guided)
   // as the smoothing base, avoiding halos at strong edges.
-  {
+  if (enable_stage3) {
     constexpr int kGfRadius = 6;
     constexpr double kGfEps = 0.001 * 65535.0 * 65535.0;
     const double gf_gain = 0.35 * (base_gain - 1.0);
@@ -800,7 +1029,7 @@ bool ExtractCfaGuideImage(const std::string& source_path,
   guide->bits = 16;
   guide->pixels.resize(static_cast<size_t>(width) * height * guide->colors, 0);
 
-  const double black_level = metadata.has_black_level ? metadata.black_level : 0.0;
+  const double black_level = RawDomainBlackLevel(processor);
 
   auto raw_sample = [&](int row, int col, int target_color) -> double {
     row = std::clamp(row, 0, static_cast<int>(height) - 1);
@@ -860,6 +1089,80 @@ bool ExtractCfaGuideImage(const std::string& source_path,
   return true;
 }
 
+void ApplyOm3HighResCfaPrecondition(const SourceLinearDngMetadata& metadata,
+                                    LibRaw* processor) {
+  if (!IsOm3HighResMetadata(metadata)) {
+    return;
+  }
+
+  ushort* raw = processor->imgdata.rawdata.raw_image;
+  const uint32_t width = processor->imgdata.sizes.raw_width;
+  const uint32_t height = processor->imgdata.sizes.raw_height;
+  if (raw == nullptr || width == 0 || height == 0) {
+    return;
+  }
+
+  const double black_level = RawDomainBlackLevel(*processor);
+  std::vector<uint16_t> updated(raw, raw + static_cast<size_t>(width) * height);
+
+  auto raw_sample = [&](int row, int col, int target_color) -> double {
+    row = std::clamp(row, 0, static_cast<int>(height) - 1);
+    col = std::clamp(col, 0, static_cast<int>(width) - 1);
+    if (processor->COLOR(row, col) != target_color) {
+      return -1.0;
+    }
+    const size_t idx = static_cast<size_t>(row) * width + col;
+    return std::max(static_cast<double>(raw[idx]) - black_level, 0.0);
+  };
+
+  for (uint32_t row = 0; row < height; ++row) {
+    for (uint32_t col = 0; col < width; ++col) {
+      const int color = processor->COLOR(static_cast<int>(row), static_cast<int>(col));
+      if (color != 1 && color != 3) {
+        continue;
+      }
+
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      const double current = std::max(static_cast<double>(raw[idx]) - black_level, 0.0);
+
+      double opposite_estimate = -1.0;
+      if (color == 1) {
+        const double d1 = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col) - 1, 3);
+        const double d2 = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col) + 1, 3);
+        const double d3 = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col) - 1, 3);
+        const double d4 = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col) + 1, 3);
+        opposite_estimate = 0.25 * (std::max(d1, 0.0) + std::max(d2, 0.0) +
+                                    std::max(d3, 0.0) + std::max(d4, 0.0));
+      } else {
+        const double d1 = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col) - 1, 1);
+        const double d2 = raw_sample(static_cast<int>(row) - 1, static_cast<int>(col) + 1, 1);
+        const double d3 = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col) - 1, 1);
+        const double d4 = raw_sample(static_cast<int>(row) + 1, static_cast<int>(col) + 1, 1);
+        opposite_estimate = 0.25 * (std::max(d1, 0.0) + std::max(d2, 0.0) +
+                                    std::max(d3, 0.0) + std::max(d4, 0.0));
+      }
+
+      if (opposite_estimate < 0.0) {
+        continue;
+      }
+
+      const double local_scale = std::max({current, opposite_estimate, 256.0});
+      const double split = current - opposite_estimate;
+      const double threshold = 0.012 * local_scale + 24.0;
+      if (std::abs(split) <= threshold) {
+        continue;
+      }
+
+      const double norm = std::abs(split) / threshold;
+      const double alpha = std::clamp(1.0 / (1.0 + 0.35 * norm * norm), 0.35, 1.0);
+      const double fused = opposite_estimate + alpha * split;
+      updated[idx] = static_cast<uint16_t>(std::clamp(fused + black_level, 0.0, 65535.0));
+    }
+  }
+
+  std::copy(updated.begin(), updated.end(), raw);
+}
+
 RasterImage MakeSyntheticRgbImage() {
   RasterImage image;
   image.width = 48;
@@ -881,6 +1184,7 @@ RasterImage MakeSyntheticRgbImage() {
 }
 
 bool RenderLibRawImage(const std::string& source_path,
+                       const SourceLinearDngMetadata& metadata,
                        const RenderSettings& settings,
                        RasterImage* output,
                        std::string* error_message,
@@ -899,6 +1203,8 @@ bool RenderLibRawImage(const std::string& source_path,
     processor.recycle();
     return false;
   }
+
+  ApplyOm3HighResCfaPrecondition(metadata, &processor);
 
   libraw_set_output_bps(&processor.imgdata, 16);
   libraw_set_output_color(&processor.imgdata, settings.output_color);
@@ -959,6 +1265,879 @@ bool RenderLibRawImage(const std::string& source_path,
   return true;
 }
 
+std::array<double, 9> IdentityMatrix3x3() {
+  return {1.0, 0.0, 0.0,
+          0.0, 1.0, 0.0,
+          0.0, 0.0, 1.0};
+}
+
+bool InvertMatrix3x3(const std::array<double, 9>& input,
+                     std::array<double, 9>* inverse) {
+  const double a = input[0];
+  const double b = input[1];
+  const double c = input[2];
+  const double d = input[3];
+  const double e = input[4];
+  const double f = input[5];
+  const double g = input[6];
+  const double h = input[7];
+  const double i = input[8];
+
+  const double A = e * i - f * h;
+  const double B = -(d * i - f * g);
+  const double C = d * h - e * g;
+  const double D = -(b * i - c * h);
+  const double E = a * i - c * g;
+  const double F = -(a * h - b * g);
+  const double G = b * f - c * e;
+  const double H = -(a * f - c * d);
+  const double I = a * e - b * d;
+
+  const double det = a * A + b * B + c * C;
+  if (std::abs(det) < 1e-9) {
+    return false;
+  }
+
+  const double inv_det = 1.0 / det;
+  *inverse = {A * inv_det, D * inv_det, G * inv_det,
+              B * inv_det, E * inv_det, H * inv_det,
+              C * inv_det, F * inv_det, I * inv_det};
+  return true;
+}
+
+std::array<double, 3> MultiplyMatrix3x3Vector(const std::array<double, 9>& matrix,
+                                              const std::array<double, 3>& vector) {
+  return {
+      matrix[0] * vector[0] + matrix[1] * vector[1] + matrix[2] * vector[2],
+      matrix[3] * vector[0] + matrix[4] * vector[1] + matrix[5] * vector[2],
+      matrix[6] * vector[0] + matrix[7] * vector[1] + matrix[8] * vector[2],
+  };
+}
+
+bool RenderOm3RawDomainImage(const std::string& source_path,
+                             const SourceLinearDngMetadata& metadata,
+                             RasterImage* output,
+                             std::string* error_message) {
+  if (output == nullptr) {
+    *error_message = "Null output raster for OM-3 raw-domain render";
+    return false;
+  }
+
+  LibRaw processor;
+  int result = processor.open_file(source_path.c_str());
+  if (result != LIBRAW_SUCCESS) {
+    *error_message = std::string("LibRaw open_file failed: ") + libraw_strerror(result);
+    return false;
+  }
+
+  result = processor.unpack();
+  if (result != LIBRAW_SUCCESS) {
+    *error_message = std::string("LibRaw unpack failed: ") + libraw_strerror(result);
+    processor.recycle();
+    return false;
+  }
+
+  ApplyOm3HighResCfaPrecondition(metadata, &processor);
+
+  const ushort* raw = processor.imgdata.rawdata.raw_image;
+  const uint32_t width = processor.imgdata.sizes.raw_width;
+  const uint32_t height = processor.imgdata.sizes.raw_height;
+  if (raw == nullptr || width == 0 || height == 0) {
+    *error_message = "LibRaw raw mosaic not available for OM-3 raw-domain render";
+    processor.recycle();
+    return false;
+  }
+
+  const size_t pixel_count = static_cast<size_t>(width) * height;
+  const double raw_black_level = RawDomainBlackLevel(processor);
+  const double raw_white_level = std::max(RawDomainWhiteLevel(processor), raw_black_level + 1.0);
+  const double pedestal = metadata.has_black_level ? metadata.black_level : 0.0;
+  const double scale = (65535.0 - pedestal) / std::max(raw_white_level - raw_black_level, 1.0);
+
+  std::vector<double> mosaic(pixel_count);
+  std::vector<uint8_t> cfa(pixel_count);
+  for (uint32_t row = 0; row < height; ++row) {
+    for (uint32_t col = 0; col < width; ++col) {
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      cfa[idx] = static_cast<uint8_t>(processor.COLOR(static_cast<int>(row), static_cast<int>(col)));
+      mosaic[idx] = std::clamp((std::max(static_cast<double>(raw[idx]) - raw_black_level, 0.0)) * scale,
+                               0.0,
+                               65535.0 - pedestal);
+    }
+  }
+
+  processor.recycle();
+
+  output->width = width;
+  output->height = height;
+  output->colors = 3;
+  output->bits = 16;
+  output->pixels.resize(pixel_count * output->colors);
+
+  auto clamp_channel = [&](double value) -> uint16_t {
+    return static_cast<uint16_t>(std::clamp(pedestal + value, 0.0, 65535.0));
+  };
+
+  auto clamp_row = [&](int row) -> uint32_t {
+    return static_cast<uint32_t>(std::clamp(row, 0, static_cast<int>(height) - 1));
+  };
+  auto clamp_col = [&](int col) -> uint32_t {
+    return static_cast<uint32_t>(std::clamp(col, 0, static_cast<int>(width) - 1));
+  };
+  auto sample_mosaic = [&](int row, int col) -> double {
+    return mosaic[static_cast<size_t>(clamp_row(row)) * width + clamp_col(col)];
+  };
+  auto sample_color = [&](int row, int col, int target_color) -> double {
+    const uint32_t r = clamp_row(row);
+    const uint32_t c = clamp_col(col);
+    const size_t idx = static_cast<size_t>(r) * width + c;
+    return cfa[idx] == target_color ? mosaic[idx] : -1.0;
+  };
+
+  std::vector<double> stack_stability;
+  if (!LoadStackStabilityMap(metadata, &stack_stability, error_message)) {
+    return false;
+  }
+
+  std::vector<double> upsampled_stability;
+  UpsampleFloatMap(stack_stability,
+                   metadata.stack_stability_width,
+                   metadata.stack_stability_height,
+                   width,
+                   height,
+                   &upsampled_stability);
+
+  std::vector<double> stack_mean;
+  if (!LoadStackMeanMap(metadata, &stack_mean, error_message)) {
+    return false;
+  }
+
+  std::vector<double> upsampled_stack_mean;
+
+  std::vector<double> stack_alias;
+  if (!LoadStackAliasMap(metadata, &stack_alias, error_message)) {
+    return false;
+  }
+
+  std::vector<double> upsampled_stack_alias;
+  UpsampleFloatMap(stack_alias,
+                   metadata.stack_alias_width,
+                   metadata.stack_alias_height,
+                   width,
+                   height,
+                   &upsampled_stack_alias);
+
+  std::vector<double> green(pixel_count, 0.0);
+  for (uint32_t row = 0; row < height; ++row) {
+    for (uint32_t col = 0; col < width; ++col) {
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      const int color = cfa[idx];
+      if (color == 1 || color == 3) {
+        green[idx] = mosaic[idx];
+        continue;
+      }
+
+      const double center = mosaic[idx];
+      const double g_left = std::max(sample_color(static_cast<int>(row), static_cast<int>(col) - 1, 1), 0.0) +
+                            std::max(sample_color(static_cast<int>(row), static_cast<int>(col) - 1, 3), 0.0);
+      const double g_right = std::max(sample_color(static_cast<int>(row), static_cast<int>(col) + 1, 1), 0.0) +
+                             std::max(sample_color(static_cast<int>(row), static_cast<int>(col) + 1, 3), 0.0);
+      const double g_up = std::max(sample_color(static_cast<int>(row) - 1, static_cast<int>(col), 1), 0.0) +
+                          std::max(sample_color(static_cast<int>(row) - 1, static_cast<int>(col), 3), 0.0);
+      const double g_down = std::max(sample_color(static_cast<int>(row) + 1, static_cast<int>(col), 1), 0.0) +
+                            std::max(sample_color(static_cast<int>(row) + 1, static_cast<int>(col), 3), 0.0);
+      const double same_left = sample_mosaic(static_cast<int>(row), static_cast<int>(col) - 2);
+      const double same_right = sample_mosaic(static_cast<int>(row), static_cast<int>(col) + 2);
+      const double same_up = sample_mosaic(static_cast<int>(row) - 2, static_cast<int>(col));
+      const double same_down = sample_mosaic(static_cast<int>(row) + 2, static_cast<int>(col));
+
+      const double horiz = 0.5 * (g_left + g_right) +
+                           0.25 * (2.0 * center - same_left - same_right);
+      const double vert = 0.5 * (g_up + g_down) +
+                          0.25 * (2.0 * center - same_up - same_down);
+      const double grad_h = std::abs(g_left - g_right) +
+                            0.5 * std::abs(2.0 * center - same_left - same_right);
+      const double grad_v = std::abs(g_up - g_down) +
+                            0.5 * std::abs(2.0 * center - same_up - same_down);
+      const double weight_h = 1.0 / (grad_h + 1.0);
+      const double weight_v = 1.0 / (grad_v + 1.0);
+
+      if (std::max(weight_h, weight_v) > 1.8 * std::min(weight_h, weight_v)) {
+        green[idx] = weight_h > weight_v ? horiz : vert;
+      } else {
+        green[idx] = (weight_h * horiz + weight_v * vert) / (weight_h + weight_v);
+      }
+      green[idx] = std::clamp(green[idx], 0.0, 65535.0 - pedestal);
+    }
+  }
+
+  auto sample_buffer = [&](const std::vector<double>& buffer, int row, int col) -> double {
+    return buffer[static_cast<size_t>(clamp_row(row)) * width + clamp_col(col)];
+  };
+
+  auto bilinear_sample = [&](const std::vector<double>& buffer, double row, double col) -> double {
+    const int y0 = static_cast<int>(std::floor(row));
+    const int x0 = static_cast<int>(std::floor(col));
+    const int y1 = y0 + 1;
+    const int x1 = x0 + 1;
+    const double wy = row - std::floor(row);
+    const double wx = col - std::floor(col);
+    const double v00 = sample_buffer(buffer, y0, x0);
+    const double v01 = sample_buffer(buffer, y0, x1);
+    const double v10 = sample_buffer(buffer, y1, x0);
+    const double v11 = sample_buffer(buffer, y1, x1);
+    const double top = (1.0 - wx) * v00 + wx * v01;
+    const double bottom = (1.0 - wx) * v10 + wx * v11;
+    return (1.0 - wy) * top + wy * bottom;
+  };
+
+  if (!stack_mean.empty()) {
+    const uint32_t guide_width = metadata.stack_mean_width;
+    const uint32_t guide_height = metadata.stack_mean_height;
+    std::vector<double> low_res_green(static_cast<size_t>(guide_width) * guide_height, 0.0);
+
+    for (uint32_t row = 0; row < guide_height; ++row) {
+      const double full_row =
+          (static_cast<double>(row) + 0.5) * static_cast<double>(height) / static_cast<double>(guide_height) - 0.5;
+      for (uint32_t col = 0; col < guide_width; ++col) {
+        const double full_col =
+            (static_cast<double>(col) + 0.5) * static_cast<double>(width) / static_cast<double>(guide_width) - 0.5;
+        low_res_green[static_cast<size_t>(row) * guide_width + col] =
+            bilinear_sample(green, full_row, full_col);
+      }
+    }
+
+    double sum_guide = 0.0;
+    double sum_green = 0.0;
+    double sum_guide_sq = 0.0;
+    double sum_guide_green = 0.0;
+    for (size_t idx = 0; idx < stack_mean.size(); ++idx) {
+      const double guide_value = stack_mean[idx];
+      const double green_value = low_res_green[idx];
+      sum_guide += guide_value;
+      sum_green += green_value;
+      sum_guide_sq += guide_value * guide_value;
+      sum_guide_green += guide_value * green_value;
+    }
+
+    const double count = static_cast<double>(stack_mean.size());
+    const double mean_guide = sum_guide / count;
+    const double mean_green = sum_green / count;
+    const double var_guide = sum_guide_sq / count - mean_guide * mean_guide;
+    const double cov_guide_green = sum_guide_green / count - mean_guide * mean_green;
+
+    double gain = 1.0;
+    if (var_guide > 1e-6) {
+      gain = cov_guide_green / var_guide;
+    }
+    if (!std::isfinite(gain) || gain <= 0.0) {
+      gain = 1.0;
+    }
+    gain = std::clamp(gain, 0.05, 64.0);
+    const double bias = mean_green - gain * mean_guide;
+
+    std::vector<double> stack_mean_scaled(stack_mean.size(), 0.0);
+    for (size_t idx = 0; idx < stack_mean.size(); ++idx) {
+      stack_mean_scaled[idx] = std::clamp(gain * stack_mean[idx] + bias, 0.0, 65535.0 - pedestal);
+    }
+
+    upsampled_stack_mean.resize(pixel_count, 0.0);
+    for (uint32_t row = 0; row < height; ++row) {
+      const double guide_row =
+          (static_cast<double>(row) + 0.5) * static_cast<double>(guide_height) / static_cast<double>(height) - 0.5;
+      const int y0 = static_cast<int>(std::floor(guide_row));
+      const int y1 = y0 + 1;
+      const double wy = guide_row - std::floor(guide_row);
+      const uint32_t sy0 = static_cast<uint32_t>(std::clamp(y0, 0, static_cast<int>(guide_height) - 1));
+      const uint32_t sy1 = static_cast<uint32_t>(std::clamp(y1, 0, static_cast<int>(guide_height) - 1));
+      for (uint32_t col = 0; col < width; ++col) {
+        const size_t out_idx = static_cast<size_t>(row) * width + col;
+        const double guide_col =
+            (static_cast<double>(col) + 0.5) * static_cast<double>(guide_width) / static_cast<double>(width) - 0.5;
+        const int x0 = static_cast<int>(std::floor(guide_col));
+        const int x1 = x0 + 1;
+        const double wx = guide_col - std::floor(guide_col);
+        const uint32_t sx0 = static_cast<uint32_t>(std::clamp(x0, 0, static_cast<int>(guide_width) - 1));
+        const uint32_t sx1 = static_cast<uint32_t>(std::clamp(x1, 0, static_cast<int>(guide_width) - 1));
+
+        const double base_w00 = (1.0 - wx) * (1.0 - wy);
+        const double base_w01 = wx * (1.0 - wy);
+        const double base_w10 = (1.0 - wx) * wy;
+        const double base_w11 = wx * wy;
+        const double green_center = green[out_idx];
+        const double sigma = 0.05 * std::max(green_center, 512.0) + 48.0;
+        const double inv_sigma_sq = 1.0 / (2.0 * sigma * sigma);
+
+        const double low_g00 = low_res_green[static_cast<size_t>(sy0) * guide_width + sx0];
+        const double low_g01 = low_res_green[static_cast<size_t>(sy0) * guide_width + sx1];
+        const double low_g10 = low_res_green[static_cast<size_t>(sy1) * guide_width + sx0];
+        const double low_g11 = low_res_green[static_cast<size_t>(sy1) * guide_width + sx1];
+
+        const double w00 = base_w00 * std::exp(-(low_g00 - green_center) * (low_g00 - green_center) * inv_sigma_sq);
+        const double w01 = base_w01 * std::exp(-(low_g01 - green_center) * (low_g01 - green_center) * inv_sigma_sq);
+        const double w10 = base_w10 * std::exp(-(low_g10 - green_center) * (low_g10 - green_center) * inv_sigma_sq);
+        const double w11 = base_w11 * std::exp(-(low_g11 - green_center) * (low_g11 - green_center) * inv_sigma_sq);
+        const double weight_sum = w00 + w01 + w10 + w11;
+
+        const double s00 = stack_mean_scaled[static_cast<size_t>(sy0) * guide_width + sx0];
+        const double s01 = stack_mean_scaled[static_cast<size_t>(sy0) * guide_width + sx1];
+        const double s10 = stack_mean_scaled[static_cast<size_t>(sy1) * guide_width + sx0];
+        const double s11 = stack_mean_scaled[static_cast<size_t>(sy1) * guide_width + sx1];
+        if (weight_sum > 1e-12) {
+          upsampled_stack_mean[out_idx] =
+              (w00 * s00 + w01 * s01 + w10 * s10 + w11 * s11) / weight_sum;
+        } else {
+          upsampled_stack_mean[out_idx] =
+              base_w00 * s00 + base_w01 * s01 + base_w10 * s10 + base_w11 * s11;
+        }
+      }
+    }
+
+    std::vector<double> refined_green(green);
+    for (uint32_t row = 0; row < height; ++row) {
+      for (uint32_t col = 0; col < width; ++col) {
+        const size_t idx = static_cast<size_t>(row) * width + col;
+        const int color = cfa[idx];
+        if (color == 1 || color == 3) {
+          continue;
+        }
+
+        const double center = mosaic[idx];
+        const double g_left = sample_buffer(green, static_cast<int>(row), static_cast<int>(col) - 1);
+        const double g_right = sample_buffer(green, static_cast<int>(row), static_cast<int>(col) + 1);
+        const double g_up = sample_buffer(green, static_cast<int>(row) - 1, static_cast<int>(col));
+        const double g_down = sample_buffer(green, static_cast<int>(row) + 1, static_cast<int>(col));
+        const double same_left = sample_mosaic(static_cast<int>(row), static_cast<int>(col) - 2);
+        const double same_right = sample_mosaic(static_cast<int>(row), static_cast<int>(col) + 2);
+        const double same_up = sample_mosaic(static_cast<int>(row) - 2, static_cast<int>(col));
+        const double same_down = sample_mosaic(static_cast<int>(row) + 2, static_cast<int>(col));
+
+        const double horiz = 0.5 * (g_left + g_right) +
+                             0.25 * (2.0 * center - same_left - same_right);
+        const double vert = 0.5 * (g_up + g_down) +
+                            0.25 * (2.0 * center - same_up - same_down);
+        const double grad_h = std::abs(g_left - g_right) +
+                              0.5 * std::abs(2.0 * center - same_left - same_right);
+        const double grad_v = std::abs(g_up - g_down) +
+                              0.5 * std::abs(2.0 * center - same_up - same_down);
+
+        const double guide_center = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col));
+        const double guide_left = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) - 1);
+        const double guide_right = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) + 1);
+        const double guide_up = sample_buffer(upsampled_stack_mean, static_cast<int>(row) - 1, static_cast<int>(col));
+        const double guide_down = sample_buffer(upsampled_stack_mean, static_cast<int>(row) + 1, static_cast<int>(col));
+        const double guide_same_left = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) - 2);
+        const double guide_same_right = sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) + 2);
+        const double guide_same_up = sample_buffer(upsampled_stack_mean, static_cast<int>(row) - 2, static_cast<int>(col));
+        const double guide_same_down = sample_buffer(upsampled_stack_mean, static_cast<int>(row) + 2, static_cast<int>(col));
+
+        const double guide_grad_h =
+            std::abs(guide_left - guide_right) +
+            0.5 * std::abs(2.0 * guide_center - guide_same_left - guide_same_right);
+        const double guide_grad_v =
+            std::abs(guide_up - guide_down) +
+            0.5 * std::abs(2.0 * guide_center - guide_same_up - guide_same_down);
+
+        const double guide_conf =
+            upsampled_stability.empty() ? 1.0 : upsampled_stability[idx];
+        const double alias_conf =
+            upsampled_stack_alias.empty() ? 0.0 : upsampled_stack_alias[idx];
+        const double guide_mix =
+            std::clamp(0.08 + 0.12 * guide_conf + 0.10 * alias_conf, 0.08, 0.30);
+        const double combined_grad_h = (1.0 - guide_mix) * grad_h + guide_mix * guide_grad_h;
+        const double combined_grad_v = (1.0 - guide_mix) * grad_v + guide_mix * guide_grad_v;
+        const double weight_h = 1.0 / (combined_grad_h + 1.0);
+        const double weight_v = 1.0 / (combined_grad_v + 1.0);
+
+        double estimate = 0.0;
+        if (std::max(weight_h, weight_v) > 1.8 * std::min(weight_h, weight_v)) {
+          estimate = weight_h > weight_v ? horiz : vert;
+        } else {
+          estimate = (weight_h * horiz + weight_v * vert) / (weight_h + weight_v);
+        }
+
+        const double guide_anisotropy =
+            std::abs(guide_grad_h - guide_grad_v) / (guide_grad_h + guide_grad_v + 1.0);
+        const double blend_weight =
+            std::clamp(0.04 +
+                           0.08 * guide_conf * guide_anisotropy +
+                           0.10 * alias_conf * guide_anisotropy,
+                       0.04,
+                       0.18);
+        refined_green[idx] =
+            std::clamp((1.0 - blend_weight) * green[idx] + blend_weight * estimate,
+                       0.0,
+                       65535.0 - pedestal);
+      }
+    }
+    green.swap(refined_green);
+  }
+
+  auto blur5 = [&](const std::vector<double>& src, std::vector<double>* dst) {
+    dst->assign(pixel_count, 0.0);
+    std::vector<double> temp(pixel_count, 0.0);
+    constexpr double kernel[5] = {1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0};
+
+    for (uint32_t row = 0; row < height; ++row) {
+      const size_t row_offset = static_cast<size_t>(row) * width;
+      for (uint32_t col = 0; col < width; ++col) {
+        double sum = 0.0;
+        for (int tap = -2; tap <= 2; ++tap) {
+          sum += kernel[tap + 2] * src[row_offset + clamp_col(static_cast<int>(col) + tap)];
+        }
+        temp[row_offset + col] = sum;
+      }
+    }
+
+    for (uint32_t row = 0; row < height; ++row) {
+      for (uint32_t col = 0; col < width; ++col) {
+        double sum = 0.0;
+        for (int tap = -2; tap <= 2; ++tap) {
+          sum += kernel[tap + 2] * temp[static_cast<size_t>(clamp_row(static_cast<int>(row) + tap)) * width + col];
+        }
+        (*dst)[static_cast<size_t>(row) * width + col] = sum;
+      }
+    }
+  };
+
+  if (!upsampled_stability.empty()) {
+    std::vector<double> green_blur;
+    blur5(green, &green_blur);
+    const double detail_strength =
+        std::clamp(0.74 + 0.30 * std::max(metadata.predicted_detail_gain - 1.0, 0.0), 0.70, 1.10);
+
+    for (uint32_t row = 0; row < height; ++row) {
+      for (uint32_t col = 0; col < width; ++col) {
+        const size_t idx = static_cast<size_t>(row) * width + col;
+        const double green_detail = green[idx] - green_blur[idx];
+        const double g_left = std::max(sample_color(static_cast<int>(row), static_cast<int>(col) - 1, 1), 0.0) +
+                              std::max(sample_color(static_cast<int>(row), static_cast<int>(col) - 1, 3), 0.0);
+        const double g_right = std::max(sample_color(static_cast<int>(row), static_cast<int>(col) + 1, 1), 0.0) +
+                               std::max(sample_color(static_cast<int>(row), static_cast<int>(col) + 1, 3), 0.0);
+        const double g_up = std::max(sample_color(static_cast<int>(row) - 1, static_cast<int>(col), 1), 0.0) +
+                            std::max(sample_color(static_cast<int>(row) - 1, static_cast<int>(col), 3), 0.0);
+        const double g_down = std::max(sample_color(static_cast<int>(row) + 1, static_cast<int>(col), 1), 0.0) +
+                              std::max(sample_color(static_cast<int>(row) + 1, static_cast<int>(col), 3), 0.0);
+
+        const double split_hv = std::abs(0.5 * (g_left + g_right) - 0.5 * (g_up + g_down));
+        const double local_scale = std::max(green_blur[idx], 512.0);
+        const double split_confidence = std::exp(-std::pow(split_hv / (0.025 * local_scale + 16.0), 2.0));
+        const double alias_conf =
+            upsampled_stack_alias.empty() ? 0.0 : upsampled_stack_alias[idx];
+        double mask = upsampled_stability[idx] * std::clamp(split_confidence, 0.20, 1.0);
+        double detail_boost = 1.0 + 0.28 * alias_conf;
+        double cap_scale = 1.0 + 0.18 * alias_conf;
+        if (!upsampled_stack_mean.empty()) {
+          const double guide_left =
+              sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) - 1);
+          const double guide_right =
+              sample_buffer(upsampled_stack_mean, static_cast<int>(row), static_cast<int>(col) + 1);
+          const double guide_up =
+              sample_buffer(upsampled_stack_mean, static_cast<int>(row) - 1, static_cast<int>(col));
+          const double guide_down =
+              sample_buffer(upsampled_stack_mean, static_cast<int>(row) + 1, static_cast<int>(col));
+          const double guide_edge =
+              std::max(std::abs(guide_left - guide_right), std::abs(guide_up - guide_down));
+          const double guide_edge_conf =
+              std::clamp(guide_edge / (0.035 * local_scale + 24.0), 0.0, 1.0);
+          mask *= 0.95 + 0.05 * guide_edge_conf;
+          detail_boost *= 1.0 + 0.18 * alias_conf * guide_edge_conf;
+          cap_scale *= 1.0 + 0.12 * alias_conf * guide_edge_conf;
+        }
+        const double capped_detail =
+            std::clamp(green_detail,
+                       -(0.16 * cap_scale) * local_scale - 160.0,
+                        (0.16 * cap_scale) * local_scale + 160.0);
+        green[idx] = std::clamp(green[idx] + detail_strength * detail_boost * mask * capped_detail,
+                                0.0,
+                                65535.0 - pedestal);
+      }
+    }
+  }
+
+  std::vector<double> red_diff(pixel_count, 0.0);
+  std::vector<double> blue_diff(pixel_count, 0.0);
+  for (size_t idx = 0; idx < pixel_count; ++idx) {
+    if (cfa[idx] == 0) {
+      red_diff[idx] = mosaic[idx] - green[idx];
+    } else if (cfa[idx] == 2) {
+      blue_diff[idx] = mosaic[idx] - green[idx];
+    }
+  }
+
+  auto interp_axis_diff = [&](uint32_t row, uint32_t col, int target_color, bool horizontal) -> double {
+    const int dr = horizontal ? 0 : 1;
+    const int dc = horizontal ? 1 : 0;
+    const uint32_t r0 = clamp_row(static_cast<int>(row) - dr);
+    const uint32_t c0 = clamp_col(static_cast<int>(col) - dc);
+    const uint32_t r1 = clamp_row(static_cast<int>(row) + dr);
+    const uint32_t c1 = clamp_col(static_cast<int>(col) + dc);
+    const size_t idx0 = static_cast<size_t>(r0) * width + c0;
+    const size_t idx1 = static_cast<size_t>(r1) * width + c1;
+    const size_t idxc = static_cast<size_t>(row) * width + col;
+    const double d0 = target_color == 0 ? red_diff[idx0] : blue_diff[idx0];
+    const double d1 = target_color == 0 ? red_diff[idx1] : blue_diff[idx1];
+    const double g0 = green[idx0];
+    const double g1 = green[idx1];
+    const double gc = green[idxc];
+    double guide_term0 = 0.0;
+    double guide_term1 = 0.0;
+    double guide_weight = 0.0;
+    if (!upsampled_stack_mean.empty()) {
+      const double guide_center = upsampled_stack_mean[idxc];
+      guide_term0 = std::abs(upsampled_stack_mean[idx0] - guide_center);
+      guide_term1 = std::abs(upsampled_stack_mean[idx1] - guide_center);
+      const double guide_conf =
+          upsampled_stability.empty() ? 1.0 : upsampled_stability[idxc];
+      const double alias_conf =
+          upsampled_stack_alias.empty() ? 0.0 : upsampled_stack_alias[idxc];
+      guide_weight = 0.10 * guide_conf + 0.08 * alias_conf;
+    }
+    const double w0 = 1.0 / (std::abs(g0 - gc) + guide_weight * guide_term0 + 1.0);
+    const double w1 = 1.0 / (std::abs(g1 - gc) + guide_weight * guide_term1 + 1.0);
+    return (w0 * d0 + w1 * d1) / (w0 + w1);
+  };
+
+  auto interp_diag_diff = [&](uint32_t row, uint32_t col, int target_color) -> double {
+    const uint32_t r_n = clamp_row(static_cast<int>(row) - 1);
+    const uint32_t r_s = clamp_row(static_cast<int>(row) + 1);
+    const uint32_t c_w = clamp_col(static_cast<int>(col) - 1);
+    const uint32_t c_e = clamp_col(static_cast<int>(col) + 1);
+
+    const size_t idx_nw = static_cast<size_t>(r_n) * width + c_w;
+    const size_t idx_ne = static_cast<size_t>(r_n) * width + c_e;
+    const size_t idx_sw = static_cast<size_t>(r_s) * width + c_w;
+    const size_t idx_se = static_cast<size_t>(r_s) * width + c_e;
+
+    const double d_nw = target_color == 0 ? red_diff[idx_nw] : blue_diff[idx_nw];
+    const double d_ne = target_color == 0 ? red_diff[idx_ne] : blue_diff[idx_ne];
+    const double d_sw = target_color == 0 ? red_diff[idx_sw] : blue_diff[idx_sw];
+    const double d_se = target_color == 0 ? red_diff[idx_se] : blue_diff[idx_se];
+
+    const double g_diag_a = std::abs(green[idx_nw] - green[idx_se]);
+    const double g_diag_b = std::abs(green[idx_ne] - green[idx_sw]);
+    double guide_diag_a = 0.0;
+    double guide_diag_b = 0.0;
+    double guide_weight = 0.0;
+    if (!upsampled_stack_mean.empty()) {
+      guide_diag_a = std::abs(upsampled_stack_mean[idx_nw] - upsampled_stack_mean[idx_se]);
+      guide_diag_b = std::abs(upsampled_stack_mean[idx_ne] - upsampled_stack_mean[idx_sw]);
+      const size_t idxc = static_cast<size_t>(row) * width + col;
+      const double guide_conf =
+          upsampled_stability.empty() ? 1.0 : upsampled_stability[idxc];
+      const double alias_conf =
+          upsampled_stack_alias.empty() ? 0.0 : upsampled_stack_alias[idxc];
+      guide_weight = 0.10 * guide_conf + 0.08 * alias_conf;
+    }
+    const double w_a = 1.0 / (g_diag_a + guide_weight * guide_diag_a + 1.0);
+    const double w_b = 1.0 / (g_diag_b + guide_weight * guide_diag_b + 1.0);
+    const double avg_a = 0.5 * (d_nw + d_se);
+    const double avg_b = 0.5 * (d_ne + d_sw);
+    return (w_a * avg_a + w_b * avg_b) / (w_a + w_b);
+  };
+
+  for (uint32_t row = 0; row < height; ++row) {
+    for (uint32_t col = 0; col < width; ++col) {
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      const int color = cfa[idx];
+
+      double red = 0.0;
+      double green_value = green[idx];
+      double blue = 0.0;
+
+      if (color == 0) {
+        red = mosaic[idx];
+        blue = green_value + interp_diag_diff(row, col, 2);
+      } else if (color == 2) {
+        red = green_value + interp_diag_diff(row, col, 0);
+        blue = mosaic[idx];
+      } else if (color == 1) {
+        red = green_value + interp_axis_diff(row, col, 0, true);
+        blue = green_value + interp_axis_diff(row, col, 2, false);
+      } else {
+        red = green_value + interp_axis_diff(row, col, 0, false);
+        blue = green_value + interp_axis_diff(row, col, 2, true);
+      }
+
+      red = std::clamp(red, 0.0, 65535.0 - pedestal);
+      green_value = std::clamp(green_value, 0.0, 65535.0 - pedestal);
+      blue = std::clamp(blue, 0.0, 65535.0 - pedestal);
+
+      const size_t px = idx * 3;
+      output->pixels[px + 0] = clamp_channel(red);
+      output->pixels[px + 1] = clamp_channel(green_value);
+      output->pixels[px + 2] = clamp_channel(blue);
+    }
+  }
+
+  return true;
+}
+
+bool ApplyOm3RawDetailReconstruction(const std::string& source_path,
+                                     const SourceLinearDngMetadata& metadata,
+                                     RasterImage* image,
+                                     std::string* error_message) {
+  if (!ShouldUseExperimentalOm3RawReconstruction(metadata) ||
+      image == nullptr ||
+      image->width == 0 ||
+      image->height == 0 ||
+      image->colors != 3) {
+    return true;
+  }
+
+  LibRaw processor;
+  int result = processor.open_file(source_path.c_str());
+  if (result != LIBRAW_SUCCESS) {
+    *error_message = std::string("LibRaw open_file failed: ") + libraw_strerror(result);
+    return false;
+  }
+
+  result = processor.unpack();
+  if (result != LIBRAW_SUCCESS) {
+    *error_message = std::string("LibRaw unpack failed: ") + libraw_strerror(result);
+    processor.recycle();
+    return false;
+  }
+
+  ApplyOm3HighResCfaPrecondition(metadata, &processor);
+
+  const ushort* raw = processor.imgdata.rawdata.raw_image;
+  const uint32_t width = processor.imgdata.sizes.raw_width;
+  const uint32_t height = processor.imgdata.sizes.raw_height;
+  if (raw == nullptr || width == 0 || height == 0) {
+    *error_message = "LibRaw raw mosaic not available for OM-3 reconstruction";
+    processor.recycle();
+    return false;
+  }
+
+  if (width != image->width || height != image->height) {
+    *error_message = "OM-3 reconstruction raster size does not match rendered carrier";
+    processor.recycle();
+    return false;
+  }
+
+  const size_t pixel_count = static_cast<size_t>(width) * height;
+  const double black_level = metadata.has_black_level ? metadata.black_level : 0.0;
+  const double white_level = metadata.has_white_level
+      ? std::max(metadata.white_level - black_level, 1.0)
+      : 65535.0;
+  const double scale = 65535.0 / white_level;
+
+  std::vector<double> mosaic(pixel_count);
+  std::vector<uint8_t> cfa(pixel_count);
+  for (uint32_t row = 0; row < height; ++row) {
+    for (uint32_t col = 0; col < width; ++col) {
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      cfa[idx] = static_cast<uint8_t>(processor.COLOR(static_cast<int>(row), static_cast<int>(col)));
+      const double sample = std::max(static_cast<double>(raw[idx]) - black_level, 0.0);
+      mosaic[idx] = std::clamp(sample * scale, 0.0, 65535.0);
+    }
+  }
+
+  processor.recycle();
+
+  auto clamp_row = [&](int row) -> uint32_t {
+    return static_cast<uint32_t>(std::clamp(row, 0, static_cast<int>(height) - 1));
+  };
+  auto clamp_col = [&](int col) -> uint32_t {
+    return static_cast<uint32_t>(std::clamp(col, 0, static_cast<int>(width) - 1));
+  };
+  auto sample_mosaic = [&](int row, int col) -> double {
+    return mosaic[static_cast<size_t>(clamp_row(row)) * width + clamp_col(col)];
+  };
+  auto sample_if_color = [&](int row, int col, int target_color) -> double {
+    const uint32_t r = clamp_row(row);
+    const uint32_t c = clamp_col(col);
+    const size_t idx = static_cast<size_t>(r) * width + c;
+    return cfa[idx] == target_color ? mosaic[idx] : -1.0;
+  };
+
+  std::vector<double> green(pixel_count);
+  for (uint32_t row = 0; row < height; ++row) {
+    for (uint32_t col = 0; col < width; ++col) {
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      const int color = cfa[idx];
+      if (color == 1 || color == 3) {
+        green[idx] = mosaic[idx];
+        continue;
+      }
+
+      const double g_left = sample_if_color(static_cast<int>(row), static_cast<int>(col) - 1, 1) >= 0.0
+          ? sample_if_color(static_cast<int>(row), static_cast<int>(col) - 1, 1)
+          : sample_if_color(static_cast<int>(row), static_cast<int>(col) - 1, 3);
+      const double g_right = sample_if_color(static_cast<int>(row), static_cast<int>(col) + 1, 1) >= 0.0
+          ? sample_if_color(static_cast<int>(row), static_cast<int>(col) + 1, 1)
+          : sample_if_color(static_cast<int>(row), static_cast<int>(col) + 1, 3);
+      const double g_up = sample_if_color(static_cast<int>(row) - 1, static_cast<int>(col), 1) >= 0.0
+          ? sample_if_color(static_cast<int>(row) - 1, static_cast<int>(col), 1)
+          : sample_if_color(static_cast<int>(row) - 1, static_cast<int>(col), 3);
+      const double g_down = sample_if_color(static_cast<int>(row) + 1, static_cast<int>(col), 1) >= 0.0
+          ? sample_if_color(static_cast<int>(row) + 1, static_cast<int>(col), 1)
+          : sample_if_color(static_cast<int>(row) + 1, static_cast<int>(col), 3);
+
+      const double same_left = sample_mosaic(static_cast<int>(row), static_cast<int>(col) - 2);
+      const double same_right = sample_mosaic(static_cast<int>(row), static_cast<int>(col) + 2);
+      const double same_up = sample_mosaic(static_cast<int>(row) - 2, static_cast<int>(col));
+      const double same_down = sample_mosaic(static_cast<int>(row) + 2, static_cast<int>(col));
+
+      const double horiz = 0.5 * (g_left + g_right);
+      const double vert = 0.5 * (g_up + g_down);
+      const double grad_h = std::abs(g_left - g_right) + 0.5 * std::abs(2.0 * mosaic[idx] - same_left - same_right);
+      const double grad_v = std::abs(g_up - g_down) + 0.5 * std::abs(2.0 * mosaic[idx] - same_up - same_down);
+      const double weight_h = 1.0 / (grad_h + 1.0);
+      const double weight_v = 1.0 / (grad_v + 1.0);
+      green[idx] = (weight_h * horiz + weight_v * vert) / (weight_h + weight_v);
+    }
+  }
+
+  auto interpolate_color_difference = [&](int target_color) {
+    std::vector<double> diff(pixel_count, 0.0);
+    for (size_t idx = 0; idx < pixel_count; ++idx) {
+      if (cfa[idx] == target_color) {
+        diff[idx] = mosaic[idx] - green[idx];
+      }
+    }
+
+    for (uint32_t row = 0; row < height; ++row) {
+      for (uint32_t col = 0; col < width; ++col) {
+        const size_t idx = static_cast<size_t>(row) * width + col;
+        if (cfa[idx] == target_color) {
+          continue;
+        }
+
+        auto diff_at = [&](int rr, int cc) -> double {
+          const uint32_t r = clamp_row(rr);
+          const uint32_t c = clamp_col(cc);
+          const size_t offset = static_cast<size_t>(r) * width + c;
+          return cfa[offset] == target_color ? diff[offset] : 0.0;
+        };
+
+        const bool left_is_target = cfa[static_cast<size_t>(row) * width + clamp_col(static_cast<int>(col) - 1)] == target_color;
+        const bool right_is_target = cfa[static_cast<size_t>(row) * width + clamp_col(static_cast<int>(col) + 1)] == target_color;
+        const bool up_is_target = cfa[static_cast<size_t>(clamp_row(static_cast<int>(row) - 1)) * width + col] == target_color;
+        const bool down_is_target = cfa[static_cast<size_t>(clamp_row(static_cast<int>(row) + 1)) * width + col] == target_color;
+
+        if ((left_is_target || right_is_target) && !(up_is_target || down_is_target)) {
+          diff[idx] = 0.5 * (diff_at(static_cast<int>(row), static_cast<int>(col) - 1) +
+                             diff_at(static_cast<int>(row), static_cast<int>(col) + 1));
+        } else if ((up_is_target || down_is_target) && !(left_is_target || right_is_target)) {
+          diff[idx] = 0.5 * (diff_at(static_cast<int>(row) - 1, static_cast<int>(col)) +
+                             diff_at(static_cast<int>(row) + 1, static_cast<int>(col)));
+        } else {
+          diff[idx] = 0.25 * (diff_at(static_cast<int>(row) - 1, static_cast<int>(col) - 1) +
+                              diff_at(static_cast<int>(row) - 1, static_cast<int>(col) + 1) +
+                              diff_at(static_cast<int>(row) + 1, static_cast<int>(col) - 1) +
+                              diff_at(static_cast<int>(row) + 1, static_cast<int>(col) + 1));
+        }
+      }
+    }
+    return diff;
+  };
+
+  std::vector<double> red_diff = interpolate_color_difference(0);
+  std::vector<double> blue_diff = interpolate_color_difference(2);
+  if (std::none_of(cfa.begin(), cfa.end(), [](uint8_t value) { return value == 2; })) {
+    blue_diff = interpolate_color_difference(3);
+  }
+
+  std::array<double, 3> wb = {1.0, 1.0, 1.0};
+  if (metadata.has_as_shot_neutral) {
+    for (size_t ch = 0; ch < 3; ++ch) {
+      wb[ch] = 1.0 / std::max(metadata.as_shot_neutral[ch], 1e-6);
+    }
+    const double green_gain = std::max(wb[1], 1e-6);
+    for (double& value : wb) {
+      value /= green_gain;
+    }
+  }
+
+  constexpr double kLumaR = 0.2126;
+  constexpr double kLumaG = 0.7152;
+  constexpr double kLumaB = 0.0722;
+  std::vector<double> raw_luma(pixel_count);
+  std::vector<double> base_luma(pixel_count);
+  for (size_t idx = 0; idx < pixel_count; ++idx) {
+    const double red = std::max(green[idx] + red_diff[idx], 0.0) * wb[0];
+    const double green_wb = std::max(green[idx], 0.0) * wb[1];
+    const double blue = std::max(green[idx] + blue_diff[idx], 0.0) * wb[2];
+    raw_luma[idx] = kLumaR * red + kLumaG * green_wb + kLumaB * blue;
+
+    const size_t px = idx * image->colors;
+    base_luma[idx] = kLumaR * image->pixels[px] +
+                     kLumaG * image->pixels[px + 1] +
+                     kLumaB * image->pixels[px + 2];
+  }
+
+  double sum_raw = 0.0;
+  double sum_base = 0.0;
+  for (size_t idx = 0; idx < pixel_count; ++idx) {
+    if (base_luma[idx] > 64.0 && raw_luma[idx] > 64.0) {
+      sum_raw += raw_luma[idx];
+      sum_base += base_luma[idx];
+    }
+  }
+  const double raw_scale = sum_raw > 0.0 ? sum_base / sum_raw : 1.0;
+  for (double& value : raw_luma) {
+    value *= raw_scale;
+  }
+
+  auto blur5 = [&](const std::vector<double>& src, std::vector<double>* dst) {
+    dst->assign(pixel_count, 0.0);
+    std::vector<double> tmp(pixel_count, 0.0);
+    constexpr double kernel[5] = {1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0};
+
+    for (uint32_t row = 0; row < height; ++row) {
+      const size_t row_offset = static_cast<size_t>(row) * width;
+      for (uint32_t col = 0; col < width; ++col) {
+        double sum = 0.0;
+        for (int tap = -2; tap <= 2; ++tap) {
+          sum += kernel[tap + 2] * src[row_offset + clamp_col(static_cast<int>(col) + tap)];
+        }
+        tmp[row_offset + col] = sum;
+      }
+    }
+
+    for (uint32_t row = 0; row < height; ++row) {
+      for (uint32_t col = 0; col < width; ++col) {
+        double sum = 0.0;
+        for (int tap = -2; tap <= 2; ++tap) {
+          sum += kernel[tap + 2] * tmp[static_cast<size_t>(clamp_row(static_cast<int>(row) + tap)) * width + col];
+        }
+        (*dst)[static_cast<size_t>(row) * width + col] = sum;
+      }
+    }
+  };
+
+  std::vector<double> raw_blur;
+  std::vector<double> base_blur;
+  blur5(raw_luma, &raw_blur);
+  blur5(base_luma, &base_blur);
+
+  const double strength = std::clamp(0.50 + 0.12 * std::max(metadata.predicted_detail_gain - 1.0, 0.0), 0.45, 0.72);
+  constexpr double kMinRatio = 0.88;
+  constexpr double kMaxRatio = 1.16;
+  for (size_t idx = 0; idx < pixel_count; ++idx) {
+    const double raw_detail = raw_luma[idx] - raw_blur[idx];
+    const double base_detail = base_luma[idx] - base_blur[idx];
+    const double extra_detail = raw_detail - base_detail;
+    const double local_scale = std::max(base_blur[idx], 256.0);
+    const double capped_detail = std::clamp(extra_detail,
+                                            -0.09 * local_scale - 192.0,
+                                             0.09 * local_scale + 192.0);
+    const double target_luma = std::max(base_luma[idx] + strength * capped_detail, 1.0);
+    double ratio = target_luma / std::max(base_luma[idx], 1.0);
+    ratio = std::clamp(ratio, kMinRatio, kMaxRatio);
+
+    const size_t px = idx * image->colors;
+    for (uint32_t ch = 0; ch < image->colors; ++ch) {
+      const double updated = static_cast<double>(image->pixels[px + ch]) * ratio;
+      image->pixels[px + ch] = static_cast<uint16_t>(std::clamp(updated, 0.0, 65535.0));
+    }
+  }
+
+  return true;
+}
+
 bool BuildLinearDngPayload(const std::string& source_path,
                            const SourceLinearDngMetadata& metadata,
                            LinearDngPayload* payload,
@@ -966,25 +2145,24 @@ bool BuildLinearDngPayload(const std::string& source_path,
   const RenderSettings raw_settings = BuildRawRenderSettings(metadata);
   const RenderSettings preview_settings = BuildPreviewRenderSettings(metadata);
 
-  if (!RenderLibRawImage(source_path, raw_settings, &payload->raw_image, error_message)) {
-    return false;
-  }
+  payload->raw_image_is_camera_space = false;
 
-  if (!RenderLibRawImage(source_path, preview_settings, &payload->rendered_preview_source, error_message)) {
-    return false;
-  }
-
-  if (ShouldApplyPredictedDetailGain(metadata, payload->raw_image)) {
-    std::string cfa_guide_error;
-    if (ExtractCfaGuideImage(source_path,
-                             metadata,
-                             &payload->cfa_guide_image,
-                             &cfa_guide_error)) {
-      // guide available
-    } else {
-      payload->cfa_guide_image = RasterImage();
+  if (ShouldUseExperimentalOm3RawReconstruction(metadata)) {
+    if (!RenderOm3RawDomainImage(source_path, metadata, &payload->raw_image, error_message)) {
+      return false;
+    }
+    payload->raw_image_is_camera_space = true;
+  } else {
+    if (!RenderLibRawImage(source_path, metadata, raw_settings, &payload->raw_image, error_message)) {
+      return false;
     }
   }
+
+  if (!RenderLibRawImage(source_path, metadata, preview_settings, &payload->rendered_preview_source, error_message)) {
+    return false;
+  }
+
+  payload->cfa_guide_image = RasterImage();
 
   return true;
 }
@@ -1232,8 +2410,10 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       return result;
     }
 
-    ApplyPredictedDetailGain(metadata, &payload.cfa_guide_image, &payload.raw_image);
-    ApplyLinearDngRasterTransform(metadata, &payload.raw_image);
+    if (!payload.raw_image_is_camera_space) {
+      ApplyPredictedDetailGain(metadata, &payload.cfa_guide_image, &payload.raw_image);
+      ApplyLinearDngRasterTransform(metadata, &payload.raw_image);
+    }
 
     PreviewImage preview_image = BuildPreviewImage(payload.rendered_preview_source, 1024);
 

@@ -22,3 +22,9 @@ tmp/
 *.TIF
 *.tiff
 *.TIFF
+*.png
+*.PNG
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
