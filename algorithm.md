@@ -10,7 +10,7 @@ The overarching goal of `hiraco` is to maximize detail extraction directly from 
 
 1. **Raw Payload Ingestion & Payload Bounding**: Identify the `.ORF` payload as an OM-3 High Resolution structure. We extract proprietary Internal Blocks from the MakerNote (specifically Block 1 for physical geometry bounding and Block 3 for spatial multi-shot guidance matrices) to perfectly align and guide the high-resolution extraction extraction.
 2. **Pedestal Management (Black Level)**: We mathematically normalize the camera's baseline absolute black (e.g. `1020` pedestal) to `0`. This zero-bound state is mandatory for spatial transformation algorithms which would otherwise calculate harsh artifacts around the mathematical offsets.
-3. **Deconvolution (Optical Base Recovery)**: Because 8+ physical sub-frames inevitably undergo sensor-shift overlap, lens diffraction, and micro-vibrations, the intrinsic image is mathematically blurred. We utilize `FFTW` (Fast Fourier Transform) to apply a Wiener Deconvolution filter that acts as the inverse of the assumed Point Spread Function (PSF), reassigning scattered photon limits to their origin points.
+3. **Experimental Deconvolution (Optical Base Recovery)**: Because 8+ physical sub-frames inevitably undergo sensor-shift overlap, lens diffraction, and micro-vibrations, the intrinsic image is mathematically blurred. We utilize `FFTW` (Fast Fourier Transform) to apply an optional Wiener Deconvolution filter that acts as the inverse of the assumed Point Spread Function (PSF). *Note: This stage is disabled by default, as global frequency-domain recovery can heavily amplify microscopic CFA tracking and sub-pixel edge alignment errors, resulting in high-frequency "maze" or "zipper" checkerboard artifacts on complex textures.*
 4. **Multi-Scale À Trous Wavelet Enhancement**: High-frequency textures and micro-contrast are lifted using non-decimated "à trous" wavelet passes. This algorithm dynamically boosts micro-edges at specific structural bounds without destructively amplifying raw noise blocks.
 5. **Restoration & Packaging**: The pedestal is re-added, returning the array to physically accurate sensor geometry. The buffer is then packaged directly into an Adobe Linear RGB Matrix (with perfectly mirrored color-channel coefficients via `CameraNeutral` definitions to avoid extreme color-casts), making it highly robust for immediate processing in software like Lightroom and DxO.
 
@@ -38,7 +38,7 @@ The "secret sauce" behind correctly forming and deconvolving the composite array
   - `stack_tensor_{x,y}` & `stack_tensor_coherence`: Multi-directional high-frequency spatial detail isolates.
   - `stack_alias`: Tracks localized moiré and aliasing error generation probabilities.
 
-By upsampling these 63KB arrays to match the colossal physical geometry, operations like the Deconvolution matrix are dynamically heavily throttled and instructed by the guidance masks on a per-pixel basis. For instance, aggressive sharpening operations bypass the regions flagged by `stack_stability` as "in motion", preventing classical and devastating multi-camera "ghosting" or smearing.
+By upsampling these 63KB arrays to match the colossal physical geometry, operations like directional wavelet enhancements are dynamically heavily throttled and instructed by the guidance masks on a per-pixel basis. For instance, aggressive sharpening operations bypass the regions flagged by `stack_stability` as "in motion", preventing classical and devastating multi-camera "ghosting" or smearing.
 
 ### 2.3 Mathematical Engine & Spatial Recoveries (`ApplyPredictedDetailGain`)
 
@@ -52,11 +52,13 @@ const double pedestal = metadata.black_level;
 pixel_value -= pedestal;
 ```
 
-#### Step 2: FFTW Wiener Deconvolution
-Sensor-shift merging inherently introduces a localized low-pass convolution (a mild blur known as the Point Spread Function or PSF). We counteract this aggressively. Using `FFTW3`, the image domain is transposed into frequency maps.
-- A **Wiener filter** algorithm is processed over these frequencies.
+#### Step 2: FFTW Wiener Deconvolution (Optional/Experimental Stage)
+Sensor-shift merging inherently introduces a localized low-pass convolution (a mild blur known as the Point Spread Function or PSF). To counteract this, `FFTW3` can transpose the image domain into frequency maps.
+- An experimental **Wiener filter** algorithm is processed over these frequencies.
 - Modulated against a calculated Signal-to-Noise Ratio (SNR), the algorithm reverses the overlapping blur, retrieving distinct physical limits inside the sensor's sub-pixels.
 - The frequencies are linearly restored to image matrices (Inverse FFT).
+
+*Why this is disabled by default*: While mathematically sound for perfect data, practical high-resolution `.ORF` composites frequently contain micro-misalignments in their multi-shot construction. A harsh deconvolution forces these phase-shifted CFA limits to clash, heavily over-amplifying sub-pixel structures which manifest visually as severe maze, zipper, or cross-hatch stippling artifacts across fine contrasting edges (e.g., distant branches against a sky). Advanced wavelet filtering (Step 3) achieves superior, artifact-free micro-contrast enhancement for general output.
 
 #### Step 3: À Trous Wavelet Multi-Scale Lifting
 To restore micro-contrast and local fidelity:

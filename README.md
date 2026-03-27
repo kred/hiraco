@@ -8,7 +8,7 @@ Project was developed exclusively using Claude 4.6 / GPT 5.4 / Gemini 3 with ana
 
 ## Unrivaled Detail Retention
 
-`hiraco` rivals and out-performs commercial converters in resolving fine spatial details from the sensor-shift data. Our native FFTW deconvolution mapping successfully retrieves the crisp architecture edges originally captured by the lens.
+`hiraco` rivals and out-performs commercial converters in resolving fine spatial details from the sensor-shift data. Our multi-stage spatial math and optional FFTW deconvolution mapping successfully retrieve the crisp architecture edges originally captured by the lens.
 
 ![Quality Comparison Sheet](contact_sheet.jpg)
 
@@ -19,7 +19,7 @@ The project offers fully working conversion paths for standard and high-resoluti
 Features include:
 - Pure C++ native pipeline.
 - Native decoding of High Resolution payload structures via MakerNote parsing.
-- **Advanced Deconvolution Pipeline**: Resolving the hardware Point Spread Function (PSF) blurring innate to multi-shot sensor shifts utilizing `FFTW`.
+- **Advanced Spatial Filtering Pipeline**: Resolving micro-contrast utilizing structured wavelet edge directionality. Includes an optional experimental FFTW Wiener Deconvolution stage for targeted hardware Point Spread Function (PSF) correction.
 - Corrected radiometrics: Black-level and color neutralizing alignments mapped to proper EXIF bounds, neutralizing historically notorious color-cast display issues in third-party viewers.
 - Native `Adobe DNG SDK` integration for final negative assembly supporting `uncompressed`, `deflate`, and modern `jpeg-xl` DNG matrices via DNG version `1.6.0.0` and `1.7.1.0`.
 
