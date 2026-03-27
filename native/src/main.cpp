@@ -345,6 +345,14 @@ SourceLinearDngMetadata ParseSourceLinearDngMetadata(const std::string& request_
   metadata.default_crop_width = crop_width;
   metadata.default_crop_height = crop_height;
 
+  unsigned working_width = 0;
+  unsigned working_height = 0;
+  metadata.has_working_geometry =
+      FindJsonUnsigned(request_json, "working_width", &working_width) &&
+      FindJsonUnsigned(request_json, "working_height", &working_height);
+  metadata.working_width = working_width;
+  metadata.working_height = working_height;
+
   return metadata;
 }
 

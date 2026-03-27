@@ -1,3 +1,5 @@
+#include <iostream>
+
 #include "dng_writer_bridge.h"
 
 #if defined(HIRACO_ENABLE_DNG_SDK) && HIRACO_ENABLE_DNG_SDK
@@ -117,6 +119,7 @@ bool EnvFlagEnabled(const char* name, bool default_value) {
   return value != 0;
 }
 
+void PrintUseExperimental(const SourceLinearDngMetadata& m) { std::cerr << "IsOm3HighResMetadata: " << IsOm3HighResMetadata(m) << "\n"; }
 bool ShouldUseExperimentalOm3RawReconstruction(const SourceLinearDngMetadata& metadata) {
   return IsOm3HighResMetadata(metadata) &&
          EnvFlagEnabled("HIRACO_OM3_EXPERIMENTAL_RAW_RECON", true);
@@ -1640,14 +1643,19 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
   if (!stack_guide.empty()) {
     const uint32_t guide_width = metadata.has_stack_guide_map ? metadata.stack_guide_width : metadata.stack_mean_width;
     const uint32_t guide_height = metadata.has_stack_guide_map ? metadata.stack_guide_height : metadata.stack_mean_height;
+      
+      const uint32_t working_width = metadata.has_working_geometry ? metadata.working_width : width;
+      const uint32_t working_height = metadata.has_working_geometry ? metadata.working_height : height;
+      const double working_offset_x = (static_cast<double>(working_width) - static_cast<double>(width)) / 2.0;
+      const double working_offset_y = (static_cast<double>(working_height) - static_cast<double>(height)) / 2.0;
     std::vector<double> low_res_green(static_cast<size_t>(guide_width) * guide_height, 0.0);
 
     for (uint32_t row = 0; row < guide_height; ++row) {
       const double full_row =
-          (static_cast<double>(row) + 0.5) * static_cast<double>(height) / static_cast<double>(guide_height) - 0.5;
+          (static_cast<double>(row) + 0.5) * static_cast<double>(working_height) / static_cast<double>(guide_height) - 0.5 - working_offset_y;
       for (uint32_t col = 0; col < guide_width; ++col) {
         const double full_col =
-            (static_cast<double>(col) + 0.5) * static_cast<double>(width) / static_cast<double>(guide_width) - 0.5;
+            (static_cast<double>(col) + 0.5) * static_cast<double>(working_width) / static_cast<double>(guide_width) - 0.5 - working_offset_x;
         low_res_green[static_cast<size_t>(row) * guide_width + col] =
             bilinear_sample(green, full_row, full_col);
       }
@@ -1690,7 +1698,7 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
     upsampled_stack_guide.resize(pixel_count, 0.0);
     for (uint32_t row = 0; row < height; ++row) {
       const double guide_row =
-          (static_cast<double>(row) + 0.5) * static_cast<double>(guide_height) / static_cast<double>(height) - 0.5;
+          (static_cast<double>(row) + working_offset_y + 0.5) * static_cast<double>(guide_height) / static_cast<double>(working_height) - 0.5;
       const int y0 = static_cast<int>(std::floor(guide_row));
       const int y1 = y0 + 1;
       const double wy = guide_row - std::floor(guide_row);
@@ -1699,7 +1707,7 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
       for (uint32_t col = 0; col < width; ++col) {
         const size_t out_idx = static_cast<size_t>(row) * width + col;
         const double guide_col =
-            (static_cast<double>(col) + 0.5) * static_cast<double>(guide_width) / static_cast<double>(width) - 0.5;
+            (static_cast<double>(col) + working_offset_x + 0.5) * static_cast<double>(guide_width) / static_cast<double>(working_width) - 0.5;
         const int x0 = static_cast<int>(std::floor(guide_col));
         const int x1 = x0 + 1;
         const double wx = guide_col - std::floor(guide_col);
@@ -1858,7 +1866,7 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
     std::vector<double> green_blur;
     blur5(green, &green_blur);
     const double detail_strength =
-        std::clamp(0.74 + 0.30 * std::max(metadata.predicted_detail_gain - 1.0, 0.0), 0.70, 1.10);
+        std::clamp(1.50 + 0.50 * std::max(metadata.predicted_detail_gain - 1.0, 0.0), 1.20, 2.50);
 
     for (uint32_t row = 0; row < height; ++row) {
       for (uint32_t col = 0; col < width; ++col) {
@@ -1900,8 +1908,8 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
         }
         const double capped_detail =
             std::clamp(green_detail,
-                       -(0.16 * cap_scale) * local_scale - 160.0,
-                        (0.16 * cap_scale) * local_scale + 160.0);
+                       -(0.45 * cap_scale) * local_scale - 320.0,
+                        (0.45 * cap_scale) * local_scale + 320.0);
         green[idx] = std::clamp(green[idx] + detail_strength * detail_boost * mask * capped_detail,
                                 0.0,
                                 65535.0 - pedestal);
@@ -2267,17 +2275,17 @@ bool ApplyOm3RawDetailReconstruction(const std::string& source_path,
   blur5(raw_luma, &raw_blur);
   blur5(base_luma, &base_blur);
 
-  const double strength = std::clamp(0.50 + 0.12 * std::max(metadata.predicted_detail_gain - 1.0, 0.0), 0.45, 0.72);
-  constexpr double kMinRatio = 0.88;
-  constexpr double kMaxRatio = 1.16;
+  const double strength = std::clamp(1.0 + 0.35 * std::max(metadata.predicted_detail_gain - 1.0, 0.0), 0.80, 2.00);
+  constexpr double kMinRatio = 0.60;
+  constexpr double kMaxRatio = 1.60;
   for (size_t idx = 0; idx < pixel_count; ++idx) {
     const double raw_detail = raw_luma[idx] - raw_blur[idx];
     const double base_detail = base_luma[idx] - base_blur[idx];
     const double extra_detail = raw_detail - base_detail;
     const double local_scale = std::max(base_blur[idx], 256.0);
     const double capped_detail = std::clamp(extra_detail,
-                                            -0.09 * local_scale - 192.0,
-                                             0.09 * local_scale + 192.0);
+                                            -0.35 * local_scale - 384.0,
+                                             0.35 * local_scale + 384.0);
     const double target_luma = std::max(base_luma[idx] + strength * capped_detail, 1.0);
     double ratio = target_luma / std::max(base_luma[idx], 1.0);
     ratio = std::clamp(ratio, kMinRatio, kMaxRatio);
@@ -2301,6 +2309,8 @@ bool BuildLinearDngPayload(const std::string& source_path,
 
   payload->raw_image_is_camera_space = false;
 
+  std::cerr << "--- HIRACO EXPERIMENTAL RECON: " << ShouldUseExperimentalOm3RawReconstruction(metadata) << " ---\n";
+  std::cerr << "--- HIRACO EXPERIMENTAL RECON: " << ShouldUseExperimentalOm3RawReconstruction(metadata) << " ---\n";
   if (ShouldUseExperimentalOm3RawReconstruction(metadata)) {
     if (!RenderOm3RawDomainImage(source_path, metadata, &payload->raw_image, error_message)) {
       return false;
@@ -2567,6 +2577,24 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     if (!payload.raw_image_is_camera_space) {
       ApplyPredictedDetailGain(metadata, &payload.cfa_guide_image, &payload.raw_image);
       ApplyLinearDngRasterTransform(metadata, &payload.raw_image);
+    } else {
+      const double pedestal = metadata.has_black_level ? metadata.black_level : 0.0;
+      const size_t pcount = static_cast<size_t>(payload.raw_image.width) * payload.raw_image.height;
+      if (pedestal > 0.0) {
+        for (size_t i = 0; i < pcount * payload.raw_image.colors; ++i) {
+          double val = static_cast<double>(payload.raw_image.pixels[i]) - pedestal;
+          payload.raw_image.pixels[i] = static_cast<uint16_t>(std::clamp(val, 0.0, 65535.0));
+        }
+      }
+      
+      ApplyPredictedDetailGain(metadata, &payload.cfa_guide_image, &payload.raw_image);
+      
+      if (pedestal > 0.0) {
+        for (size_t i = 0; i < pcount * payload.raw_image.colors; ++i) {
+          double val = static_cast<double>(payload.raw_image.pixels[i]) + pedestal;
+          payload.raw_image.pixels[i] = static_cast<uint16_t>(std::clamp(val, 0.0, 65535.0));
+        }
+      }
     }
 
     PreviewImage preview_image = BuildPreviewImage(payload.rendered_preview_source, 1024);

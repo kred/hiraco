@@ -401,6 +401,23 @@ def compact_source_summary(path: Path) -> dict[str, Any]:
     if make and model:
         unique_camera_model = f"{make} {model}"
 
+    working_width = None
+    working_height = None
+    if make == "OLYMPUS CORPORATION" or make == "OM Digital Solutions":
+        try:
+            record = inspect_olympus_makernote_blocks(path)
+            b1 = record["blocks"].get("UnknownBlock1")
+            if b1 and len(b1["payload"]) >= 24 * 4:
+                arr = np.frombuffer(b1["payload"], dtype="<u4")
+                dim_word = arr[23]
+                h = (dim_word >> 16) & 0xFFFF
+                w = dim_word & 0xFFFF
+                if w > 0 and h > 0:
+                    working_width = int(w)
+                    working_height = int(h)
+        except Exception:
+            pass
+
     flattened_color_matrix: dict[str, float] = {}
     color_matrix = rawpy_data.get("color_matrix") or []
     if len(color_matrix) >= 3:
@@ -432,6 +449,8 @@ def compact_source_summary(path: Path) -> dict[str, Any]:
         "linear_dng_as_shot_neutral_0": None if as_shot_neutral is None else as_shot_neutral[0],
         "linear_dng_as_shot_neutral_1": None if as_shot_neutral is None else as_shot_neutral[1],
         "linear_dng_as_shot_neutral_2": None if as_shot_neutral is None else as_shot_neutral[2],
+        "working_width": working_width,
+        "working_height": working_height,
         **flattened_color_matrix,
     }
 

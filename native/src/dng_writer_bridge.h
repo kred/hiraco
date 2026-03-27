@@ -64,6 +64,9 @@ struct SourceLinearDngMetadata {
   uint32_t default_crop_origin_v = 0;
   uint32_t default_crop_width = 0;
   uint32_t default_crop_height = 0;
+  bool has_working_geometry = false;
+  uint32_t working_width = 0;
+  uint32_t working_height = 0;
 };
 
 DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
