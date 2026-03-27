@@ -614,7 +614,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // Keep a copy of the original luma for ratio transfer.
   std::vector<double> original_luma(luma);
 
-  const bool enable_stage1 = false; // Wiener deconvolution (FFT-based);
+  const bool enable_stage1 = true;  // Wiener deconvolution (FFT-based);
   const bool enable_stage2 = true;  // Spatially varying gain modulation (stack stability/guide maps);
   const bool enable_stage3 = true;  // Spatially varying gain modulation (tensor maps);
 
@@ -698,8 +698,11 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // Uses mirror/reflection padding to avoid boundary discontinuities that
   // produce periodic stipple artifacts with zero-padding.
   if (enable_stage1) {
-    float psf_sigma = 1.05f;
-    float nsr = 0.004f;
+    // A native mathematical system blur of ~1 pixel maps to exactly ~2.0 pixels
+    // in the 2x oversampled High-Res coordinate grid.
+    float psf_sigma = 2.0f;
+    // A higher NSR (0.1) suppresses Bayer dot patterns gracefully by bounding the inverse.
+    float nsr = 0.1f;
     ReadEnvFloat("HIRACO_STAGE1_PSF_SIGMA", &psf_sigma);
     ReadEnvFloat("HIRACO_STAGE1_NSR", &nsr);
 
