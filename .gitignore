@@ -30,3 +30,4 @@ tmp/
 *.JPEG
 bin/
 obj/
+.vscode/
