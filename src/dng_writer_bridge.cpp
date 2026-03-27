@@ -614,9 +614,9 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // Keep a copy of the original luma for ratio transfer.
   std::vector<double> original_luma(luma);
 
-  const bool enable_stage1 = true;
-  const bool enable_stage2 = true;
-  const bool enable_stage3 = true;
+  const bool enable_stage1 = false; // Wiener deconvolution (FFT-based);
+  const bool enable_stage2 = true;  // Spatially varying gain modulation (stack stability/guide maps);
+  const bool enable_stage3 = true;  // Spatially varying gain modulation (tensor maps);
 
   std::vector<double> confidence(pixel_count, 1.0);
 
