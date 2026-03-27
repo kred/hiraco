@@ -15,26 +15,55 @@ Features include:
 
 ## Dependencies
 
-Install native prerequisites. On macOS, you can use Homebrew:
+`hiraco` requires the following dependencies:
+- **CMake** (v3.16+)
+- **LibRaw**
+- **FFTW3**
+- **Adobe DNG SDK 1.7.1** (Manual installation required)
 
+### 1. The Adobe DNG SDK (All Platforms)
+The Adobe DNG SDK is a required manual dependency for the native packaging path. It cannot be redistributed in this repository. Before building, ensure you have placed the Adobe DNG SDK bundle folder into `dng_sdk_1_7_1/` inside the workspace root.
+
+### 2. Native Prerequisites
+
+**macOS (via Homebrew)**
 ```bash
-brew install cmake libraw fftw
+brew install cmake libraw fftw pkg-config
 ```
 
-*Note: The Adobe DNG SDK is a required manual dependency for the native packaging path. It cannot be redistributed in this repository. Before building, ensure you have placed the Adobe DNG SDK bundle into `dng_sdk_1_7_1/` inside the workspace root.*
+**Linux (Debian/Ubuntu, experimental not tested)**
+```bash
+sudo apt update
+sudo apt install build-essential cmake libraw-dev libfftw3-dev pkg-config zlib1g-dev
+```
+
+**Windows (via vcpkg, experimental not tested)**
+```powershell
+# Assumes vcpkg is installed and bootstrapped
+vcpkg install libraw fftw3 zlib:x64-windows
+```
 
 ## Building from source
 
 You can configure and build the standalone C++ binary out-of-source:
 
+**macOS & Linux**
 ```bash
 mkdir bin
 cd bin
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j
 ```
-
 The resulting binary will be output locally at `bin/hiraco`.
+
+**Windows**
+```powershell
+mkdir build
+cd build
+cmake -DCMAKE_TOOLCHAIN_FILE="C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release ..
+cmake --build . --config Release
+```
+The resulting binary will be output locally at `build\Release\hiraco.exe`.
 
 ## Usage
 

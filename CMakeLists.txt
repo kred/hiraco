@@ -24,45 +24,50 @@ if(NOT EXISTS "${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/public/include/XMP.incl_cpp")
   message(FATAL_ERROR "Bundled Adobe XMP toolkit sources were not found under ${HIRACO_DNG_SDK_ROOT}. Ensure the full Adobe DNG SDK bundle is present.")
 endif()
 
-find_path(LIBRAW_INCLUDE_DIR
-  NAMES libraw/libraw.h
-  HINTS
-    /opt/homebrew/include
-    /usr/local/include
-)
+# Find ZLIB first
+find_package(ZLIB REQUIRED)
 
-find_library(LIBRAW_LIBRARY
-  NAMES raw_r libraw_r
-  HINTS
-    /opt/homebrew/lib
-    /usr/local/lib
-)
-
-if(NOT LIBRAW_INCLUDE_DIR OR NOT LIBRAW_LIBRARY)
-  message(FATAL_ERROR "LibRaw not found. Install libraw or adjust include/library hints.")
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND)
+  pkg_check_modules(PKG_LIBRAW QUIET libraw)
+  pkg_check_modules(PKG_FFTW3 QUIET fftw3)
 endif()
 
-find_path(FFTW3_INCLUDE_DIR
-  NAMES fftw3.h
-  HINTS
-    /opt/homebrew/include
-    /usr/local/include
-)
-
-find_library(FFTW3_LIBRARY
-  NAMES fftw3
-  HINTS
-    /opt/homebrew/lib
-    /usr/local/lib
-)
-
-if(NOT FFTW3_INCLUDE_DIR OR NOT FFTW3_LIBRARY)
-  message(FATAL_ERROR "FFTW3 not found. Install fftw (e.g. brew install fftw) or adjust include/library hints.")
+# Fallback / VCPKG configurations for libraw
+find_package(libraw CONFIG QUIET)
+if(TARGET libraw::libraw)
+  set(LIBRAW_LIBRARIES libraw::libraw)
+elseif(PKG_LIBRAW_FOUND)
+  set(LIBRAW_LIBRARIES ${PKG_LIBRAW_LIBRARIES})
+  set(LIBRAW_INCLUDE_DIRS ${PKG_LIBRAW_INCLUDE_DIRS})
+  link_directories(${PKG_LIBRAW_LIBRARY_DIRS})
+else()
+  find_path(LIBRAW_INCLUDE_DIR NAMES libraw/libraw.h HINTS /opt/homebrew/include /usr/local/include)
+  find_library(LIBRAW_LIBRARY NAMES raw_r libraw_r raw libraw HINTS /opt/homebrew/lib /usr/local/lib)
+  if(NOT LIBRAW_INCLUDE_DIR OR NOT LIBRAW_LIBRARY)
+    message(FATAL_ERROR "LibRaw not found.")
+  endif()
+  set(LIBRAW_LIBRARIES ${LIBRAW_LIBRARY})
+  set(LIBRAW_INCLUDE_DIRS ${LIBRAW_INCLUDE_DIR})
 endif()
 
-find_library(COREFOUNDATION_LIBRARY CoreFoundation)
-find_library(CORESERVICES_LIBRARY CoreServices)
-find_library(ZLIB_LIBRARY z)
+# Fallback / VCPKG configurations for fftw3
+find_package(FFTW3 CONFIG QUIET)
+if(TARGET FFTW3::fftw3)
+  set(FFTW3_LIBRARIES FFTW3::fftw3)
+elseif(PKG_FFTW3_FOUND)
+  set(FFTW3_LIBRARIES ${PKG_FFTW3_LIBRARIES})
+  set(FFTW3_INCLUDE_DIRS ${PKG_FFTW3_INCLUDE_DIRS})
+  link_directories(${PKG_FFTW3_LIBRARY_DIRS})
+else()
+  find_path(FFTW3_INCLUDE_DIR NAMES fftw3.h HINTS /opt/homebrew/include /usr/local/include)
+  find_library(FFTW3_LIBRARY NAMES fftw3 fftw3-3 HINTS /opt/homebrew/lib /usr/local/lib)
+  if(NOT FFTW3_INCLUDE_DIR OR NOT FFTW3_LIBRARY)
+    message(FATAL_ERROR "FFTW3 not found.")
+  endif()
+  set(FFTW3_LIBRARIES ${FFTW3_LIBRARY})
+  set(FFTW3_INCLUDE_DIRS ${FFTW3_INCLUDE_DIR})
+endif()
 
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -79,6 +84,19 @@ set(JPEGXL_ENABLE_SJPEG OFF CACHE BOOL "" FORCE)
 set(JPEGXL_ENABLE_OPENEXR OFF CACHE BOOL "" FORCE)
 set(JPEGXL_ENABLE_VIEWERS OFF CACHE BOOL "" FORCE)
 set(JPEGXL_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
+
+if(APPLE)
+  set(XMP_OS_FLAG "MAC_ENV=1")
+  set(DNG_OS_FLAG "qMacOS=1")
+  find_library(COREFOUNDATION_LIBRARY CoreFoundation)
+  find_library(CORESERVICES_LIBRARY CoreServices)
+elseif(WIN32)
+  set(XMP_OS_FLAG "WIN_ENV=1")
+  set(DNG_OS_FLAG "qWinOS=1")
+else()
+  set(XMP_OS_FLAG "UNIX_ENV=1")
+  set(DNG_OS_FLAG "qLinux=1")
+endif()
 
 file(GLOB HIRACO_XMPCORE_SOURCES CONFIGURE_DEPENDS
   "${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/XMPCore/source/WXMP*.cpp"
@@ -100,7 +118,7 @@ add_library(hiraco-xmp-core STATIC
   ${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/XMPCore/third-party/expat/public/lib/xmltok.c
 )
 target_compile_definitions(hiraco-xmp-core PRIVATE
-  MAC_ENV=1
+  ${XMP_OS_FLAG}
   BUILDING_XMPCORE_LIB=1
   BUILDING_XMPCORE_AS_STATIC=1
   XMP_COMPONENT_INT_NAMESPACE=AdobeXMPCore_Int
@@ -118,12 +136,17 @@ target_include_directories(hiraco-xmp-core PRIVATE
   ${HIRACO_DNG_SDK_ROOT}/xmp/toolkit
   ${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/public/include
   ${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/XMPCore/third-party/expat/public/lib
-  ${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/XMPCore/resource/mac
 )
-target_link_libraries(hiraco-xmp-core PRIVATE
-  ${COREFOUNDATION_LIBRARY}
-  ${CORESERVICES_LIBRARY}
-)
+
+if(APPLE)
+  target_include_directories(hiraco-xmp-core PRIVATE
+    ${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/XMPCore/resource/mac
+  )
+  target_link_libraries(hiraco-xmp-core PRIVATE
+    ${COREFOUNDATION_LIBRARY}
+    ${CORESERVICES_LIBRARY}
+  )
+endif()
 
 add_subdirectory(${HIRACO_DNG_SDK_ROOT}/libjxl/libjxl ${CMAKE_CURRENT_BINARY_DIR}/libjxl EXCLUDE_FROM_ALL)
 
@@ -137,7 +160,7 @@ add_library(hiraco-dng-sdk STATIC
   ${HIRACO_DNG_SDK_SOURCES}
 )
 target_compile_definitions(hiraco-dng-sdk PRIVATE
-  qMacOS=1
+  ${DNG_OS_FLAG}
   qDNGUseXMP=1
   qDNGXMPFiles=0
   qDNGUseLibJPEG=0
@@ -152,10 +175,15 @@ target_link_libraries(hiraco-dng-sdk PRIVATE
   jxl
   jxl_threads
   hiraco-xmp-core
-  ${COREFOUNDATION_LIBRARY}
-  ${CORESERVICES_LIBRARY}
-  ${ZLIB_LIBRARY}
+  ZLIB::ZLIB
 )
+
+if(APPLE)
+  target_link_libraries(hiraco-dng-sdk PRIVATE
+    ${COREFOUNDATION_LIBRARY}
+    ${CORESERVICES_LIBRARY}
+  )
+endif()
 
 add_executable(hiraco
   src/dng_sdk_bridge.cpp
@@ -165,26 +193,37 @@ add_executable(hiraco
   src/stack_guidance.cpp
 )
 
-target_include_directories(hiraco PRIVATE ${LIBRAW_INCLUDE_DIR} ${FFTW3_INCLUDE_DIR})
-target_link_libraries(hiraco PRIVATE ${LIBRAW_LIBRARY} ${FFTW3_LIBRARY})
+target_include_directories(hiraco PRIVATE ${LIBRAW_INCLUDE_DIRS} ${FFTW3_INCLUDE_DIRS})
+target_link_libraries(hiraco PRIVATE ${LIBRAW_LIBRARIES} ${FFTW3_LIBRARIES})
 target_compile_definitions(hiraco PRIVATE
   HIRACO_ENABLE_DNG_SDK=1
   HIRACO_DNG_SDK_ROOT="${HIRACO_DNG_SDK_ROOT}"
-  qMacOS=1
+  ${DNG_OS_FLAG}
   qDNGUseXMP=1
   qDNGXMPFiles=0
   qDNGUseLibJPEG=0
 )
+
 target_include_directories(hiraco PRIVATE
   ${HIRACO_DNG_SDK_ROOT}/dng_sdk/source
   ${HIRACO_DNG_SDK_ROOT}/libjxl/libjxl/lib/include
   ${HIRACO_DNG_SDK_ROOT}/libjpeg
   ${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/public/include
 )
+
+if(WIN32)
+  target_compile_definitions(hiraco PRIVATE _USE_MATH_DEFINES)
+endif()
+
 target_link_libraries(hiraco PRIVATE
   hiraco-dng-sdk
   hiraco-xmp-core
-  ${COREFOUNDATION_LIBRARY}
-  ${CORESERVICES_LIBRARY}
-  ${ZLIB_LIBRARY}
+  ZLIB::ZLIB
 )
+
+if(APPLE)
+  target_link_libraries(hiraco PRIVATE
+    ${COREFOUNDATION_LIBRARY}
+    ${CORESERVICES_LIBRARY}
+  )
+endif()
