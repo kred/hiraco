@@ -754,52 +754,42 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
         fftw_execute(plan_fwd);
         fftw_destroy_plan(plan_fwd);
 
-        // Apply Wiener filter in frequency domain, combined with a CFA
-        // frequency notch to suppress Bayer pattern residual.
-        //
-        // The demosaiced green channel retains Gr/Gb residual at the CFA
-        // frequency (0.5 cycles/pixel in each axis).  Since luma is ~71%
-        // green, the Wiener gain would amplify this into a visible dotted
-        // pattern.  A narrow Gaussian notch at the three CFA frequencies
-        // — (0.5, 0), (0, 0.5), (0.5, 0.5) — kills the pattern while
-        // leaving all other frequencies untouched.
-        const double two_pi2_sigma2 = 2.0 * M_PI * M_PI * psf_sigma * psf_sigma;
-        const uint32_t half_w = fft_w / 2 + 1;
+// Apply Wiener filter in frequency domain.
+          //
+          // We apply the physical sensor diode integration limit models:
+          // The high-res sensor shifts 8 times by half a pixel so it has a 
+          // 2x oversampled integration box. In the frequency domain, a box
+          // filter responds as a sinc(x) function that naturally zeroes
+          // out the exact spatial frequencies where Bayer grid residuals clash,
+          // safely preventing Wiener over-amplification at the Nyquist limit.
+          const double two_pi2_sigma2 = 2.0 * M_PI * M_PI * psf_sigma * psf_sigma;
+          const uint32_t half_w = fft_w / 2 + 1;
 
-        // CFA notch: Gaussian dip centered at normalized freq 0.5 in
-        // each axis.  σ_notch controls width; 0.04 ≈ ±4 % of Nyquist.
-        constexpr double kNotchSigma = 0.04;
-        constexpr double kNotchInvTwoSigma2 = 1.0 / (2.0 * kNotchSigma * kNotchSigma);
+          for (uint32_t row = 0; row < fft_h; ++row) {
+            double fy = static_cast<double>(row);
+            if (fy > fft_h / 2.0) fy -= fft_h;
+            fy /= fft_h;  // normalized: [-0.5, 0.5)
 
-        for (uint32_t row = 0; row < fft_h; ++row) {
-          double fy = static_cast<double>(row);
-          if (fy > fft_h / 2.0) fy -= fft_h;
-          fy /= fft_h;  // normalized: [-0.5, 0.5)
+            for (uint32_t col = 0; col < half_w; ++col) {
+              const double fx = static_cast<double>(col) / fft_w;
 
-          for (uint32_t col = 0; col < half_w; ++col) {
-            const double fx = static_cast<double>(col) / fft_w;
+              // Wiener filter for PSF deconvolution + Diode integration
+              auto sinc = [](double x) {
+                if (std::abs(x) < 1e-6) return 1.0;
+                const double px = M_PI * x;
+                return std::sin(px) / px;
+              };
+              const double H_diode = sinc(2.0 * fx) * sinc(2.0 * fy);
+              const double freq_sq = fx * fx + fy * fy;
+              const double H_optics = std::exp(-two_pi2_sigma2 * freq_sq);
+              const double H = H_optics * H_diode;
 
-            // Wiener filter for PSF deconvolution.
-            const double freq_sq = fx * fx + fy * fy;
-            const double H = std::exp(-two_pi2_sigma2 * freq_sq);
-            const double H2 = H * H;
-            const double wiener = H / (H2 + nsr);
+              const double H2 = H * H;
+              const double wiener = H / (H2 + nsr);
 
-            // CFA notch: suppress (0.5,0), (0,0.5), (0.5,0.5).
-            const double dfx_half = fx - 0.5;
-            const double dfy_half = std::abs(fy) - 0.5;  // fy or -fy → both handled
-            const double notch_h  = std::exp(-(dfx_half * dfx_half) * kNotchInvTwoSigma2);  // near (0.5, 0)
-            const double notch_v  = std::exp(-(dfy_half * dfy_half) * kNotchInvTwoSigma2);  // near (0, 0.5)
-            const double notch_d  = std::exp(-(dfx_half * dfx_half + dfy_half * dfy_half) * kNotchInvTwoSigma2);  // near (0.5, 0.5)
-            // Combined notch: 1 − max(individual notches)
-            const double notch_atten = 1.0 - std::max({notch_h * (std::exp(-(fy * fy) * kNotchInvTwoSigma2)),
-                                                         notch_v * (std::exp(-(fx * fx) * kNotchInvTwoSigma2)),
-                                                         notch_d});
-            const double cfa_notch = std::max(notch_atten, 0.0);
-
-            const size_t idx = static_cast<size_t>(row) * half_w + col;
-            fft_out[idx][0] *= wiener * cfa_notch;
-            fft_out[idx][1] *= wiener * cfa_notch;
+              const size_t idx = static_cast<size_t>(row) * half_w + col;
+              fft_out[idx][0] *= wiener;
+              fft_out[idx][1] *= wiener;
           }
         }
 

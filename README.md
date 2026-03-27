@@ -19,7 +19,7 @@ The project offers fully working conversion paths for standard and high-resoluti
 Features include:
 - Pure C++ native pipeline.
 - Native decoding of High Resolution payload structures via MakerNote parsing.
-- **Advanced Spatial Filtering Pipeline**: Resolving micro-contrast utilizing structured wavelet edge directionality. Includes an optional experimental FFTW Wiener Deconvolution stage for targeted hardware Point Spread Function (PSF) correction.
+- **Advanced Spatial Filtering Pipeline**: Resolving micro-contrast utilizing structured wavelet edge directionality. Includes a highly calibrated FFTW Wiener Deconvolution stage configured for native physical sensor-shift boundary limits (PSF + Sinc photodiode integration) to safely and heavily eliminate optical blur limits without raising grid artifacts.
 - Corrected radiometrics: Black-level and color neutralizing alignments mapped to proper EXIF bounds, neutralizing historically notorious color-cast display issues in third-party viewers.
 - Native `Adobe DNG SDK` integration for final negative assembly supporting `uncompressed`, `deflate`, and modern `jpeg-xl` DNG matrices via DNG version `1.6.0.0` and `1.7.1.0`.
 
