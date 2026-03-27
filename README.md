@@ -4,6 +4,14 @@
 
 By deeply analyzing the sensor-shift characteristics of these cameras, `hiraco` operates a specialized custom native reconstruction engine to extract true sub-pixel resolution rather than relying on mathematically standard interpolations. It specifically targets the full optical extraction of High-Res composites.
 
+## Unrivaled Detail Retention
+
+`hiraco` rivals and out-performs commercial converters in resolving fine spatial details from the sensor-shift data. Our native FFTW deconvolution mapping successfully retrieves the crisp architecture edges originally captured by the lens.
+
+![Quality Comparison Sheet](contact_sheet.jpg)
+
+*(Comparison of identical high-res Olympus raw exported across top commercial engines vs `hiraco`)*
+
 ## Current status
 The project offers fully working conversion paths for standard and high-resolution camera payloads.
 Features include:
