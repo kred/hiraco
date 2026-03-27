@@ -28,10 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compression level"
     )
     convert_parser.add_argument(
-        "--detail-gain",
-        type=float,
-        default=1.8,
-        help="Expected detail gain to apply. Values > 1.0 enhance details to match high-res. Default 1.8"
+        "--debug",
+        action="store_true",
+        help="Print verbose JSON diagnostic output"
     )
     convert_parser.set_defaults(handler=handle_convert)
 
@@ -76,7 +75,7 @@ def handle_convert(args: argparse.Namespace) -> int:
         compression=CompressionMode(args.compression),
         overwrite=True,
         source_info=source_info,
-        predicted_detail_gain=args.detail_gain,
+        predicted_detail_gain=1.8,
     )
 
     try:
@@ -101,7 +100,16 @@ def handle_convert(args: argparse.Namespace) -> int:
             response["ok"] = False
             response["message"] = "native DNG write succeeded but metadata copy failed"
 
-    print(json.dumps(response, indent=2, sort_keys=True))
+    if args.debug:
+        print(json.dumps(response, indent=2, sort_keys=True))
+    else:
+        if response.get("ok"):
+            print(f"Success: {args.output}")
+        else:
+            print(f"Error: {response.get('message', 'Unknown error module')}")
+            if "stderr" in diagnostics:
+                print(f"Details: {diagnostics['stderr']}")
+
     return 0 if response.get("ok") else 1
 
 
