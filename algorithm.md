@@ -8,7 +8,7 @@ This document details the architectural processes, design logic, and underlying 
 
 The overarching goal of `hiraco` is to maximize detail extraction directly from High-Res `.ORF` files, aiming for optimal optical fidelity. We achieve this by abandoning standard interpolative pathways from routine raw decoders in favor of heavy spatial math targeting the specialized native geometry.
 
-1. **Raw Payload Ingestion**: Identify the `.ORF` payload as an OM-3 High Resolution structure and properly extract the full physical geometry (`8172x6132`) directly from camera space.
+1. **Raw Payload Ingestion & Payload Bounding**: Identify the `.ORF` payload as an OM-3 High Resolution structure. We extract proprietary Internal Blocks from the MakerNote (specifically Block 1 for physical geometry bounding and Block 3 for spatial multi-shot guidance matrices) to perfectly align and guide the high-resolution extraction extraction.
 2. **Pedestal Management (Black Level)**: We mathematically normalize the camera's baseline absolute black (e.g. `1020` pedestal) to `0`. This zero-bound state is mandatory for spatial transformation algorithms which would otherwise calculate harsh artifacts around the mathematical offsets.
 3. **Deconvolution (Optical Base Recovery)**: Because 8+ physical sub-frames inevitably undergo sensor-shift overlap, lens diffraction, and micro-vibrations, the intrinsic image is mathematically blurred. We utilize `FFTW` (Fast Fourier Transform) to apply a Wiener Deconvolution filter that acts as the inverse of the assumed Point Spread Function (PSF), reassigning scattered photon limits to their origin points.
 4. **Multi-Scale À Trous Wavelet Enhancement**: High-frequency textures and micro-contrast are lifted using non-decimated "à trous" wavelet passes. This algorithm dynamically boosts micro-edges at specific structural bounds without destructively amplifying raw noise blocks.
@@ -26,7 +26,21 @@ Conversely, Modern Vendor high-resolution `.ORF` files are the result of rapid s
 
 The primary challenge isn't color interpolation; it is the **resolution of sub-pixel overlaps**, preventing the matrix from looking artificially bloated or soft. 
 
-### 2.2 Mathematical Engine & Spatial Recoveries (`ApplyPredictedDetailGain`)
+### 2.2 Proprietary MakerNote Decoding: Internal Blocks 1 & 3
+
+The "secret sauce" behind correctly forming and deconvolving the composite array without introducing artifacts relies heavily on extracting proprietary metadata payload fragments embedded within the OEM MakerNotes. These data structures instruct the algorithm on handling boundary limits and movement disparities natively computed by the camera:
+
+- **Internal Block 1 (`unknown_block_1`)**: Generalized raw decoding libraries (like `libraw`) often struggle with bounding boxes for non-standard multi-shot modes. `hiraco` directly parses the internal bytes of Block 1 (specifically targeting `uint32` data at byte offset 23). This provides the exact boundary configurations (`working_rect_width` and `working_rect_height`) intended for the active High-Res crop. Without it, the final rendered Linear DNG exhibits mismatched optical centers, distorted edges, and corrupt black level margins.
+
+- **Internal Block 3 (`unknown_block_3` / Stack Guidance)**: High-resolution shots computed in-camera ("Hand-held high resolution") embed a dense 63,488-byte spatial metadata payload. `hiraco` unpacks this binary blob into complex floating-point masking matrices known as **Stack Guidance Maps**:
+  - `stack_stability`: Motion detection arrays indicating structural shifts between rapid sequential exposures (e.g., moving foliage, running water).
+  - `stack_guide`: Foundational structural edge gradients natively captured by hardware.
+  - `stack_tensor_{x,y}` & `stack_tensor_coherence`: Multi-directional high-frequency spatial detail isolates.
+  - `stack_alias`: Tracks localized moiré and aliasing error generation probabilities.
+
+By upsampling these 63KB arrays to match the colossal physical geometry, operations like the Deconvolution matrix are dynamically heavily throttled and instructed by the guidance masks on a per-pixel basis. For instance, aggressive sharpening operations bypass the regions flagged by `stack_stability` as "in motion", preventing classical and devastating multi-camera "ghosting" or smearing.
+
+### 2.3 Mathematical Engine & Spatial Recoveries (`ApplyPredictedDetailGain`)
 
 When the extracted OM-3 `camera_space` array is intercepted from `LibRaw`, it has standard baseline offsets. If left unaltered, editing software will treat it as a generic flat bitmap, rendering the sub-pixel details muddy.
 
@@ -58,7 +72,7 @@ With the matrix completely redefined logically, the original Black Level thresho
 pixel_value = clamp(pixel_value + pedestal);
 ```
 
-### 2.3 The DNG Matrix Translation
+### 2.4 The DNG Matrix Translation
 
 Once the mathematical pass restores the exact limits of the optical resolution, `hiraco` transfers the matrix to the Adobe DNG SDK formatting runtime.
 
