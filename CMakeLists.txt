@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(hiraco_native LANGUAGES C CXX)
+project(hiraco LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,10 +10,10 @@ if(APPLE AND NOT DEFINED CMAKE_OSX_ARCHITECTURES)
   set(CMAKE_OSX_ARCHITECTURES "${CMAKE_HOST_SYSTEM_PROCESSOR}" CACHE STRING "Build architectures for macOS" FORCE)
 endif()
 
-set(HIRACO_DNG_SDK_ROOT "${CMAKE_CURRENT_LIST_DIR}/../dng_sdk_1_7_1" CACHE PATH "Path to the Adobe DNG SDK bundle root")
+set(HIRACO_DNG_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/dng_sdk_1_7_1" CACHE PATH "Path to the Adobe DNG SDK bundle root")
 
 if(NOT EXISTS "${HIRACO_DNG_SDK_ROOT}/dng_sdk/source")
-  message(FATAL_ERROR "Adobe DNG SDK not found at ${HIRACO_DNG_SDK_ROOT}. Copy the SDK bundle there or pass -DHIRACO_DNG_SDK_ROOT=/path/to/dng_sdk_1_7_1.")
+  message(FATAL_ERROR "Adobe DNG SDK not found at ${HIRACO_DNG_SDK_ROOT}. Ensure the dng_sdk_1_7_1 directory exists in the project root or provide HIRACO_DNG_SDK_ROOT.")
 endif()
 
 if(NOT EXISTS "${HIRACO_DNG_SDK_ROOT}/libjxl/libjxl/CMakeLists.txt")
@@ -157,17 +157,17 @@ target_link_libraries(hiraco-dng-sdk PRIVATE
   ${ZLIB_LIBRARY}
 )
 
-add_executable(hiraco-native
+add_executable(hiraco
   src/dng_sdk_bridge.cpp
   src/dng_writer_bridge.cpp
   src/main.cpp
-  src/olympus_makernote.cpp
+  src/vendor_makernote.cpp
   src/stack_guidance.cpp
 )
 
-target_include_directories(hiraco-native PRIVATE ${LIBRAW_INCLUDE_DIR} ${FFTW3_INCLUDE_DIR})
-target_link_libraries(hiraco-native PRIVATE ${LIBRAW_LIBRARY} ${FFTW3_LIBRARY})
-target_compile_definitions(hiraco-native PRIVATE
+target_include_directories(hiraco PRIVATE ${LIBRAW_INCLUDE_DIR} ${FFTW3_INCLUDE_DIR})
+target_link_libraries(hiraco PRIVATE ${LIBRAW_LIBRARY} ${FFTW3_LIBRARY})
+target_compile_definitions(hiraco PRIVATE
   HIRACO_ENABLE_DNG_SDK=1
   HIRACO_DNG_SDK_ROOT="${HIRACO_DNG_SDK_ROOT}"
   qMacOS=1
@@ -175,13 +175,13 @@ target_compile_definitions(hiraco-native PRIVATE
   qDNGXMPFiles=0
   qDNGUseLibJPEG=0
 )
-target_include_directories(hiraco-native PRIVATE
+target_include_directories(hiraco PRIVATE
   ${HIRACO_DNG_SDK_ROOT}/dng_sdk/source
   ${HIRACO_DNG_SDK_ROOT}/libjxl/libjxl/lib/include
   ${HIRACO_DNG_SDK_ROOT}/libjpeg
   ${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/public/include
 )
-target_link_libraries(hiraco-native PRIVATE
+target_link_libraries(hiraco PRIVATE
   hiraco-dng-sdk
   hiraco-xmp-core
   ${COREFOUNDATION_LIBRARY}

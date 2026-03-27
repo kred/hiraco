@@ -1,6 +1,6 @@
 #include "dng_sdk_bridge.h"
 #include "dng_writer_bridge.h"
-#include "olympus_makernote.h"
+#include "vendor_makernote.h"
 #include "stack_guidance.h"
 
 #include <filesystem>
@@ -197,173 +197,8 @@ std::string BuildJsonStringArray(const std::vector<std::string>& values) {
   return output.str();
 }
 
-std::string FindJsonString(const std::string& json, const std::string& key) {
-  const std::regex pattern("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
-  std::smatch match;
-  if (!std::regex_search(json, match, pattern)) {
-    return {};
-  }
-  return match[1].str();
-}
-
-bool FindJsonBool(const std::string& json, const std::string& key, bool default_value) {
-  const std::regex pattern("\"" + key + "\"\\s*:\\s*(true|false)");
-  std::smatch match;
-  if (!std::regex_search(json, match, pattern)) {
-    return default_value;
-  }
-  return match[1].str() == "true";
-}
-
-bool FindJsonUnsigned(const std::string& json, const std::string& key, unsigned* value) {
-  const std::regex pattern("\"" + key + "\"\\s*:\\s*([0-9]+)");
-  std::smatch match;
-  if (!std::regex_search(json, match, pattern)) {
-    return false;
-  }
-  *value = static_cast<unsigned>(std::stoul(match[1].str()));
-  return true;
-}
-
-bool FindJsonDouble(const std::string& json, const std::string& key, double* value) {
-  const std::regex pattern("\"" + key + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
-  std::smatch match;
-  if (!std::regex_search(json, match, pattern)) {
-    return false;
-  }
-  *value = std::stod(match[1].str());
-  return true;
-}
-
-SourceLinearDngMetadata ParseSourceLinearDngMetadata(const std::string& request_json) {
-  SourceLinearDngMetadata metadata;
-  metadata.make = FindJsonString(request_json, "make");
-  metadata.model = FindJsonString(request_json, "model");
-  metadata.unique_camera_model = FindJsonString(request_json, "unique_camera_model");
-
-  metadata.has_black_level = FindJsonDouble(request_json, "linear_dng_black_level", &metadata.black_level);
-  metadata.has_white_level = FindJsonDouble(request_json, "linear_dng_white_level", &metadata.white_level);
-
-  metadata.has_as_shot_neutral =
-      FindJsonDouble(request_json, "linear_dng_as_shot_neutral_0", &metadata.as_shot_neutral[0]) &&
-      FindJsonDouble(request_json, "linear_dng_as_shot_neutral_1", &metadata.as_shot_neutral[1]) &&
-      FindJsonDouble(request_json, "linear_dng_as_shot_neutral_2", &metadata.as_shot_neutral[2]);
-
-  metadata.has_color_matrix1 =
-      FindJsonDouble(request_json, "linear_dng_color_matrix_00", &metadata.color_matrix1[0]) &&
-      FindJsonDouble(request_json, "linear_dng_color_matrix_01", &metadata.color_matrix1[1]) &&
-      FindJsonDouble(request_json, "linear_dng_color_matrix_02", &metadata.color_matrix1[2]) &&
-      FindJsonDouble(request_json, "linear_dng_color_matrix_10", &metadata.color_matrix1[3]) &&
-      FindJsonDouble(request_json, "linear_dng_color_matrix_11", &metadata.color_matrix1[4]) &&
-      FindJsonDouble(request_json, "linear_dng_color_matrix_12", &metadata.color_matrix1[5]) &&
-      FindJsonDouble(request_json, "linear_dng_color_matrix_20", &metadata.color_matrix1[6]) &&
-      FindJsonDouble(request_json, "linear_dng_color_matrix_21", &metadata.color_matrix1[7]) &&
-      FindJsonDouble(request_json, "linear_dng_color_matrix_22", &metadata.color_matrix1[8]);
-
-  metadata.has_predicted_detail_gain =
-      FindJsonDouble(request_json, "predicted_detail_gain", &metadata.predicted_detail_gain);
-
-  metadata.stack_stability_path = FindJsonString(request_json, "om3_stack_stability_path");
-  unsigned stack_stability_width = 0;
-  unsigned stack_stability_height = 0;
-  metadata.has_stack_stability_map =
-      !metadata.stack_stability_path.empty() &&
-      FindJsonUnsigned(request_json, "om3_stack_stability_width", &stack_stability_width) &&
-      FindJsonUnsigned(request_json, "om3_stack_stability_height", &stack_stability_height);
-  metadata.stack_stability_width = stack_stability_width;
-  metadata.stack_stability_height = stack_stability_height;
-
-  metadata.stack_mean_path = FindJsonString(request_json, "om3_stack_mean_path");
-  unsigned stack_mean_width = 0;
-  unsigned stack_mean_height = 0;
-  metadata.has_stack_mean_map =
-      !metadata.stack_mean_path.empty() &&
-      FindJsonUnsigned(request_json, "om3_stack_mean_width", &stack_mean_width) &&
-      FindJsonUnsigned(request_json, "om3_stack_mean_height", &stack_mean_height);
-  metadata.stack_mean_width = stack_mean_width;
-  metadata.stack_mean_height = stack_mean_height;
-
-  metadata.stack_guide_path = FindJsonString(request_json, "om3_stack_guide_path");
-  unsigned stack_guide_width = 0;
-  unsigned stack_guide_height = 0;
-  metadata.has_stack_guide_map =
-      !metadata.stack_guide_path.empty() &&
-      FindJsonUnsigned(request_json, "om3_stack_guide_width", &stack_guide_width) &&
-      FindJsonUnsigned(request_json, "om3_stack_guide_height", &stack_guide_height);
-  metadata.stack_guide_width = stack_guide_width;
-  metadata.stack_guide_height = stack_guide_height;
-
-  metadata.stack_tensor_x_path = FindJsonString(request_json, "om3_stack_tensor_x_path");
-  unsigned stack_tensor_x_width = 0;
-  unsigned stack_tensor_x_height = 0;
-  metadata.has_stack_tensor_x_map =
-      !metadata.stack_tensor_x_path.empty() &&
-      FindJsonUnsigned(request_json, "om3_stack_tensor_x_width", &stack_tensor_x_width) &&
-      FindJsonUnsigned(request_json, "om3_stack_tensor_x_height", &stack_tensor_x_height);
-  metadata.stack_tensor_x_width = stack_tensor_x_width;
-  metadata.stack_tensor_x_height = stack_tensor_x_height;
-
-  metadata.stack_tensor_y_path = FindJsonString(request_json, "om3_stack_tensor_y_path");
-  unsigned stack_tensor_y_width = 0;
-  unsigned stack_tensor_y_height = 0;
-  metadata.has_stack_tensor_y_map =
-      !metadata.stack_tensor_y_path.empty() &&
-      FindJsonUnsigned(request_json, "om3_stack_tensor_y_width", &stack_tensor_y_width) &&
-      FindJsonUnsigned(request_json, "om3_stack_tensor_y_height", &stack_tensor_y_height);
-  metadata.stack_tensor_y_width = stack_tensor_y_width;
-  metadata.stack_tensor_y_height = stack_tensor_y_height;
-
-  metadata.stack_tensor_coherence_path = FindJsonString(request_json, "om3_stack_tensor_coherence_path");
-  unsigned stack_tensor_coherence_width = 0;
-  unsigned stack_tensor_coherence_height = 0;
-  metadata.has_stack_tensor_coherence_map =
-      !metadata.stack_tensor_coherence_path.empty() &&
-      FindJsonUnsigned(request_json, "om3_stack_tensor_coherence_width", &stack_tensor_coherence_width) &&
-      FindJsonUnsigned(request_json, "om3_stack_tensor_coherence_height", &stack_tensor_coherence_height);
-  metadata.stack_tensor_coherence_width = stack_tensor_coherence_width;
-  metadata.stack_tensor_coherence_height = stack_tensor_coherence_height;
-
-  metadata.stack_alias_path = FindJsonString(request_json, "om3_stack_alias_path");
-  unsigned stack_alias_width = 0;
-  unsigned stack_alias_height = 0;
-  metadata.has_stack_alias_map =
-      !metadata.stack_alias_path.empty() &&
-      FindJsonUnsigned(request_json, "om3_stack_alias_width", &stack_alias_width) &&
-      FindJsonUnsigned(request_json, "om3_stack_alias_height", &stack_alias_height);
-  metadata.stack_alias_width = stack_alias_width;
-  metadata.stack_alias_height = stack_alias_height;
-
-  unsigned crop_left = 0;
-  unsigned crop_top = 0;
-  unsigned crop_width = 0;
-  unsigned crop_height = 0;
-  metadata.has_default_crop =
-      FindJsonUnsigned(request_json, "linear_dng_crop_left_margin", &crop_left) &&
-      FindJsonUnsigned(request_json, "linear_dng_crop_top_margin", &crop_top) &&
-      FindJsonUnsigned(request_json, "linear_dng_crop_width", &crop_width) &&
-      FindJsonUnsigned(request_json, "linear_dng_crop_height", &crop_height);
-  metadata.default_crop_origin_h = crop_left;
-  metadata.default_crop_origin_v = crop_top;
-  metadata.default_crop_width = crop_width;
-  metadata.default_crop_height = crop_height;
-
-  unsigned working_width = 0;
-  unsigned working_height = 0;
-  metadata.has_working_geometry =
-      FindJsonUnsigned(request_json, "working_width", &working_width) &&
-      FindJsonUnsigned(request_json, "working_height", &working_height);
-  metadata.working_width = working_width;
-  metadata.working_height = working_height;
-
-  return metadata;
-}
-
 int PrintUsage() {
   std::cerr << "usage: hiraco convert <source> <output> [--compression uncompressed|deflate|jpeg-xl] [--debug]\n";
-  std::cerr << "       hiraco convert --request-json <json>  (legacy JSON IPC)\n";
-  std::cerr << "       hiraco analyze --request-json <json>\n";
-  std::cerr << "       hiraco probe --source <path>\n";
-  std::cerr << "       hiraco selftest-write --output <path> [--compression uncompressed|deflate|jpeg-xl]\n";
   return 2;
 }
 
@@ -434,27 +269,6 @@ bool WriteTextFile(const std::string& output_path,
   }
 
   return true;
-}
-
-void PrintProbeJson(bool ok,
-                    const std::string& message,
-                    const std::string& source_path,
-                    bool source_exists,
-                    const DecodeSummary* decode_summary = nullptr) {
-  const auto dng_sdk_summary = GetDngSdkSupportSummary();
-  std::cout
-      << "{\n"
-      << "  \"diagnostics\": {\n"
-      << "    \"decode_summary\": "
-      << (decode_summary ? BuildDecodeSummaryJson(*decode_summary) : "null") << ",\n"
-      << "    \"dng_sdk\": " << BuildDngSdkSummaryJson(dng_sdk_summary) << ",\n"
-      << "    \"source_exists\": " << (source_exists ? "true" : "false") << ",\n"
-      << "    \"source_path\": \"" << JsonEscape(source_path) << "\",\n"
-      << "    \"stage\": \"native-probe\"\n"
-      << "  },\n"
-      << "  \"message\": \"" << JsonEscape(message) << "\",\n"
-      << "  \"ok\": " << (ok ? "true" : "false") << "\n"
-      << "}\n";
 }
 
 std::string BuildDecodeSummaryJson(const DecodeSummary& summary) {
@@ -565,6 +379,28 @@ std::string BuildAnalysisSummaryJson(const AnalysisSummary& summary) {
       << "      \"wrote_mosaic\": " << (summary.wrote_mosaic ? "true" : "false") << "\n"
       << "    }";
   return output.str();
+}
+
+SourceLinearDngMetadata BuildMetadataFromLibRaw(const std::string& source_path,
+                                                const DecodeSummary& decode_summary) {
+  SourceLinearDngMetadata metadata;
+  metadata.make = decode_summary.camera_make;
+  metadata.model = decode_summary.camera_model;
+  // TODO: extract default matrix or as_shot_neutral directly from LibRaw instead of Python Exiftool 
+  // For now, we seed the bridge with the basic decode limits.
+  metadata.black_level = decode_summary.black_level;
+  metadata.has_black_level = true;
+  metadata.white_level = decode_summary.white_level;
+  metadata.has_white_level = true;
+
+  // Read maker notes to get working geometry 
+  auto mn = ReadVendorMakerNote(source_path);
+  if (mn.ok && mn.has_working_geometry) {
+      metadata.has_working_geometry = true;
+      metadata.working_width = mn.working_width;
+      metadata.working_height = mn.working_height;
+  }
+  return metadata;
 }
 
 bool DecodeWithLibRaw(const std::string& source_path,
@@ -797,191 +633,11 @@ bool RunAnalysisWithLibRaw(const std::string& source_path,
   return true;
 }
 
-void PrintAnalyzeJson(bool ok,
-                      const std::string& message,
-                      const std::string& source_path,
-                      bool source_exists,
-                      const DecodeSummary* decode_summary,
-                      const AnalysisSummary* analysis_summary) {
-  std::cout
-      << "{\n"
-      << "  \"diagnostics\": {\n"
-      << "    \"analysis_outputs\": "
-      << (analysis_summary ? BuildAnalysisSummaryJson(*analysis_summary) : "null") << ",\n"
-      << "    \"decode_summary\": "
-      << (decode_summary ? BuildDecodeSummaryJson(*decode_summary) : "null") << ",\n"
-      << "    \"source_exists\": " << (source_exists ? "true" : "false") << ",\n"
-      << "    \"source_path\": \"" << JsonEscape(source_path) << "\",\n"
-      << "    \"stage\": \"native-analyze\"\n"
-      << "  },\n"
-      << "  \"message\": \"" << JsonEscape(message) << "\",\n"
-      << "  \"ok\": " << (ok ? "true" : "false") << "\n"
-      << "}\n";
-}
-
-void PrintJsonFailure(const std::string& message,
-                      const std::string& source_path = {},
-                      const std::string& output_path = {},
-                      const std::string& compression = {},
-                      bool overwrite = false,
-                      bool source_exists = false,
-                      bool output_exists = false,
-                      const DecodeSummary* decode_summary = nullptr) {
-  const auto dng_sdk_summary = GetDngSdkSupportSummary();
-  const auto writer_config_summary = BuildDngWriterConfigSummary(compression);
-  const auto writer_runtime_summary = BuildDngWriterRuntimeSummary(compression);
-  std::cout
-      << "{\n"
-      << "  \"diagnostics\": {\n"
-      << "    \"compression\": \"" << JsonEscape(compression) << "\",\n"
-      << "    \"decode_summary\": "
-      << (decode_summary ? BuildDecodeSummaryJson(*decode_summary) : "null") << ",\n"
-      << "    \"dng_sdk\": " << BuildDngSdkSummaryJson(dng_sdk_summary) << ",\n"
-      << "    \"writer_config\": " << BuildDngWriterConfigJson(writer_config_summary) << ",\n"
-      << "    \"writer_runtime\": " << BuildDngWriterRuntimeJson(writer_runtime_summary) << ",\n"
-      << "    \"output_exists\": " << (output_exists ? "true" : "false") << ",\n"
-      << "    \"output_path\": \"" << JsonEscape(output_path) << "\",\n"
-      << "    \"overwrite\": " << (overwrite ? "true" : "false") << ",\n"
-      << "    \"source_exists\": " << (source_exists ? "true" : "false") << ",\n"
-      << "    \"source_path\": \"" << JsonEscape(source_path) << "\",\n"
-      << "    \"stage\": \"native-helper-stub\"\n"
-      << "  },\n"
-      << "  \"message\": \"" << JsonEscape(message) << "\",\n"
-      << "  \"ok\": false\n"
-      << "}\n";
-}
-
-    void PrintJsonSuccess(const std::string& message,
-              const std::string& source_path,
-              const std::string& output_path,
-              const std::string& compression,
-              bool overwrite,
-              bool source_exists,
-              bool output_exists,
-              const DecodeSummary* decode_summary = nullptr) {
-      const auto dng_sdk_summary = GetDngSdkSupportSummary();
-      const auto writer_config_summary = BuildDngWriterConfigSummary(compression);
-      const auto writer_runtime_summary = BuildDngWriterRuntimeSummary(compression);
-      std::cout
-      << "{\n"
-      << "  \"diagnostics\": {\n"
-      << "    \"compression\": \"" << JsonEscape(compression) << "\",\n"
-      << "    \"decode_summary\": "
-      << (decode_summary ? BuildDecodeSummaryJson(*decode_summary) : "null") << ",\n"
-      << "    \"dng_sdk\": " << BuildDngSdkSummaryJson(dng_sdk_summary) << ",\n"
-      << "    \"writer_config\": " << BuildDngWriterConfigJson(writer_config_summary) << ",\n"
-      << "    \"writer_runtime\": " << BuildDngWriterRuntimeJson(writer_runtime_summary) << ",\n"
-      << "    \"output_exists\": " << (output_exists ? "true" : "false") << ",\n"
-      << "    \"output_path\": \"" << JsonEscape(output_path) << "\",\n"
-      << "    \"overwrite\": " << (overwrite ? "true" : "false") << ",\n"
-      << "    \"source_exists\": " << (source_exists ? "true" : "false") << ",\n"
-      << "    \"source_path\": \"" << JsonEscape(source_path) << "\",\n"
-      << "    \"stage\": \"native-write\"\n"
-      << "  },\n"
-      << "  \"message\": \"" << JsonEscape(message) << "\",\n"
-      << "  \"ok\": true,\n"
-      << "  \"output_path\": \"" << JsonEscape(output_path) << "\"\n"
-      << "}\n";
-    }
-
-SourceLinearDngMetadata BuildMetadataFromLibRaw(const std::string& source_path,
-                                                 const DecodeSummary& decode_summary) {
-  SourceLinearDngMetadata metadata;
-  metadata.make = decode_summary.camera_make;
-  metadata.model = decode_summary.camera_model;
-  metadata.unique_camera_model = decode_summary.camera_make + " " + decode_summary.camera_model;
-
-  // Black/white levels: scale to 16-bit linear DNG range.
-  const unsigned raw_white = decode_summary.white_level;
-  if (raw_white > 0) {
-    const unsigned shift = std::max(0, 16 - static_cast<int>(
-        raw_white > 0 ? (32u - static_cast<unsigned>(__builtin_clz(raw_white))) : 0u));
-    metadata.has_black_level = true;
-    metadata.black_level = static_cast<double>(decode_summary.black_level) * (1u << shift);
-    metadata.has_white_level = true;
-    metadata.white_level = 65535.0;
-  }
-
-  // Color matrix from LibRaw.
-  {
-    LibRaw processor;
-    if (processor.open_file(source_path.c_str()) == LIBRAW_SUCCESS) {
-      // color_matrix[3][4] — use first 3 columns.
-      bool all_zero = true;
-      for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) {
-          if (processor.imgdata.color.cam_xyz[r][c] != 0.0f) {
-            all_zero = false;
-          }
-        }
-      }
-      if (!all_zero) {
-        metadata.has_color_matrix1 = true;
-        for (int r = 0; r < 3; ++r) {
-          for (int c = 0; c < 3; ++c) {
-            metadata.color_matrix1[r * 3 + c] = static_cast<double>(processor.imgdata.color.cam_xyz[r][c]);
-          }
-        }
-      }
-
-      // as_shot_neutral from camera white balance.
-      const float* cam_mul = processor.imgdata.color.cam_mul;
-      if (cam_mul[0] > 0 && cam_mul[1] > 0 && cam_mul[2] > 0) {
-        double neutral[3];
-        for (int i = 0; i < 3; ++i) {
-          neutral[i] = 1.0 / static_cast<double>(cam_mul[i]);
-        }
-        if (neutral[1] > 0) {
-          metadata.has_as_shot_neutral = true;
-          for (int i = 0; i < 3; ++i) {
-            metadata.as_shot_neutral[i] = neutral[i] / neutral[1];
-          }
-        }
-      }
-
-      // Crop geometry from LibRaw sizes.
-      const auto& sizes = processor.imgdata.sizes;
-      if (sizes.raw_inset_crops[0].cwidth > 0 && sizes.raw_inset_crops[0].cheight > 0) {
-        metadata.has_default_crop = true;
-        metadata.default_crop_origin_h = sizes.raw_inset_crops[0].cleft;
-        metadata.default_crop_origin_v = sizes.raw_inset_crops[0].ctop;
-        metadata.default_crop_width = sizes.raw_inset_crops[0].cwidth;
-        metadata.default_crop_height = sizes.raw_inset_crops[0].cheight;
-      }
-
-      processor.recycle();
-    }
-  }
-
-  // Working geometry and stacked image from Olympus MakerNote.
-  auto mn = ReadOlympusMakerNote(source_path);
-  if (mn.ok) {
-    if (mn.has_working_geometry) {
-      metadata.has_working_geometry = true;
-      metadata.working_width = mn.working_width;
-      metadata.working_height = mn.working_height;
-    }
-    // Use TIFF Make/Model from the file for exact naming.
-    if (!mn.tiff_make.empty()) {
-      metadata.make = mn.tiff_make;
-    }
-    if (!mn.tiff_model.empty()) {
-      metadata.model = mn.tiff_model;
-    }
-    metadata.unique_camera_model = metadata.make + " " + metadata.model;
-  }
-
-  metadata.has_predicted_detail_gain = true;
-  metadata.predicted_detail_gain = 1.8;
-
-  return metadata;
-}
-
-bool PopulateStackGuidance(const std::string& source_path,
+    bool PopulateStackGuidance(const std::string& source_path,
                            const std::string& tmp_dir,
                            SourceLinearDngMetadata* metadata,
                            std::string* error_message) {
-  auto mn = ReadOlympusMakerNote(source_path);
+  auto mn = ReadVendorMakerNote(source_path);
   if (!mn.ok) {
     // Not an error — just no stack guidance available.
     return true;
@@ -1090,13 +746,7 @@ int RunDirectConvert(const std::string& source_path,
                      bool debug) {
   const bool source_exists = std::filesystem::exists(source_path);
   if (!source_exists) {
-    if (debug) {
-      PrintJsonFailure("source file does not exist",
-                       source_path, output_path, compression,
-                       true, false, false);
-    } else {
-      std::cerr << "Error: source file does not exist: " << source_path << "\n";
-    }
+    std::cerr << "Error: source file does not exist: " << source_path << "\n";
     return 1;
   }
 
@@ -1104,13 +754,7 @@ int RunDirectConvert(const std::string& source_path,
   std::string decode_error;
   bool has_decode_summary = false;
   if (!DecodeWithLibRaw(source_path, &decode_summary, &decode_error, &has_decode_summary)) {
-    if (debug) {
-      PrintJsonFailure(decode_error, source_path, output_path, compression,
-                       true, source_exists, false,
-                       has_decode_summary ? &decode_summary : nullptr);
-    } else {
-      std::cerr << "Error: " << decode_error << "\n";
-    }
+    std::cerr << "Error: " << decode_error << "\n";
     return 1;
   }
 
@@ -1122,12 +766,7 @@ int RunDirectConvert(const std::string& source_path,
                               + "/.hiraco_tmp";
   std::string guidance_error;
   if (!PopulateStackGuidance(source_path, tmp_dir, &metadata, &guidance_error)) {
-    if (debug) {
-      PrintJsonFailure(guidance_error, source_path, output_path, compression,
-                       true, source_exists, false, &decode_summary);
-    } else {
-      std::cerr << "Error: " << guidance_error << "\n";
-    }
+    std::cerr << "Error: " << guidance_error << "\n";
     return 1;
   }
 
@@ -1140,267 +779,23 @@ int RunDirectConvert(const std::string& source_path,
   }
 
   if (write_result.ok) {
-    if (debug) {
-      PrintJsonSuccess(write_result.message, source_path, output_path, compression,
-                       true, source_exists, std::filesystem::exists(output_path),
-                       &decode_summary);
-    } else {
-      std::cout << "Success: " << output_path << "\n";
-    }
+    std::cout << "Success: " << output_path << "\n";
     return 0;
   }
 
-  if (debug) {
-    PrintJsonFailure(write_result.message, source_path, output_path, compression,
-                     true, source_exists, std::filesystem::exists(output_path),
-                     &decode_summary);
-  } else {
-    std::cerr << "Error: " << write_result.message << "\n";
-  }
+  std::cerr << "Error: " << write_result.message << "\n";
   return 1;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 2) {
+  if (argc < 4) {
     return PrintUsage();
   }
 
   const std::string command = argv[1];
-  if (command == "probe") {
-    if (argc != 4 || std::string(argv[2]) != "--source") {
-      return PrintUsage();
-    }
-
-    const std::string source_path = argv[3];
-    const bool source_exists = std::filesystem::exists(source_path);
-    if (!source_exists) {
-      PrintProbeJson(false, "source file does not exist", source_path, source_exists);
-      return 1;
-    }
-
-    DecodeSummary decode_summary;
-    std::string decode_error;
-    bool has_decode_summary = false;
-    if (!DecodeWithLibRaw(source_path, &decode_summary, &decode_error, &has_decode_summary)) {
-      PrintProbeJson(false,
-                     decode_error,
-                     source_path,
-                     source_exists,
-                     has_decode_summary ? &decode_summary : nullptr);
-      return 1;
-    }
-
-    PrintProbeJson(true, "native probe succeeded", source_path, source_exists, &decode_summary);
-    return 0;
-  }
-
-  if (command == "selftest-write") {
-    if (argc != 4 && argc != 6) {
-      return PrintUsage();
-    }
-
-    if (std::string(argv[2]) != "--output") {
-      return PrintUsage();
-    }
-
-    const std::string output_path = argv[3];
-    std::string compression = "deflate";
-
-    if (argc == 6) {
-      if (std::string(argv[4]) != "--compression") {
-        return PrintUsage();
-      }
-      compression = argv[5];
-    }
-
-    const auto write_result = WriteSyntheticLinearDng(output_path, compression);
-    if (write_result.ok) {
-      PrintJsonSuccess(write_result.message,
-                       "synthetic-gradient.raw",
-                       output_path,
-                       compression,
-                       true,
-                       true,
-                       std::filesystem::exists(output_path),
-                       nullptr);
-      return 0;
-    }
-
-    PrintJsonFailure(write_result.message,
-                     "synthetic-gradient.raw",
-                     output_path,
-                     compression,
-                     true,
-                     true,
-                     std::filesystem::exists(output_path),
-                     nullptr);
-    return 1;
-  }
-
-  if (command == "analyze") {
-    if (argc != 4 || std::string(argv[2]) != "--request-json") {
-      return PrintUsage();
-    }
-
-    const std::string request_json = argv[3];
-    if (request_json.empty()) {
-      PrintAnalyzeJson(false, "request payload is empty", {}, false, nullptr, nullptr);
-      return 1;
-    }
-
-    const std::string source_path = FindJsonString(request_json, "source_path");
-    const std::string dump_mosaic_path = FindJsonString(request_json, "dump_mosaic_path");
-    const std::string dump_cfa_index_path = FindJsonString(request_json, "dump_cfa_index_path");
-    const std::string dump_crop_geometry_path = FindJsonString(request_json, "dump_crop_geometry_path");
-
-    if (source_path.empty()) {
-      PrintAnalyzeJson(false, "source_path is missing from request", {}, false, nullptr, nullptr);
-      return 1;
-    }
-
-    const bool source_exists = std::filesystem::exists(source_path);
-    if (!source_exists) {
-      PrintAnalyzeJson(false, "source file does not exist", source_path, source_exists, nullptr, nullptr);
-      return 1;
-    }
-
-    DecodeSummary decode_summary;
-    std::string decode_error;
-    bool has_decode_summary = false;
-    if (!DecodeWithLibRaw(source_path, &decode_summary, &decode_error, &has_decode_summary)) {
-      PrintAnalyzeJson(false,
-                       decode_error,
-                       source_path,
-                       source_exists,
-                       has_decode_summary ? &decode_summary : nullptr,
-                       nullptr);
-      return 1;
-    }
-
-    AnalysisSummary analysis_summary;
-    std::string analysis_error;
-    if (!RunAnalysisWithLibRaw(source_path,
-                               dump_mosaic_path,
-                               dump_cfa_index_path,
-                               dump_crop_geometry_path,
-                               decode_summary,
-                               &analysis_summary,
-                               &analysis_error)) {
-      PrintAnalyzeJson(false,
-                       analysis_error,
-                       source_path,
-                       source_exists,
-                       &decode_summary,
-                       &analysis_summary);
-      return 1;
-    }
-
-    PrintAnalyzeJson(true,
-                     "native analysis succeeded",
-                     source_path,
-                     source_exists,
-                     &decode_summary,
-                     &analysis_summary);
-    return 0;
-  }
-
   if (command != "convert") {
-    return PrintUsage();
-  }
-
-  // Legacy JSON IPC mode: convert --request-json <json>
-  if (argc == 4 && std::string(argv[2]) == "--request-json") {
-    const std::string request_json = argv[3];
-    if (request_json.empty()) {
-      PrintJsonFailure("request payload is empty");
-      return 1;
-    }
-
-    const std::string source_path = FindJsonString(request_json, "source_path");
-    const std::string output_path = FindJsonString(request_json, "output_path");
-    const std::string compression = FindJsonString(request_json, "compression");
-    const bool overwrite = FindJsonBool(request_json, "overwrite", false);
-    const auto source_metadata = ParseSourceLinearDngMetadata(request_json);
-
-    if (source_path.empty()) {
-      PrintJsonFailure("source_path is missing from request");
-      return 1;
-    }
-    if (output_path.empty()) {
-      PrintJsonFailure("output_path is missing from request", source_path);
-      return 1;
-    }
-
-    const std::set<std::string> valid_compressions = {
-        "uncompressed",
-        "deflate",
-        "jpeg-xl",
-    };
-    if (valid_compressions.find(compression) == valid_compressions.end()) {
-      PrintJsonFailure("compression mode is invalid",
-                       source_path,
-                       output_path,
-                       compression,
-                       overwrite);
-      return 1;
-    }
-
-    const bool source_exists = std::filesystem::exists(source_path);
-    const bool output_exists = std::filesystem::exists(output_path);
-    if (!source_exists) {
-      PrintJsonFailure("source file does not exist",
-                       source_path,
-                       output_path,
-                       compression,
-                       overwrite,
-                       source_exists,
-                       output_exists);
-      return 1;
-    }
-
-    DecodeSummary decode_summary;
-    std::string decode_error;
-    bool has_decode_summary = false;
-    if (!DecodeWithLibRaw(source_path, &decode_summary, &decode_error, &has_decode_summary)) {
-      PrintJsonFailure(decode_error,
-                       source_path,
-                       output_path,
-                       compression,
-                       overwrite,
-                       source_exists,
-                       output_exists,
-                       has_decode_summary ? &decode_summary : nullptr);
-      return 1;
-    }
-
-    const auto write_result = WriteLinearDngFromRaw(source_path, output_path, compression, source_metadata);
-    if (write_result.ok) {
-      PrintJsonSuccess(write_result.message,
-                       source_path,
-                       output_path,
-                       compression,
-                       overwrite,
-                       source_exists,
-                       std::filesystem::exists(output_path),
-                       &decode_summary);
-      return 0;
-    }
-
-    PrintJsonFailure(write_result.message,
-                     source_path,
-                     output_path,
-                     compression,
-                     overwrite,
-                     source_exists,
-                     std::filesystem::exists(output_path),
-                     &decode_summary);
-    return 1;
-  }
-
-  // Direct args mode: convert <source> <output> [--compression <mode>] [--debug]
-  if (argc < 4) {
     return PrintUsage();
   }
 

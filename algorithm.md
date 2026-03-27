@@ -1,6 +1,6 @@
 # High-Resolution RAW Compilation & Algorithm Pipeline
 
-This document details the architectural processes, design logic, and underlying algorithmic implementations used in `hiraco` to convert OM SYSTEM / Olympus High-Resolution sensor-shift composite `.ORF` files into pristine, well-formed `.dng` files.
+This document details the architectural processes, design logic, and underlying algorithmic implementations used in `hiraco` to convert high-resolution sensor-shift composite `.ORF` files into pristine, well-formed `.dng` files.
 
 ---
 
@@ -22,7 +22,7 @@ The overarching goal of `hiraco` is to maximize detail extraction directly from 
 
 Standard Bayer arrays rely on a `2x2` CFA (Color Filter Array) grid, demanding mathematically complex demosaicing (calculating unknown colors from neighbors) which fundamentally degrades maximum spatial constraints. 
 
-Conversely, OM SYSTEM high-resolution `.ORF` files are the result of rapid sequential burst triggers combined with in-body image stabilization (IBIS) micro-shifts. When merged, every physical pixel well on the grid effectively receives full Red, Green, and Blue samples. Demosaicing is bypassed. The resulting native block acts as a true, demosaic-free multi-channel bitmap. 
+Conversely, Modern Vendor high-resolution `.ORF` files are the result of rapid sequential burst triggers combined with in-body image stabilization (IBIS) micro-shifts. When merged, every physical pixel well on the grid effectively receives full Red, Green, and Blue samples. Demosaicing is bypassed. The resulting native block acts as a true, demosaic-free multi-channel bitmap. 
 
 The primary challenge isn't color interpolation; it is the **resolution of sub-pixel overlaps**, preventing the matrix from looking artificially bloated or soft. 
 
