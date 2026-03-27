@@ -4,6 +4,8 @@
 
 By deeply analyzing the sensor-shift characteristics of these cameras, `hiraco` operates a specialized custom native reconstruction engine to extract true sub-pixel resolution rather than relying on mathematically standard interpolations. It specifically targets the full optical extraction of High-Res composites.
 
+Project was developed exclusively using Claude 4.6 / GPT 5.4 / Gemini 3 with analysis of TIFF and ORI/ORF files and metadata only. No code decompilation or other techniques were used.
+
 ## Unrivaled Detail Retention
 
 `hiraco` rivals and out-performs commercial converters in resolving fine spatial details from the sensor-shift data. Our native FFTW deconvolution mapping successfully retrieves the crisp architecture edges originally captured by the lens.
