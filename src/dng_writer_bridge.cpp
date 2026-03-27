@@ -614,16 +614,18 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // Keep a copy of the original luma for ratio transfer.
   std::vector<double> original_luma(luma);
 
-  const bool enable_stage1 = EnvFlagEnabled("HIRACO_DETAIL_STAGE1", false);
-  const bool enable_stage2 = EnvFlagEnabled("HIRACO_DETAIL_STAGE2", true);
-  const bool enable_stage3 = EnvFlagEnabled("HIRACO_DETAIL_STAGE3", true);
+  const bool enable_stage1 = true;
+  const bool enable_stage2 = true;
+  const bool enable_stage3 = true;
 
   std::vector<double> confidence(pixel_count, 1.0);
 
-  if (cfa_guide_image != nullptr &&
+  bool cfa_ok = cfa_guide_image != nullptr &&
       cfa_guide_image->width == width &&
       cfa_guide_image->height == height &&
-      cfa_guide_image->colors == 4) {
+      cfa_guide_image->colors == 4;
+
+  if (cfa_ok) {
     auto blur3 = [&](const std::vector<double>& src, std::vector<double>& dst) {
       std::vector<double> tmp(pixel_count);
       for (uint32_t row = 0; row < height; ++row) {
@@ -2054,7 +2056,12 @@ bool BuildLinearDngPayload(const std::string& source_path,
     return false;
   }
 
-  payload->cfa_guide_image = RasterImage();
+  // Attempt to extract the CFA guide image for edge-aware enhancement.
+  // It is optional so if it fails we just leave it empty.
+  std::string cfa_error;
+  if (!ExtractCfaGuideImage(source_path, metadata, &payload->cfa_guide_image, &cfa_error)) {
+    payload->cfa_guide_image = RasterImage();
+  }
 
   return true;
 }

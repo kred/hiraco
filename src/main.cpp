@@ -386,20 +386,95 @@ SourceLinearDngMetadata BuildMetadataFromLibRaw(const std::string& source_path,
   SourceLinearDngMetadata metadata;
   metadata.make = decode_summary.camera_make;
   metadata.model = decode_summary.camera_model;
-  // TODO: extract default matrix or as_shot_neutral directly from LibRaw instead of Python Exiftool 
-  // For now, we seed the bridge with the basic decode limits.
-  metadata.black_level = decode_summary.black_level;
-  metadata.has_black_level = true;
-  metadata.white_level = decode_summary.white_level;
-  metadata.has_white_level = true;
+  metadata.unique_camera_model = decode_summary.camera_make + " " + decode_summary.camera_model;
+
+  // Black/white levels: scale to 16-bit linear DNG range.
+  const unsigned raw_white = decode_summary.white_level;
+  if (raw_white > 0) {
+    const unsigned shift = std::max(0, 16 - static_cast<int>(
+        raw_white > 0 ? (32u - static_cast<unsigned>(__builtin_clz(raw_white))) : 0u));
+    metadata.has_black_level = true;
+    metadata.black_level = static_cast<double>(decode_summary.black_level) * (1u << shift);
+    metadata.has_white_level = true;
+    metadata.white_level = 65535.0;
+  } else {
+    metadata.black_level = decode_summary.black_level;
+    metadata.has_black_level = true;
+    metadata.white_level = decode_summary.white_level;
+    metadata.has_white_level = true;
+  }
+
+  // Color matrix from LibRaw.
+  {
+    LibRaw processor;
+    if (processor.open_file(source_path.c_str()) == LIBRAW_SUCCESS) {
+      if (processor.unpack() == LIBRAW_SUCCESS) {
+        // color_matrix[3][4] — use first 3 columns.
+        bool all_zero = true;
+        for (int r = 0; r < 3; ++r) {
+          for (int c = 0; c < 3; ++c) {
+            if (processor.imgdata.color.cmatrix[r][c] != 0.0f) {
+              all_zero = false;
+            }
+          }
+        }
+        if (!all_zero) {
+          metadata.has_color_matrix1 = true;
+          for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+              metadata.color_matrix1[r * 3 + c] =
+                  processor.imgdata.color.cmatrix[r][c];
+            }
+          }
+        }
+
+        // Neutral coordinates.
+        if (processor.imgdata.color.cam_mul[0] > 0.0f &&
+            processor.imgdata.color.cam_mul[1] > 0.0f &&
+            processor.imgdata.color.cam_mul[2] > 0.0f) {
+          metadata.has_as_shot_neutral = true;
+          // LibRaw provides multipliers, DNG expects inverse.
+          // Normalize green channel to 1.0.
+          const double g = processor.imgdata.color.cam_mul[1];
+          metadata.as_shot_neutral[0] = static_cast<double>(g / processor.imgdata.color.cam_mul[0]);
+          metadata.as_shot_neutral[1] = 1.0;
+          metadata.as_shot_neutral[2] = static_cast<double>(g / processor.imgdata.color.cam_mul[2]);
+        }
+
+        const libraw_image_sizes_t& sizes = processor.imgdata.sizes;
+        if (sizes.raw_inset_crops[0].cwidth > 0 &&
+            sizes.raw_inset_crops[0].cheight > 0) {
+          metadata.has_default_crop = true;
+          metadata.default_crop_origin_h = sizes.raw_inset_crops[0].cleft;
+          metadata.default_crop_origin_v = sizes.raw_inset_crops[0].ctop;
+          metadata.default_crop_width = sizes.raw_inset_crops[0].cwidth;
+          metadata.default_crop_height = sizes.raw_inset_crops[0].cheight;
+        }
+      }
+    }
+  }
 
   // Read maker notes to get working geometry 
   auto mn = ReadVendorMakerNote(source_path);
-  if (mn.ok && mn.has_working_geometry) {
+  if (mn.ok) {
+    if (mn.tiff_make.length() > 0) {
+      metadata.make = mn.tiff_make;
+    }
+    if (mn.tiff_model.length() > 0) {
+      metadata.model = mn.tiff_model;
+    }
+    metadata.unique_camera_model = metadata.make + " " + metadata.model;
+
+    if (mn.has_working_geometry) {
       metadata.has_working_geometry = true;
       metadata.working_width = mn.working_width;
       metadata.working_height = mn.working_height;
+    }
   }
+
+  metadata.has_predicted_detail_gain = true;
+  metadata.predicted_detail_gain = 1.8;
+
   return metadata;
 }
 
