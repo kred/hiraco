@@ -833,7 +833,15 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   if (enable_stage2) {
     constexpr int kNumScales = 4;
     // Fine-scale gains — slightly reduced from v1 to avoid noise amplification.
-    const double scale_gains[kNumScales] = {1.4, 1.25, 1.1, 1.0};
+    
+    float denoise = 0.4f;
+    float gain0 = 1.6f, gain1 = 1.3f, gain2 = 1.1f, gain3 = 1.0f;
+    ReadEnvFloat("HIRACO_STAGE2_DENOISE", &denoise);
+    ReadEnvFloat("HIRACO_STAGE2_GAIN0", &gain0);
+    ReadEnvFloat("HIRACO_STAGE2_GAIN1", &gain1);
+    ReadEnvFloat("HIRACO_STAGE2_GAIN2", &gain2);
+    ReadEnvFloat("HIRACO_STAGE2_GAIN3", &gain3);
+    double scale_gains[kNumScales] = {gain0, gain1, gain2, gain3};
 
     // B3-spline 1D kernel: [1, 4, 6, 4, 1] / 16
     constexpr int kHalf = 2;
@@ -905,10 +913,10 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
         const double sigma_sq_noise = sigma_noise * sigma_noise;
         const double sigma_sq_signal =
             std::max(sigma_sq_total - sigma_sq_noise, 1e-10);
-        // Use 60% of BayesShrink threshold for gentler denoising that
+        // Use BayesShrink threshold for gentler denoising that
         // preserves more genuine detail.
         const double threshold =
-            0.6 * sigma_sq_noise / std::sqrt(sigma_sq_signal);
+            denoise * sigma_sq_noise / std::sqrt(sigma_sq_signal);
 
         for (size_t i = 0; i < pixel_count; ++i) {
           double detail = approx_prev[i] - approx_cur[i];
@@ -937,9 +945,14 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // Applies a final sharpening pass using a guided filter (self-guided)
   // as the smoothing base, avoiding halos at strong edges.
   if (enable_stage3) {
-    constexpr int kGfRadius = 6;
+    int gf_radius = 4;
+    float user_gf_gain = 0.5f;
+    ReadEnvInt("HIRACO_STAGE3_RADIUS", &gf_radius);
+    ReadEnvFloat("HIRACO_STAGE3_GAIN", &user_gf_gain);
+    
+    const int kGfRadius = gf_radius;
     constexpr double kGfEps = 0.001 * 65535.0 * 65535.0;
-    const double gf_gain = 0.35 * (base_gain - 1.0);
+    const double gf_gain = user_gf_gain * (base_gain - 1.0);
 
     // Integral images for O(1)-per-pixel box filtering.
     const size_t integral_w = static_cast<size_t>(width) + 1;
