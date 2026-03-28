@@ -28,7 +28,12 @@
 #include <libraw/libraw.h>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include "HalideBuffer.h"
+#include "hiraco_atrous_wavelet.h"
+#include "hiraco_guided_filter.h"
 
 namespace {
 
@@ -117,6 +122,41 @@ bool EnvFlagEnabled(const char* name, bool default_value) {
     return default_value;
   }
   return value != 0;
+}
+
+// --- FFTW threading and wisdom management ---
+
+bool g_fftw_threads_initialized = false;
+
+void InitFftwThreads() {
+  if (g_fftw_threads_initialized) return;
+  if (fftw_init_threads()) {
+    const int num_threads = static_cast<int>(std::thread::hardware_concurrency());
+    fftw_plan_with_nthreads(std::max(num_threads, 1));
+    std::cerr << "[hiraco] FFTW using " << std::max(num_threads, 1) << " threads\n";
+  }
+  g_fftw_threads_initialized = true;
+}
+
+std::string FftwWisdomPath() {
+  const char* home = std::getenv("HOME");
+  if (!home) home = std::getenv("USERPROFILE");
+  if (home) return std::string(home) + "/.hiraco_fftw_wisdom";
+  return "";
+}
+
+void LoadFftwWisdom() {
+  const std::string path = FftwWisdomPath();
+  if (!path.empty()) {
+    fftw_import_wisdom_from_filename(path.c_str());
+  }
+}
+
+void SaveFftwWisdom() {
+  const std::string path = FftwWisdomPath();
+  if (!path.empty()) {
+    fftw_export_wisdom_to_filename(path.c_str());
+  }
 }
 
 
@@ -410,6 +450,7 @@ void UpsampleFloatMap(const std::vector<double>& source,
 
   const double scale_x = static_cast<double>(source_width) / static_cast<double>(target_width);
   const double scale_y = static_cast<double>(source_height) / static_cast<double>(target_height);
+  #pragma omp parallel for schedule(static) if(target_height > 100)
   for (uint32_t row = 0; row < target_height; ++row) {
     const double y = (static_cast<double>(row) + 0.5) * scale_y - 0.5;
     const int y0 = static_cast<int>(std::floor(y));
@@ -570,6 +611,7 @@ void ApplyLinearDngRasterTransform(const SourceLinearDngMetadata& metadata,
     const double pedestal = metadata.black_level;
     const double gain = (65535.0 - pedestal) / 65535.0;
     const size_t pixel_count = static_cast<size_t>(image->width) * static_cast<size_t>(image->height);
+    #pragma omp parallel for schedule(static) if(pixel_count > 100000)
     for (size_t index = 0; index < pixel_count; ++index) {
       for (size_t channel = 0; channel < 3; ++channel) {
         const size_t sample_index = index * image->colors + channel;
@@ -604,6 +646,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
 
   // --- Stage 0: Extract luma channel (BT.709) ---
   std::vector<double> luma(pixel_count);
+  #pragma omp parallel for schedule(static) if(pixel_count > 100000)
   for (size_t i = 0; i < pixel_count; ++i) {
     const size_t px = i * colors;
     luma[i] = kLumaR * image->pixels[px] +
@@ -725,6 +768,10 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     fftw_complex* fft_out = fftw_alloc_complex(complex_n);
 
     if (fft_in && fft_out) {
+      // Ensure FFTW threading is initialized and load cached wisdom.
+      InitFftwThreads();
+      LoadFftwWisdom();
+
       // Fill the padded buffer using reflection at the image boundaries.
       std::fill(fft_in, fft_in + fft_n, 0.0);
       for (uint32_t pr = 0; pr < padded_h; ++pr) {
@@ -751,9 +798,26 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
 
       fftw_plan plan_fwd = fftw_plan_dft_r2c_2d(
           static_cast<int>(fft_h), static_cast<int>(fft_w),
-          fft_in, fft_out, FFTW_ESTIMATE);
+          fft_in, fft_out, FFTW_MEASURE);
 
       if (plan_fwd) {
+        // Re-fill the buffer after FFTW_MEASURE (planning may clobber it).
+        std::fill(fft_in, fft_in + fft_n, 0.0);
+        for (uint32_t pr = 0; pr < padded_h; ++pr) {
+          int sr = static_cast<int>(pr) - static_cast<int>(kPadMargin);
+          if (sr < 0) sr = -sr;
+          if (sr >= static_cast<int>(height)) sr = 2 * static_cast<int>(height) - 2 - sr;
+          sr = std::clamp(sr, 0, static_cast<int>(height) - 1);
+          const size_t dst_row = static_cast<size_t>(pr) * fft_w;
+          const size_t src_row = static_cast<size_t>(sr) * width;
+          for (uint32_t pc = 0; pc < padded_w; ++pc) {
+            int sc = static_cast<int>(pc) - static_cast<int>(kPadMargin);
+            if (sc < 0) sc = -sc;
+            if (sc >= static_cast<int>(width)) sc = 2 * static_cast<int>(width) - 2 - sc;
+            sc = std::clamp(sc, 0, static_cast<int>(width) - 1);
+            fft_in[dst_row + pc] = luma[src_row + sc];
+          }
+        }
         fftw_execute(plan_fwd);
         fftw_destroy_plan(plan_fwd);
 
@@ -768,6 +832,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
           const double two_pi2_sigma2 = 2.0 * M_PI * M_PI * psf_sigma * psf_sigma;
           const uint32_t half_w = fft_w / 2 + 1;
 
+          #pragma omp parallel for schedule(static) if(fft_h > 100)
           for (uint32_t row = 0; row < fft_h; ++row) {
             double fy = static_cast<double>(row);
             if (fy > fft_h / 2.0) fy -= fft_h;
@@ -798,14 +863,18 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
 
         fftw_plan plan_inv = fftw_plan_dft_c2r_2d(
             static_cast<int>(fft_h), static_cast<int>(fft_w),
-            fft_out, fft_in, FFTW_ESTIMATE);
+            fft_out, fft_in, FFTW_MEASURE);
 
         if (plan_inv) {
           fftw_execute(plan_inv);
           fftw_destroy_plan(plan_inv);
 
+          // Save FFTW wisdom so subsequent runs skip the planning cost.
+          SaveFftwWisdom();
+
           // Extract the central (un-padded) region, normalised.
           const double norm = 1.0 / static_cast<double>(fft_n);
+          #pragma omp parallel for schedule(static) if(height > 100)
           for (uint32_t row = 0; row < height; ++row) {
             const size_t src_offset =
                 static_cast<size_t>(row + kPadMargin) * fft_w + kPadMargin;
@@ -815,6 +884,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
             }
           }
 
+          #pragma omp parallel for schedule(static) if(pixel_count > 100000)
           for (size_t i = 0; i < pixel_count; ++i) {
             luma[i] = original_luma[i] + confidence[i] * (luma[i] - original_luma[i]);
           }
@@ -843,47 +913,17 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     ReadEnvFloat("HIRACO_STAGE2_GAIN3", &gain3);
     double scale_gains[kNumScales] = {gain0, gain1, gain2, gain3};
 
-    // B3-spline 1D kernel: [1, 4, 6, 4, 1] / 16
-    constexpr int kHalf = 2;
-    constexpr double kKernel[5] = {1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0,
-                                   4.0 / 16.0, 1.0 / 16.0};
-
     std::vector<double> approx_prev(luma);
     std::vector<double> detail_accum(pixel_count, 0.0);
-    std::vector<double> h_pass(pixel_count);
     std::vector<double> approx_cur(pixel_count);
 
     for (int scale = 0; scale < kNumScales; ++scale) {
       const int step = 1 << scale;  // dilation: 1, 2, 4, 8
 
-      // Horizontal pass.
-      for (uint32_t row = 0; row < height; ++row) {
-        const size_t row_off = static_cast<size_t>(row) * width;
-        for (uint32_t col = 0; col < width; ++col) {
-          double sum = 0.0;
-          for (int k = -kHalf; k <= kHalf; ++k) {
-            int sc = static_cast<int>(col) + k * step;
-            if (sc < 0) sc = 0;
-            if (sc >= static_cast<int>(width)) sc = static_cast<int>(width) - 1;
-            sum += kKernel[k + kHalf] * approx_prev[row_off + sc];
-          }
-          h_pass[row_off + col] = sum;
-        }
-      }
-
-      // Vertical pass.
-      for (uint32_t col = 0; col < width; ++col) {
-        for (uint32_t row = 0; row < height; ++row) {
-          double sum = 0.0;
-          for (int k = -kHalf; k <= kHalf; ++k) {
-            int sr = static_cast<int>(row) + k * step;
-            if (sr < 0) sr = 0;
-            if (sr >= static_cast<int>(height)) sr = static_cast<int>(height) - 1;
-            sum += kKernel[k + kHalf] * h_pass[static_cast<size_t>(sr) * width + col];
-          }
-          approx_cur[static_cast<size_t>(row) * width + col] = sum;
-        }
-      }
+      // Halide AOT: separable B3-spline convolution with dilation.
+      Halide::Runtime::Buffer<double> in_buf(approx_prev.data(), width, height);
+      Halide::Runtime::Buffer<double> out_buf(approx_cur.data(), width, height);
+      hiraco_atrous_wavelet(in_buf, step, out_buf);
 
       // Detail = previous_approx - current_approx.
       // Apply soft noise thresholding (BayesShrink-style) at finest
@@ -893,6 +933,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
         // Estimate noise σ at this scale using robust MAD estimator.
         // σ_noise ≈ median(|detail|) / 0.6745
         std::vector<double> abs_details(pixel_count);
+        #pragma omp parallel for schedule(static) if(pixel_count > 100000)
         for (size_t i = 0; i < pixel_count; ++i) {
           abs_details[i] = std::abs(approx_prev[i] - approx_cur[i]);
         }
@@ -904,6 +945,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
         // Soft threshold = σ²_noise / σ_signal
         // with σ_signal estimated from the detail coefficients.
         double sum_sq = 0.0;
+        #pragma omp parallel for reduction(+:sum_sq) schedule(static) if(pixel_count > 100000)
         for (size_t i = 0; i < pixel_count; ++i) {
           const double d = approx_prev[i] - approx_cur[i];
           sum_sq += d * d;
@@ -918,6 +960,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
         const double threshold =
             denoise * sigma_sq_noise / std::sqrt(sigma_sq_signal);
 
+        #pragma omp parallel for schedule(static) if(pixel_count > 100000)
         for (size_t i = 0; i < pixel_count; ++i) {
           double detail = approx_prev[i] - approx_cur[i];
           // Soft-threshold: shrink toward zero.
@@ -936,6 +979,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     }
 
     // Add accumulated wavelet detail to the (Wiener-deconvolved) luma.
+    #pragma omp parallel for schedule(static) if(pixel_count > 100000)
     for (size_t i = 0; i < pixel_count; ++i) {
       luma[i] += detail_accum[i];
     }
@@ -949,118 +993,18 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     float user_gf_gain = 0.5f;
     ReadEnvInt("HIRACO_STAGE3_RADIUS", &gf_radius);
     ReadEnvFloat("HIRACO_STAGE3_GAIN", &user_gf_gain);
-    
-    const int kGfRadius = gf_radius;
+
     constexpr double kGfEps = 0.001 * 65535.0 * 65535.0;
     const double gf_gain = user_gf_gain * (base_gain - 1.0);
 
-    // Integral images for O(1)-per-pixel box filtering.
-    const size_t integral_w = static_cast<size_t>(width) + 1;
-    const size_t integral_h = static_cast<size_t>(height) + 1;
-    const size_t integral_n = integral_w * integral_h;
-
-    std::vector<double> sum_I(integral_n, 0.0);
-    std::vector<double> sum_II(integral_n, 0.0);
-
-    // Build integral images for luma (I) and I*I.
-    for (uint32_t row = 0; row < height; ++row) {
-      double row_sum_I = 0.0;
-      double row_sum_II = 0.0;
-      for (uint32_t col = 0; col < width; ++col) {
-        const double val = luma[static_cast<size_t>(row) * width + col];
-        row_sum_I += val;
-        row_sum_II += val * val;
-        const size_t idx = static_cast<size_t>(row + 1) * integral_w + (col + 1);
-        sum_I[idx] = row_sum_I + sum_I[idx - integral_w];
-        sum_II[idx] = row_sum_II + sum_II[idx - integral_w];
-      }
-    }
-
-    // Box-filter helper: sum over rect [r0..r1, c0..c1] inclusive.
-    auto box_sum = [&](const std::vector<double>& integral,
-                       int r0, int c0, int r1, int c1) -> double {
-      r0 = std::max(r0, 0);
-      c0 = std::max(c0, 0);
-      r1 = std::min(r1, static_cast<int>(height) - 1);
-      c1 = std::min(c1, static_cast<int>(width) - 1);
-      const size_t a = static_cast<size_t>(r1 + 1) * integral_w + (c1 + 1);
-      const size_t b = static_cast<size_t>(r0) * integral_w + (c1 + 1);
-      const size_t c = static_cast<size_t>(r1 + 1) * integral_w + c0;
-      const size_t d = static_cast<size_t>(r0) * integral_w + c0;
-      return integral[a] - integral[b] - integral[c] + integral[d];
-    };
-
-    // Compute guided-filter smoothed luma and apply residual gain.
-    std::vector<double> gf_a(pixel_count);
-    std::vector<double> gf_b(pixel_count);
-
-    for (uint32_t row = 0; row < height; ++row) {
-      for (uint32_t col = 0; col < width; ++col) {
-        const int r0 = static_cast<int>(row) - kGfRadius;
-        const int c0 = static_cast<int>(col) - kGfRadius;
-        const int r1 = static_cast<int>(row) + kGfRadius;
-        const int c1 = static_cast<int>(col) + kGfRadius;
-
-        const int cr0 = std::max(r0, 0);
-        const int cc0 = std::max(c0, 0);
-        const int cr1 = std::min(r1, static_cast<int>(height) - 1);
-        const int cc1 = std::min(c1, static_cast<int>(width) - 1);
-        const double count = static_cast<double>((cr1 - cr0 + 1)) * (cc1 - cc0 + 1);
-
-        const double mean_I = box_sum(sum_I, r0, c0, r1, c1) / count;
-        const double mean_II = box_sum(sum_II, r0, c0, r1, c1) / count;
-        const double var_I = mean_II - mean_I * mean_I;
-
-        const size_t idx = static_cast<size_t>(row) * width + col;
-        gf_a[idx] = var_I / (var_I + kGfEps);
-        gf_b[idx] = mean_I * (1.0 - gf_a[idx]);
-      }
-    }
-
-    // Build integral images for a and b to average them.
-    std::vector<double> sum_a(integral_n, 0.0);
-    std::vector<double> sum_b(integral_n, 0.0);
-    for (uint32_t row = 0; row < height; ++row) {
-      double rs_a = 0.0, rs_b = 0.0;
-      for (uint32_t col = 0; col < width; ++col) {
-        const size_t idx = static_cast<size_t>(row) * width + col;
-        rs_a += gf_a[idx];
-        rs_b += gf_b[idx];
-        const size_t ii = static_cast<size_t>(row + 1) * integral_w + (col + 1);
-        sum_a[ii] = rs_a + sum_a[ii - integral_w];
-        sum_b[ii] = rs_b + sum_b[ii - integral_w];
-      }
-    }
-
-    for (uint32_t row = 0; row < height; ++row) {
-      for (uint32_t col = 0; col < width; ++col) {
-        const int r0 = static_cast<int>(row) - kGfRadius;
-        const int c0 = static_cast<int>(col) - kGfRadius;
-        const int r1 = static_cast<int>(row) + kGfRadius;
-        const int c1 = static_cast<int>(col) + kGfRadius;
-
-        const int cr0 = std::max(r0, 0);
-        const int cc0 = std::max(c0, 0);
-        const int cr1 = std::min(r1, static_cast<int>(height) - 1);
-        const int cc1 = std::min(c1, static_cast<int>(width) - 1);
-        const double count = static_cast<double>((cr1 - cr0 + 1)) * (cc1 - cc0 + 1);
-
-        const double mean_a = box_sum(sum_a, r0, c0, r1, c1) / count;
-        const double mean_b = box_sum(sum_b, r0, c0, r1, c1) / count;
-
-        const size_t idx = static_cast<size_t>(row) * width + col;
-        const double smoothed = mean_a * luma[idx] + mean_b;
-        const double detail = luma[idx] - smoothed;
-
-        // Adaptive gain: more gain in textured areas (higher local variance),
-        // less in smooth areas; and intensity modulation for shadow boost.
-        const double intensity_factor = std::pow(
-            std::max(luma[idx], 1.0) / 65535.0, -0.3);
-        const double clamped_ifactor = std::clamp(intensity_factor, 0.5, 3.0);
-
-        luma[idx] += gf_gain * clamped_ifactor * confidence[idx] * detail;
-      }
-    }
+    // Halide AOT: guided filter with adaptive gain.
+    Halide::Runtime::Buffer<double> luma_buf(luma.data(), width, height);
+    Halide::Runtime::Buffer<double> conf_buf(confidence.data(), width, height);
+    std::vector<double> gf_output(pixel_count);
+    Halide::Runtime::Buffer<double> result_buf(gf_output.data(), width, height);
+    hiraco_guided_filter(luma_buf, conf_buf, gf_radius, kGfEps, gf_gain,
+                         result_buf);
+    luma.swap(gf_output);
   }
 
   // --- Stage 4: Multiplicative ratio transfer to RGB ---
@@ -1070,6 +1014,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   constexpr double kMinRatio = 0.3;
   constexpr double kMaxRatio = 4.0;
 
+  #pragma omp parallel for schedule(static) if(pixel_count > 100000)
   for (size_t i = 0; i < pixel_count; ++i) {
     const double orig_y = std::max(original_luma[i], kMinLuma);
     const double enhanced_y = std::max(luma[i], 0.0);

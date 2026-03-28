@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.28)
 
 project(hiraco LANGUAGES C CXX)
 
@@ -68,6 +68,41 @@ else()
   set(FFTW3_LIBRARIES ${FFTW3_LIBRARY})
   set(FFTW3_INCLUDE_DIRS ${FFTW3_INCLUDE_DIR})
 endif()
+
+# FFTW3 threading library (pthreads-based, works on all platforms)
+find_library(FFTW3_THREADS_LIBRARY NAMES fftw3_threads HINTS /opt/homebrew/lib /usr/local/lib)
+if(NOT FFTW3_THREADS_LIBRARY)
+  message(FATAL_ERROR "FFTW3 threads library (fftw3_threads) not found. Install fftw with threading support.")
+endif()
+list(APPEND FFTW3_LIBRARIES ${FFTW3_THREADS_LIBRARY})
+message(STATUS "Found FFTW3 threads: ${FFTW3_THREADS_LIBRARY}")
+
+# OpenMP for loop-level parallelism
+# Apple Clang needs explicit hints to find Homebrew libomp
+if(APPLE)
+  execute_process(
+    COMMAND brew --prefix libomp
+    OUTPUT_VARIABLE HOMEBREW_LIBOMP_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(HOMEBREW_LIBOMP_PREFIX)
+    set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp -I${HOMEBREW_LIBOMP_PREFIX}/include")
+    set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${HOMEBREW_LIBOMP_PREFIX}/include")
+    set(OpenMP_C_LIB_NAMES "omp")
+    set(OpenMP_CXX_LIB_NAMES "omp")
+    set(OpenMP_omp_LIBRARY "${HOMEBREW_LIBOMP_PREFIX}/lib/libomp.dylib")
+  endif()
+endif()
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  message(STATUS "OpenMP found: ${OpenMP_CXX_FLAGS}")
+else()
+  message(STATUS "OpenMP not found; loop-level parallelism disabled")
+endif()
+
+# Halide for AOT-compiled image processing pipelines (wavelet, guided filter).
+find_package(Halide REQUIRED)
 
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -150,6 +185,17 @@ endif()
 
 add_subdirectory(${HIRACO_DNG_SDK_ROOT}/libjxl/libjxl ${CMAKE_CURRENT_BINARY_DIR}/libjxl EXCLUDE_FROM_ALL)
 
+# --- Halide AOT generators ---
+add_halide_generator(hiraco_wavelet_gen
+  SOURCES src/halide/wavelet_generator.cpp)
+add_halide_generator(hiraco_guided_filter_gen
+  SOURCES src/halide/guided_filter_generator.cpp)
+
+add_halide_library(hiraco_atrous_wavelet FROM hiraco_wavelet_gen
+  GENERATOR atrous_wavelet)
+add_halide_library(hiraco_guided_filter FROM hiraco_guided_filter_gen
+  GENERATOR guided_filter)
+
 file(GLOB HIRACO_DNG_SDK_SOURCES CONFIGURE_DEPENDS
   "${HIRACO_DNG_SDK_ROOT}/dng_sdk/source/*.cpp"
 )
@@ -195,6 +241,10 @@ add_executable(hiraco
 
 target_include_directories(hiraco PRIVATE ${LIBRAW_INCLUDE_DIRS} ${FFTW3_INCLUDE_DIRS})
 target_link_libraries(hiraco PRIVATE ${LIBRAW_LIBRARIES} ${FFTW3_LIBRARIES})
+target_link_libraries(hiraco PRIVATE hiraco_atrous_wavelet hiraco_guided_filter)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(hiraco PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_compile_definitions(hiraco PRIVATE
   HIRACO_ENABLE_DNG_SDK=1
   HIRACO_DNG_SDK_ROOT="${HIRACO_DNG_SDK_ROOT}"
