@@ -745,7 +745,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     // in the 2x oversampled High-Res coordinate grid.
     float psf_sigma = 2.0f;
     // A higher NSR (0.1) suppresses Bayer dot patterns gracefully by bounding the inverse.
-    float nsr = 0.1f;
+    float nsr = 0.05f; //0.1f
     ReadEnvFloat("HIRACO_STAGE1_PSF_SIGMA", &psf_sigma);
     ReadEnvFloat("HIRACO_STAGE1_NSR", &nsr);
 
@@ -905,7 +905,7 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     // Fine-scale gains — slightly reduced from v1 to avoid noise amplification.
     
     float denoise = 0.4f;
-    float gain0 = 1.6f, gain1 = 1.3f, gain2 = 1.1f, gain3 = 1.0f;
+    float gain0 = 2.0f, gain1 = 1.6f, gain2 = 1.4f, gain3 = 1.0f;
     ReadEnvFloat("HIRACO_STAGE2_DENOISE", &denoise);
     ReadEnvFloat("HIRACO_STAGE2_GAIN0", &gain0);
     ReadEnvFloat("HIRACO_STAGE2_GAIN1", &gain1);
@@ -989,8 +989,8 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // Applies a final sharpening pass using a guided filter (self-guided)
   // as the smoothing base, avoiding halos at strong edges.
   if (enable_stage3) {
-    int gf_radius = 4;
-    float user_gf_gain = 0.5f;
+    int gf_radius = 6;
+    float user_gf_gain = 0.7f;
     ReadEnvInt("HIRACO_STAGE3_RADIUS", &gf_radius);
     ReadEnvFloat("HIRACO_STAGE3_GAIN", &user_gf_gain);
 
