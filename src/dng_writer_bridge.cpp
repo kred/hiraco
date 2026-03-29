@@ -77,11 +77,17 @@ struct RenderSettings {
 };
 
 bool IsOm3HighResMetadata(const SourceLinearDngMetadata& metadata) {
-  return metadata.model == "OM-3" &&
-         metadata.default_crop_origin_h == 6 &&
-         metadata.default_crop_origin_v == 6 &&
-         metadata.default_crop_width == 8160 &&
-         metadata.default_crop_height == 6120;
+  // 50 MP hand-held high-res (8172×6132 raw, 8160×6120 crop, origin 6,6)
+  if (metadata.default_crop_origin_h == 6 &&
+      metadata.default_crop_origin_v == 6 &&
+      metadata.default_crop_width == 8160 &&
+      metadata.default_crop_height == 6120) return true;
+  // 80 MP tripod high-res (10386×7792 raw, 10368×7776 crop, origin 8,8)
+  if (metadata.default_crop_origin_h == 8 &&
+      metadata.default_crop_origin_v == 8 &&
+      metadata.default_crop_width == 10368 &&
+      metadata.default_crop_height == 7776) return true;
+  return false;
 }
 
 bool ReadEnvInt(const char* name, int* value) {
@@ -255,7 +261,7 @@ bool LoadStackStabilityMap(const SourceLinearDngMetadata& metadata,
   if (!LoadFloatMap(metadata.stack_stability_path,
                     metadata.stack_stability_width,
                     metadata.stack_stability_height,
-                    "OM-3 stack stability map",
+                    "stack stability map",
                     stability_map,
                     error_message)) {
     return false;
@@ -285,7 +291,7 @@ bool LoadStackMeanMap(const SourceLinearDngMetadata& metadata,
   return LoadFloatMap(metadata.stack_mean_path,
                       metadata.stack_mean_width,
                       metadata.stack_mean_height,
-                      "OM-3 stack mean map",
+                      "stack mean map",
                       mean_map,
                       error_message);
 }
@@ -305,7 +311,7 @@ bool LoadStackGuideMap(const SourceLinearDngMetadata& metadata,
     return LoadFloatMap(metadata.stack_guide_path,
                         metadata.stack_guide_width,
                         metadata.stack_guide_height,
-                        "OM-3 stack guide map",
+                        "stack guide map",
                         guide_map,
                         error_message);
   }
@@ -331,7 +337,7 @@ bool LoadStackTensorXMap(const SourceLinearDngMetadata& metadata,
   if (!LoadFloatMap(metadata.stack_tensor_x_path,
                     metadata.stack_tensor_x_width,
                     metadata.stack_tensor_x_height,
-                    "OM-3 stack tensor-x map",
+                    "stack tensor-x map",
                     tensor_map,
                     error_message)) {
     return false;
@@ -360,7 +366,7 @@ bool LoadStackTensorYMap(const SourceLinearDngMetadata& metadata,
   if (!LoadFloatMap(metadata.stack_tensor_y_path,
                     metadata.stack_tensor_y_width,
                     metadata.stack_tensor_y_height,
-                    "OM-3 stack tensor-y map",
+                    "stack tensor-y map",
                     tensor_map,
                     error_message)) {
     return false;
@@ -389,7 +395,7 @@ bool LoadStackTensorCoherenceMap(const SourceLinearDngMetadata& metadata,
   if (!LoadFloatMap(metadata.stack_tensor_coherence_path,
                     metadata.stack_tensor_coherence_width,
                     metadata.stack_tensor_coherence_height,
-                    "OM-3 stack tensor-coherence map",
+                    "stack tensor-coherence map",
                     coherence_map,
                     error_message)) {
     return false;
@@ -418,7 +424,7 @@ bool LoadStackAliasMap(const SourceLinearDngMetadata& metadata,
   if (!LoadFloatMap(metadata.stack_alias_path,
                     metadata.stack_alias_width,
                     metadata.stack_alias_height,
-                    "OM-3 stack alias map",
+                    "stack alias map",
                     alias_map,
                     error_message)) {
     return false;
@@ -546,35 +552,49 @@ RenderSettings BuildCfaGuideRenderSettings(const SourceLinearDngMetadata& metada
 
 bool ShouldApplyOm3SourceDrivenLinearTransform(const SourceLinearDngMetadata& metadata,
                                                const RasterImage& image) {
-  if (metadata.model != "OM-3" || !metadata.has_black_level || !metadata.has_as_shot_neutral) {
+  if (!metadata.has_black_level || !metadata.has_as_shot_neutral) {
     return false;
   }
 
-  const bool is_high_res = metadata.default_crop_origin_h == 6 &&
-                           metadata.default_crop_origin_v == 6 &&
-                           metadata.default_crop_width == 8160 &&
-                           metadata.default_crop_height == 6120 &&
-                           image.width == 8172 &&
-                           image.height == 6132;
+  const bool is_50mp_high_res = metadata.default_crop_origin_h == 6 &&
+                                metadata.default_crop_origin_v == 6 &&
+                                metadata.default_crop_width == 8160 &&
+                                metadata.default_crop_height == 6120 &&
+                                image.width == 8172 &&
+                                image.height == 6132;
+  const bool is_80mp_high_res = metadata.default_crop_origin_h == 8 &&
+                                metadata.default_crop_origin_v == 8 &&
+                                metadata.default_crop_width == 10368 &&
+                                metadata.default_crop_height == 7776 &&
+                                image.width == 10386 &&
+                                image.height == 7792;
   const bool is_standard_20mp = metadata.default_crop_origin_h == 12 &&
                                 metadata.default_crop_origin_v == 12 &&
                                 metadata.default_crop_width == 5184 &&
                                 metadata.default_crop_height == 3888 &&
                                 image.width == 5220 &&
                                 image.height == 3912;
-  return is_high_res || is_standard_20mp;
+  return is_50mp_high_res || is_80mp_high_res || is_standard_20mp;
 }
 
 bool IsOm3HighResRaster(const SourceLinearDngMetadata& metadata,
-                       const RasterImage& image) {
-  return metadata.model == "OM-3" &&
-         metadata.default_crop_origin_h == 6 &&
-         metadata.default_crop_origin_v == 6 &&
-         metadata.default_crop_width == 8160 &&
-         metadata.default_crop_height == 6120 &&
-         image.width == 8172 &&
-         image.height == 6132 &&
-         image.colors == 3;
+                        const RasterImage& image) {
+  if (image.colors != 3) return false;
+  // 50 MP hand-held
+  if (metadata.default_crop_origin_h == 6 &&
+      metadata.default_crop_origin_v == 6 &&
+      metadata.default_crop_width == 8160 &&
+      metadata.default_crop_height == 6120 &&
+      image.width == 8172 &&
+      image.height == 6132) return true;
+  // 80 MP tripod
+  if (metadata.default_crop_origin_h == 8 &&
+      metadata.default_crop_origin_v == 8 &&
+      metadata.default_crop_width == 10368 &&
+      metadata.default_crop_height == 7776 &&
+      image.width == 10386 &&
+      image.height == 7792) return true;
+  return false;
 }
 
 bool ShouldApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
@@ -586,23 +606,29 @@ bool ShouldApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
 
 bool ShouldUseOm3AdobeMetadata(const SourceLinearDngMetadata& metadata,
                                const RasterImage& image) {
-  if (metadata.model != "OM-3" || !metadata.has_black_level || !metadata.has_as_shot_neutral) {
+  if (!metadata.has_black_level || !metadata.has_as_shot_neutral) {
     return false;
   }
 
-  const bool is_high_res = metadata.default_crop_origin_h == 6 &&
-                           metadata.default_crop_origin_v == 6 &&
-                           metadata.default_crop_width == 8160 &&
-                           metadata.default_crop_height == 6120 &&
-                           image.width == 8172 &&
-                           image.height == 6132;
+  const bool is_50mp_high_res = metadata.default_crop_origin_h == 6 &&
+                                metadata.default_crop_origin_v == 6 &&
+                                metadata.default_crop_width == 8160 &&
+                                metadata.default_crop_height == 6120 &&
+                                image.width == 8172 &&
+                                image.height == 6132;
+  const bool is_80mp_high_res = metadata.default_crop_origin_h == 8 &&
+                                metadata.default_crop_origin_v == 8 &&
+                                metadata.default_crop_width == 10368 &&
+                                metadata.default_crop_height == 7776 &&
+                                image.width == 10386 &&
+                                image.height == 7792;
   const bool is_standard_20mp = metadata.default_crop_origin_h == 12 &&
                                 metadata.default_crop_origin_v == 12 &&
                                 metadata.default_crop_width == 5184 &&
                                 metadata.default_crop_height == 3888 &&
                                 image.width == 5220 &&
                                 image.height == 3912;
-  return is_high_res || is_standard_20mp;
+  return is_50mp_high_res || is_80mp_high_res || is_standard_20mp;
 }
 
 void ApplyLinearDngRasterTransform(const SourceLinearDngMetadata& metadata,
@@ -741,9 +767,11 @@ void ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // Uses mirror/reflection padding to avoid boundary discontinuities that
   // produce periodic stipple artifacts with zero-padding.
   if (enable_stage1) {
-    // A native mathematical system blur of ~1 pixel maps to exactly ~2.0 pixels
-    // in the 2x oversampled High-Res coordinate grid.
-    float psf_sigma = 2.0f;
+    // Default PSF sigma scales with the output pixel density:
+    //   50 MP hand-held (8172×6132):  ~1 physical blur pixel = 2.0 output pixels (2× oversample)
+    //   80 MP tripod   (10386×7792): ~1 physical blur pixel = 2.5 output pixels (sqrt(80/50)≈1.265 scale)
+    const bool is_80mp = (width == 10386 && height == 7792);
+    float psf_sigma = is_80mp ? 2.5f : 2.0f;
     // A higher NSR (0.1) suppresses Bayer dot patterns gracefully by bounding the inverse.
     float nsr = 0.05f; //0.1f
     ReadEnvFloat("HIRACO_STAGE1_PSF_SIGMA", &psf_sigma);
@@ -1381,7 +1409,7 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
                              RasterImage* output,
                              std::string* error_message) {
   if (output == nullptr) {
-    *error_message = "Null output raster for OM-3 raw-domain render";
+    *error_message = "Null output raster for raw-domain render";
     return false;
   }
 
@@ -1405,7 +1433,7 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
   const uint32_t width = processor.imgdata.sizes.raw_width;
   const uint32_t height = processor.imgdata.sizes.raw_height;
   if (raw == nullptr || width == 0 || height == 0) {
-    *error_message = "LibRaw raw mosaic not available for OM-3 raw-domain render";
+    *error_message = "LibRaw raw mosaic not available for raw-domain render";
     processor.recycle();
     return false;
   }
