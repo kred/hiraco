@@ -19,16 +19,18 @@ The project offers fully working conversion paths for standard and high-resoluti
 Features include:
 - Pure C++ native pipeline.
 - Native decoding of High Resolution payload structures via MakerNote parsing.
-- **Advanced Spatial Filtering Pipeline**: Resolving micro-contrast utilizing structured wavelet edge directionality. Includes a highly calibrated FFTW Wiener Deconvolution stage configured for native physical sensor-shift boundary limits (PSF + Sinc photodiode integration) to safely and heavily eliminate optical blur limits without raising grid artifacts.
+- **Advanced Spatial Filtering Pipeline**: Resolving micro-contrast utilizing structured wavelet edge directionality. Includes a highly calibrated FFTW Wiener Deconvolution stage (Stage 1) configured for native physical sensor-shift boundary limits (PSF + Sinc photodiode integration) to safely and heavily eliminate optical blur limits without raising grid artifacts. Stages 2 and 3 run as **Halide AOT-compiled pipelines** — an à trous wavelet sharpening pass and a guided filter refinement pass — compiled ahead-of-time for native SIMD throughput.
 - Corrected radiometrics: Black-level and color neutralizing alignments mapped to proper EXIF bounds, neutralizing historically notorious color-cast display issues in third-party viewers.
 - Native `Adobe DNG SDK` integration for final negative assembly supporting `uncompressed`, `deflate`, and modern `jpeg-xl` DNG matrices via DNG version `1.6.0.0` and `1.7.1.0`.
 
 ## Dependencies
 
 `hiraco` requires the following dependencies:
-- **CMake** (v3.16+)
+- **CMake** (v3.28+)
 - **LibRaw**
-- **FFTW3**
+- **FFTW3** (with threading support — `fftw3_threads`)
+- **Halide** (for AOT-compiled wavelet and guided filter pipelines)
+- **OpenMP** (optional, for loop-level parallelism)
 - **Adobe DNG SDK 1.7.1** (Manual installation required)
 
 ### 1. The Adobe DNG SDK (All Platforms)
@@ -38,19 +40,19 @@ The Adobe DNG SDK is a required manual dependency for the native packaging path.
 
 **macOS (via Homebrew)**
 ```bash
-brew install cmake libraw fftw pkg-config
+brew install cmake libraw fftw halide libomp pkg-config
 ```
 
 **Linux (Debian/Ubuntu, experimental not tested)**
 ```bash
 sudo apt update
-sudo apt install build-essential cmake libraw-dev libfftw3-dev pkg-config zlib1g-dev
+sudo apt install build-essential cmake libraw-dev libfftw3-dev libhalide-dev libomp-dev pkg-config zlib1g-dev
 ```
 
 **Windows (via vcpkg, experimental not tested)**
 ```powershell
 # Assumes vcpkg is installed and bootstrapped
-vcpkg install libraw fftw3 zlib:x64-windows
+vcpkg install libraw fftw3 halide zlib:x64-windows
 ```
 
 ## Building from source
@@ -59,12 +61,12 @@ You can configure and build the standalone C++ binary out-of-source:
 
 **macOS & Linux**
 ```bash
-mkdir bin
-cd bin
+mkdir build
+cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j
 ```
-The resulting binary will be output locally at `bin/hiraco`.
+The resulting binary will be output locally at `build/hiraco`.
 
 **Windows**
 ```powershell
@@ -83,11 +85,11 @@ Convert utilizing uncompressed arrays or standard Deflate/JPEG-XL compression:
 
 ```bash
 # Convert to Uncompressed 16-bit Linear DNG
-./bin/hiraco convert _3210505.ORF output.dng --compression uncompressed
+./build/hiraco convert _3210505.ORF output.dng --compression uncompressed
 
 # Convert using compression paths
-./bin/hiraco convert _3210505.ORF output.dng --compression deflate
-./bin/hiraco convert _3210505.ORI output.dng --compression jpeg-xl
+./build/hiraco convert _3210505.ORF output.dng --compression deflate
+./build/hiraco convert _3210505.ORI output.dng --compression jpeg-xl
 ```
 
 ## Repository notes
