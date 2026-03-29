@@ -10,7 +10,7 @@ Project was developed exclusively using Claude 4.6 / GPT 5.4 / Gemini 3 with ana
 
 `hiraco` rivals and out-performs commercial converters in resolving fine spatial details from the sensor-shift data. Our multi-stage spatial math and optional FFTW deconvolution mapping successfully retrieve the crisp architecture edges originally captured by the lens.
 
-![Quality Comparison Sheet](contact_sheet.jpg)
+![Quality Comparison Sheet](contact_sheet.png)
 
 *(Comparison of identical high-res Olympus raw exported across top commercial engines vs `hiraco`)*
 
