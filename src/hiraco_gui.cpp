@@ -885,7 +885,7 @@ class HiracoMainFrame final : public wxFrame {
                       0,
                       wxBOTTOM | wxEXPAND,
                       8);
-    stage3_sizer->Add(CreateFloatSlider(stage3_section, "Edge Gain", 0.00, 2.00, 100, 2, &stage3_gain_),
+    stage3_sizer->Add(CreateFloatSlider(stage3_section, "Edge Gain", 0.00, 4.00, 100, 2, &stage3_gain_),
                       0,
                       wxEXPAND,
                       0);

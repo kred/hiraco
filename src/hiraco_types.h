@@ -118,14 +118,14 @@ struct LibRawOverrideSet {
 
 struct ResolvedStageSettings {
   float stage1_psf_sigma = 2.0f;
-  float stage1_nsr = 0.05f;
-  float stage2_denoise = 0.4f;
-  float stage2_gain0 = 1.7f;
+  float stage1_nsr = 0.09f;
+  float stage2_denoise = 1.0f;
+  float stage2_gain0 = 2.0f;
   float stage2_gain1 = 1.4f;
-  float stage2_gain2 = 1.2f;
-  float stage2_gain3 = 1.0f;
-  int stage3_radius = 4;
-  float stage3_gain = 0.6f;
+  float stage2_gain2 = 1.3f;
+  float stage2_gain3 = 1.1f;
+  int stage3_radius = 2;
+  float stage3_gain = 2.0f;
 };
 
 struct RasterImage {
