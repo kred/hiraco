@@ -7,7 +7,7 @@ The repository builds one shared processing core and exposes it through two fron
 - `hiraco-gui` for interactive preview, tuning, and batch conversion
 
 The current implementation supports both a custom high-resolution raw-domain reconstruction path and a LibRaw-based render path for other supported inputs.
-
+![Comparison](contact_sheet.png)
 ## GUI
 
 ![hiraco GUI screenshot](hiraco-gui.png)
