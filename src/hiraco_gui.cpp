@@ -807,7 +807,7 @@ class HiracoMainFrame final : public wxFrame {
     compression_choice_->Append("Uncompressed");
     compression_choice_->Append("Deflate");
     compression_choice_->Append("JPEG XL");
-    compression_choice_->SetSelection(0);
+    compression_choice_->SetSelection(1);
     compression_row->Add(compression_choice_, 1);
     output_sizer->Add(compression_row, 0, wxEXPAND);
     output_sizer->Add(new wxStaticText(output_panel, wxID_ANY, "Output Directory"),
@@ -1924,7 +1924,7 @@ class HiracoMainFrame final : public wxFrame {
         compression_ = HiracoCompression::kJpegXl;
         break;
       default:
-        compression_ = HiracoCompression::kUncompressed;
+        compression_ = HiracoCompression::kDeflate;
         break;
     }
   }
@@ -2356,7 +2356,7 @@ class HiracoMainFrame final : public wxFrame {
   std::vector<QueueItem> queue_;
   std::filesystem::path base_output_dir_;
   std::filesystem::path relative_subdir_;
-  HiracoCompression compression_ = HiracoCompression::kUncompressed;
+  HiracoCompression compression_ = HiracoCompression::kDeflate;
   std::optional<StageOverrideSet> copied_stage_overrides_;
   std::optional<CropRect> current_crop_rect_;
   uint32_t display_preview_width_ = 0;

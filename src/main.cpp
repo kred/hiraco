@@ -10,6 +10,7 @@ namespace {
 
 int PrintUsage() {
   std::cerr << "usage: hiraco-cli convert <source> <output> [--compression uncompressed|deflate|jpeg-xl] [--debug]\n";
+  std::cerr << "default compression: deflate\n";
   return 2;
 }
 
@@ -35,7 +36,7 @@ int main(int argc, char** argv) {
 
   const std::string source_path = argv[2];
   const std::string output_path = argv[3];
-  std::string compression_text = "uncompressed";
+  std::string compression_text = "deflate";
   bool debug = false;
 
   for (int index = 4; index < argc; ++index) {
@@ -53,7 +54,7 @@ int main(int argc, char** argv) {
     EnableTimingLogsForDebug();
   }
 
-  HiracoCompression compression = HiracoCompression::kUncompressed;
+  HiracoCompression compression = HiracoCompression::kDeflate;
   if (!ParseCompressionString(compression_text, &compression)) {
     std::cerr << "Error: invalid compression mode: " << compression_text << "\n";
     return 2;
