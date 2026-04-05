@@ -1,6 +1,9 @@
 #pragma once
 
+#include "hiraco_types.h"
+
 #include <cstdint>
+#include <memory>
 #include <string>
 
 struct DngWriterRuntimeSummary {
@@ -12,67 +15,62 @@ struct DngWriterRuntimeSummary {
 
 DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string& compression);
 
-struct DngWriteResult {
-  bool ok = false;
-  std::string message;
-};
+ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata& metadata,
+                                                   uint32_t width,
+                                                   uint32_t height,
+                                                   const StageOverrideSet& overrides);
 
-struct SourceLinearDngMetadata {
-  std::string make;
-  std::string model;
-  std::string unique_camera_model;
-  bool has_black_level = false;
-  double black_level = 0.0;
-  bool has_white_level = false;
-  double white_level = 0.0;
-  bool has_as_shot_neutral = false;
-  double as_shot_neutral[3] = {1.0, 1.0, 1.0};
-  bool has_color_matrix1 = false;
-  double color_matrix1[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-  bool has_predicted_detail_gain = false;
-  double predicted_detail_gain = 1.0;
-  bool has_stack_stability_map = false;
-  std::string stack_stability_path;
-  uint32_t stack_stability_width = 0;
-  uint32_t stack_stability_height = 0;
-  bool has_stack_mean_map = false;
-  std::string stack_mean_path;
-  uint32_t stack_mean_width = 0;
-  uint32_t stack_mean_height = 0;
-  bool has_stack_guide_map = false;
-  std::string stack_guide_path;
-  uint32_t stack_guide_width = 0;
-  uint32_t stack_guide_height = 0;
-  bool has_stack_tensor_x_map = false;
-  std::string stack_tensor_x_path;
-  uint32_t stack_tensor_x_width = 0;
-  uint32_t stack_tensor_x_height = 0;
-  bool has_stack_tensor_y_map = false;
-  std::string stack_tensor_y_path;
-  uint32_t stack_tensor_y_width = 0;
-  uint32_t stack_tensor_y_height = 0;
-  bool has_stack_tensor_coherence_map = false;
-  std::string stack_tensor_coherence_path;
-  uint32_t stack_tensor_coherence_width = 0;
-  uint32_t stack_tensor_coherence_height = 0;
-  bool has_stack_alias_map = false;
-  std::string stack_alias_path;
-  uint32_t stack_alias_width = 0;
-  uint32_t stack_alias_height = 0;
-  bool has_default_crop = false;
-  uint32_t default_crop_origin_h = 0;
-  uint32_t default_crop_origin_v = 0;
-  uint32_t default_crop_width = 0;
-  uint32_t default_crop_height = 0;
-  bool has_working_geometry = false;
-  uint32_t working_width = 0;
-  uint32_t working_height = 0;
-};
+bool BuildOriginalPreviewFromRaw(const std::string& source_path,
+                                 const SourceLinearDngMetadata& metadata,
+                                 const LibRawOverrideSet& libraw_overrides,
+                                 std::shared_ptr<PreviewImage> preview,
+                                 ProgressCallback progress = {},
+                                 CancelCheck cancel = {},
+                                 std::string* error_message = nullptr);
+
+bool EstimatePreviewAutoBrightGainFromRaw(const std::string& source_path,
+                                          const SourceLinearDngMetadata& metadata,
+                                          const LibRawOverrideSet& libraw_overrides,
+                                          double* gain,
+                                          std::string* error_message = nullptr);
+
+bool BuildProcessingCacheFromRaw(const std::string& source_path,
+                                 const SourceLinearDngMetadata& metadata,
+                                 uint32_t source_width,
+                                 uint32_t source_height,
+                                 const CropRect& crop_rect,
+                                 const LibRawOverrideSet& libraw_overrides,
+                                 ProcessingCache* cache,
+                                 ProgressCallback progress = {},
+                                 CancelCheck cancel = {},
+                                 std::string* error_message = nullptr);
+
+bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
+                                const ProcessingCache& cache,
+                                const CropRect& crop_rect,
+                                const StageOverrideSet& stage_overrides,
+                                std::shared_ptr<PreviewImage> preview,
+                                ProgressCallback progress = {},
+                                CancelCheck cancel = {},
+                                std::string* error_message = nullptr);
+
+bool ApplyResolvedStageSettingsForTesting(const SourceLinearDngMetadata& metadata,
+                                          const ResolvedStageSettings& settings,
+                                          const RasterImage* cfa_guide_image,
+                                          RasterImage* image,
+                                          ProgressCallback progress = {},
+                                          CancelCheck cancel = {},
+                                          std::string* error_message = nullptr);
 
 DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const std::string& output_path,
                                      const std::string& compression,
-                                     const SourceLinearDngMetadata& metadata);
+                                     const SourceLinearDngMetadata& metadata,
+                                     const StageOverrideSet& stage_overrides = {},
+                                     const LibRawOverrideSet& libraw_overrides = {},
+                                     std::shared_ptr<const PreviewImage> preview_override = {},
+                                     ProgressCallback progress = {},
+                                     CancelCheck cancel = {});
 
 DngWriteResult WriteSyntheticLinearDng(const std::string& output_path,
                                        const std::string& compression);

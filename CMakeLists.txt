@@ -6,6 +6,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(HIRACO_BUILD_CLI "Build the hiraco-cli binary" ON)
+option(HIRACO_BUILD_GUI "Build the hiraco-gui binary" ON)
+option(HIRACO_BUILD_TESTS "Build hiraco core tests" ON)
+
 if(APPLE AND NOT DEFINED CMAKE_OSX_ARCHITECTURES)
   set(CMAKE_OSX_ARCHITECTURES "${CMAKE_HOST_SYSTEM_PROCESSOR}" CACHE STRING "Build architectures for macOS" FORCE)
 endif()
@@ -231,21 +235,35 @@ if(APPLE)
   )
 endif()
 
-add_executable(hiraco
+add_library(hiraco-core STATIC
   src/dng_sdk_bridge.cpp
   src/dng_writer_bridge.cpp
-  src/main.cpp
+  src/hiraco_core.cpp
   src/vendor_makernote.cpp
   src/stack_guidance.cpp
 )
 
-target_include_directories(hiraco PRIVATE ${LIBRAW_INCLUDE_DIRS} ${FFTW3_INCLUDE_DIRS})
-target_link_libraries(hiraco PRIVATE ${LIBRAW_LIBRARIES} ${FFTW3_LIBRARIES})
-target_link_libraries(hiraco PRIVATE hiraco_atrous_wavelet hiraco_guided_filter)
+target_include_directories(hiraco-core
+  PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  PRIVATE
+    ${LIBRAW_INCLUDE_DIRS}
+    ${FFTW3_INCLUDE_DIRS}
+)
+target_link_libraries(hiraco-core
+  PUBLIC
+    ${LIBRAW_LIBRARIES}
+    ${FFTW3_LIBRARIES}
+    hiraco_atrous_wavelet
+    hiraco_guided_filter
+    hiraco-dng-sdk
+    hiraco-xmp-core
+    ZLIB::ZLIB
+)
 if(OpenMP_CXX_FOUND)
-  target_link_libraries(hiraco PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(hiraco-core PUBLIC OpenMP::OpenMP_CXX)
 endif()
-target_compile_definitions(hiraco PRIVATE
+target_compile_definitions(hiraco-core PRIVATE
   HIRACO_ENABLE_DNG_SDK=1
   HIRACO_DNG_SDK_ROOT="${HIRACO_DNG_SDK_ROOT}"
   ${DNG_OS_FLAG}
@@ -254,7 +272,7 @@ target_compile_definitions(hiraco PRIVATE
   qDNGUseLibJPEG=0
 )
 
-target_include_directories(hiraco PRIVATE
+target_include_directories(hiraco-core PRIVATE
   ${HIRACO_DNG_SDK_ROOT}/dng_sdk/source
   ${HIRACO_DNG_SDK_ROOT}/libjxl/libjxl/lib/include
   ${HIRACO_DNG_SDK_ROOT}/libjpeg
@@ -262,18 +280,38 @@ target_include_directories(hiraco PRIVATE
 )
 
 if(WIN32)
-  target_compile_definitions(hiraco PRIVATE _USE_MATH_DEFINES)
+  target_compile_definitions(hiraco-core PRIVATE _USE_MATH_DEFINES)
 endif()
 
-target_link_libraries(hiraco PRIVATE
-  hiraco-dng-sdk
-  hiraco-xmp-core
-  ZLIB::ZLIB
-)
-
 if(APPLE)
-  target_link_libraries(hiraco PRIVATE
+  target_link_libraries(hiraco-core PRIVATE
     ${COREFOUNDATION_LIBRARY}
     ${CORESERVICES_LIBRARY}
   )
+endif()
+
+if(HIRACO_BUILD_CLI)
+  add_executable(hiraco-cli
+    src/main.cpp
+  )
+  target_link_libraries(hiraco-cli PRIVATE hiraco-core)
+endif()
+
+if(HIRACO_BUILD_GUI)
+  find_package(wxWidgets REQUIRED COMPONENTS core base adv)
+  include(${wxWidgets_USE_FILE})
+
+  add_executable(hiraco-gui
+    src/hiraco_gui.cpp
+  )
+  target_link_libraries(hiraco-gui PRIVATE hiraco-core ${wxWidgets_LIBRARIES})
+endif()
+
+if(HIRACO_BUILD_TESTS)
+  enable_testing()
+  add_executable(hiraco-core-tests
+    tests/hiraco_core_tests.cpp
+  )
+  target_link_libraries(hiraco-core-tests PRIVATE hiraco-core)
+  add_test(NAME hiraco-core-tests COMMAND hiraco-core-tests)
 endif()

@@ -1,102 +1,169 @@
 # hiraco
 
-`hiraco` is a standalone C++ pipeline designed to convert select Olympus / OM System High-Resolution sensor-shift `.ORF` raw files into robust, exceptionally detailed Linear DNG files. 
+`hiraco` is a native C++ toolchain for converting selected Olympus / OM SYSTEM RAW files, with a custom emphasis on high-resolution sensor-shift captures, into rendered Linear DNG files.
 
-By deeply analyzing the sensor-shift characteristics of these cameras, `hiraco` operates a specialized custom native reconstruction engine to extract true sub-pixel resolution rather than relying on mathematically standard interpolations. It specifically targets the full optical extraction of High-Res composites.
+The repository builds one shared processing core and exposes it through two frontends:
+- `hiraco-cli` for command-line conversion
+- `hiraco-gui` for interactive preview, tuning, and batch conversion
 
-Project was developed exclusively using Claude 4.6 / GPT 5.4 / Gemini 3 with analysis of TIFF and ORI/ORF files and metadata only. No code decompilation or other techniques were used.
+The current implementation supports both a custom high-resolution raw-domain reconstruction path and a LibRaw-based render path for other supported inputs.
 
-## Unrivaled Detail Retention
+## GUI
 
-`hiraco` rivals and out-performs commercial converters in resolving fine spatial details from the sensor-shift data. Our multi-stage spatial math and optional FFTW deconvolution mapping successfully retrieve the crisp architecture edges originally captured by the lens.
+![hiraco GUI screenshot](hiraco-gui.png)
 
-![Quality Comparison Sheet](contact_sheet.png)
+## What The Project Currently Provides
 
-*(Comparison of identical high-res Olympus raw exported across top commercial engines vs `hiraco`)*
+- `hiraco-core`: shared static library containing preparation, metadata, preview, crop-preview, enhancement, and DNG writing code.
+- `hiraco-cli`: command-line `convert` frontend.
+- `hiraco-gui`: wxWidgets desktop frontend with queueing, preview, crop inspection, output controls, and conversion.
+- Custom high-resolution raw-domain reconstruction driven by vendor metadata and stack-guidance maps.
+- Rendered Linear DNG output with `uncompressed`, `deflate`, and `jpeg-xl` compression modes.
+- Three user-facing processing control groups in the GUI:
+  - `Detail Recovery`
+  - `Multi-scale Detail`
+  - `Edge Refinement`
+- Cached original preview rendering and processing-cache reuse for fast converted crop inspection in the GUI.
+- Optional timing output for performance work via `--debug` or `HIRACO_TIMING=1`.
 
-## Current status
-The project offers fully working conversion paths for standard and high-resolution camera payloads.
-Features include:
-- Pure C++ native pipeline.
-- Native decoding of High Resolution payload structures via MakerNote parsing.
-- **Advanced Spatial Filtering Pipeline**: Resolving micro-contrast utilizing structured wavelet edge directionality. Includes a highly calibrated FFTW Wiener Deconvolution stage (Stage 1) configured for native physical sensor-shift boundary limits (PSF + Sinc photodiode integration) to safely and heavily eliminate optical blur limits without raising grid artifacts. Stages 2 and 3 run as **Halide AOT-compiled pipelines** — an à trous wavelet sharpening pass and a guided filter refinement pass — compiled ahead-of-time for native SIMD throughput.
-- Corrected radiometrics: Black-level and color neutralizing alignments mapped to proper EXIF bounds, neutralizing historically notorious color-cast display issues in third-party viewers.
-- Native `Adobe DNG SDK` integration for final negative assembly supporting `uncompressed`, `deflate`, and modern `jpeg-xl` DNG matrices via DNG version `1.6.0.0` and `1.7.1.0`.
+## Supported Workflows
 
-## Dependencies
+- Convert `.ORF` and `.ORI` sources to rendered Linear DNG.
+- Open the GUI, inspect the original preview, and move a crop box over the image.
+- Inspect a live converted crop preview while adjusting processing controls.
+- Queue multiple files, choose an output directory and relative subfolder, and batch convert them.
 
-`hiraco` requires the following dependencies:
-- **CMake** (v3.28+)
-- **LibRaw**
-- **FFTW3** (with threading support — `fftw3_threads`)
-- **Halide** (for AOT-compiled wavelet and guided filter pipelines)
-- **OpenMP** (optional, for loop-level parallelism)
-- **Adobe DNG SDK 1.7.1** (Manual installation required)
+The strongest custom path in the repository today is the high-resolution workflow. Standard sources still go through the shared core, but the specialized raw-domain reconstruction is targeted at the  high-resolution capture format.
 
-### 1. The Adobe DNG SDK (All Platforms)
-The Adobe DNG SDK is a required manual dependency for the native packaging path. It cannot be redistributed in this repository. Before building, ensure you have placed the Adobe DNG SDK bundle folder into `dng_sdk_1_7_1/` inside the workspace root.
+## Requirements
 
-### 2. Native Prerequisites
+`hiraco` currently expects:
 
-**macOS (via Homebrew)**
+- CMake 3.28+
+- LibRaw
+- FFTW3 and `fftw3_threads`
+- Halide
+- Zlib
+- OpenMP (optional but strongly recommended)
+- wxWidgets (for `hiraco-gui`)
+- Adobe DNG SDK 1.7.1 bundle unpacked into `dng_sdk_1_7_1/`
+
+The repository also expects the bundled Adobe libjxl and XMP toolkit that ship with the DNG SDK bundle under `dng_sdk_1_7_1/`.
+
+### macOS
+
 ```bash
-brew install cmake libraw fftw halide libomp pkg-config
+brew install cmake libraw fftw halide libomp pkg-config wxwidgets
 ```
 
-**Linux (Debian/Ubuntu, experimental not tested)**
+### Linux (Debian/Ubuntu)
+
 ```bash
 sudo apt update
-sudo apt install build-essential cmake libraw-dev libfftw3-dev libhalide-dev libomp-dev pkg-config zlib1g-dev
+sudo apt install build-essential cmake libraw-dev libfftw3-dev libhalide-dev libomp-dev pkg-config zlib1g-dev libwxgtk3.2-dev
 ```
 
-**Windows (via vcpkg, experimental not tested)**
+### Windows (vcpkg)
+
 ```powershell
-# Assumes vcpkg is installed and bootstrapped
-vcpkg install libraw fftw3 halide zlib:x64-windows
+vcpkg install libraw fftw3 halide zlib wxwidgets:x64-windows
 ```
 
-## Building from source
+## Building
 
-You can configure and build the standalone C++ binary out-of-source:
-
-**macOS & Linux**
-```bash
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j
-```
-The resulting binary will be output locally at `build/hiraco`.
-
-**Windows**
-```powershell
-mkdir build
-cd build
-cmake -DCMAKE_TOOLCHAIN_FILE="C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . --config Release
-```
-The resulting binary will be output locally at `build\Release\hiraco.exe`.
-
-## Usage
-
-You can use the native binary directly from the terminal to process your conversions. The converter writes a Rendered Linear RGB DNG, providing software with a clean, high-bit-depth image ready for baseline color and tonal manipulation.
-
-Convert utilizing uncompressed arrays or standard Deflate/JPEG-XL compression:
+### Configure And Build
 
 ```bash
-# Convert to Uncompressed 16-bit Linear DNG
-./build/hiraco convert _3210505.ORF output.dng --compression uncompressed
-
-# Convert using compression paths
-./build/hiraco convert _3210505.ORF output.dng --compression deflate
-./build/hiraco convert _3210505.ORI output.dng --compression jpeg-xl
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
 
-## Repository notes
+This produces:
 
-- The project relies heavily upon the Adobe DNG SDK for constructing the final negative container. It is not included and must be sourced from Adobe's developer distribution.
-- The pipeline previously consisted of a Python wrapper calling into a C++ helper, but has now been fully ported to a singular native C++ implementation (`hiraco`).
+- `build/hiraco-cli`
+- `build/hiraco-gui`
+- `build/libhiraco-core.a`
 
+If `wx-config` is not on `PATH` on macOS, point CMake at it explicitly:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DwxWidgets_CONFIG_EXECUTABLE="$(brew --prefix wxwidgets)/bin/wx-config"
+cmake --build build -j
+```
+
+### Useful Build Switches
+
+```bash
+cmake -S . -B build -DHIRACO_BUILD_GUI=OFF
+cmake -S . -B build -DHIRACO_BUILD_CLI=OFF
+cmake -S . -B build -DHIRACO_BUILD_TESTS=ON
+```
+
+## Running
+
+### CLI
+
+The CLI currently exposes one command:
+
+```bash
+./build/hiraco-cli convert <source> <output> [--compression uncompressed|deflate|jpeg-xl] [--debug]
+```
+
+Examples:
+
+```bash
+./build/hiraco-cli convert _3210505.ORF output.dng --compression uncompressed
+./build/hiraco-cli convert _3210505.ORF output.dng --compression deflate
+./build/hiraco-cli convert _3210505.ORI output.dng --compression jpeg-xl --debug
+```
+
+`--debug` enables timing logs for the main processing phases.
+
+### GUI
+
+```bash
+./build/hiraco-gui
+```
+
+The GUI currently supports:
+
+- Adding files with a button or drag-and-drop
+- Per-file queueing and processed-state feedback
+- Original preview with `Fit`, `25%`, `50%`, and `100%` zoom modes
+- A movable crop box with live converted crop preview
+- Compression and output-path configuration
+- Interactive processing controls for detail recovery, multi-scale detail, and edge refinement
+- Overwrite prompts, progress reporting, and cancellation
+
+## Tests
+
+If tests are enabled, the repository builds `hiraco-core-tests`:
+
+```bash
+cmake -S . -B build -DHIRACO_BUILD_TESTS=ON
+cmake --build build --target hiraco-core-tests
+ctest --test-dir build --output-on-failure
+```
+
+The test target currently covers core-library behavior rather than full GUI automation.
+
+## Processing Notes
+
+At a high level, the current pipeline is:
+
+1. Inspect the source with LibRaw and build reusable base metadata.
+2. Lazily enrich that metadata with vendor MakerNote and stack-guidance data when needed.
+3. Render either:
+   - a cached original preview,
+   - a cached converted crop preview, or
+   - a full rendered Linear DNG payload.
+4. Apply enhancement stages when the source metadata requests predicted detail gain.
+5. Package the final rendered image through the Adobe DNG SDK.
+
+See [algorithm.md](algorithm.md) for the current implementation-level processing description.
 
 ## Legal Disclaimer
-*OM SYSTEM and Olympus are registered trademarks of OM Digital Solutions Corporation or Olympus Corporation. This open source project is not affiliated with, endorsed by, or sponsored by these companies. All trademarks are used for compatibility description and nominative fair use purposes only.*
+
+*OM SYSTEM and Olympus are registered trademarks of OM Digital Solutions Corporation or Olympus Corporation. This project is not affiliated with, endorsed by, or sponsored by these companies. All trademarks are used only for compatibility description and nominative fair use purposes.*
