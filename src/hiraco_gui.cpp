@@ -941,7 +941,7 @@ class HiracoMainFrame final : public wxFrame {
         selected_row_ < static_cast<int>(queue_.size()) &&
         queue_[selected_row_].prepared.has_value() &&
         current_crop_rect_.has_value()) {
-      ScheduleCropPreview(true);
+      ScheduleCropPreview(false);
     }
   }
 
@@ -1121,14 +1121,34 @@ class HiracoMainFrame final : public wxFrame {
   }
 
   void BindSlider(SliderControl& control, std::function<void(double)> on_change) {
-    control.slider->Bind(wxEVT_SLIDER, [this, &control, on_change](wxCommandEvent&) {
+    auto apply_change = [this, &control, on_change](bool debounce) {
       const double value = SliderValue(control);
       UpdateSliderLabel(control);
       if (!updating_sliders_) {
         on_change(value);
-        ScheduleCropPreview(true);
+        ScheduleCropPreview(debounce);
       }
-    });
+    };
+
+    control.slider->Bind(wxEVT_SLIDER, [apply_change](wxCommandEvent&) { apply_change(false); });
+    control.slider->Bind(wxEVT_SCROLL_THUMBTRACK,
+                         [apply_change](wxScrollEvent&) { apply_change(true); });
+    control.slider->Bind(wxEVT_SCROLL_THUMBRELEASE,
+                         [apply_change](wxScrollEvent&) { apply_change(false); });
+    control.slider->Bind(wxEVT_SCROLL_CHANGED,
+                         [apply_change](wxScrollEvent&) { apply_change(false); });
+    control.slider->Bind(wxEVT_SCROLL_LINEUP,
+                         [apply_change](wxScrollEvent&) { apply_change(false); });
+    control.slider->Bind(wxEVT_SCROLL_LINEDOWN,
+                         [apply_change](wxScrollEvent&) { apply_change(false); });
+    control.slider->Bind(wxEVT_SCROLL_PAGEUP,
+                         [apply_change](wxScrollEvent&) { apply_change(false); });
+    control.slider->Bind(wxEVT_SCROLL_PAGEDOWN,
+                         [apply_change](wxScrollEvent&) { apply_change(false); });
+    control.slider->Bind(wxEVT_SCROLL_TOP,
+                         [apply_change](wxScrollEvent&) { apply_change(false); });
+    control.slider->Bind(wxEVT_SCROLL_BOTTOM,
+                         [apply_change](wxScrollEvent&) { apply_change(false); });
   }
 
   double SliderValue(const SliderControl& control) const {
