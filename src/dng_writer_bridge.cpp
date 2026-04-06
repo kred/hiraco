@@ -2791,6 +2791,60 @@ RasterImage BuildScaledRasterImage(const RasterImage& source, uint32_t max_dimen
   return scaled;
 }
 
+void ApplyLibRawOrientationToPreview(int libraw_flip, PreviewImage* preview) {
+  if (preview == nullptr || preview->width == 0 || preview->height == 0 || preview->colors == 0) {
+    return;
+  }
+
+  const int normalized_flip = NormalizeLibRawFlip(libraw_flip);
+  if (normalized_flip == 0) {
+    return;
+  }
+
+  const uint32_t source_width = preview->width;
+  const uint32_t source_height = preview->height;
+  const uint32_t target_width = OrientedImageWidth(source_width, source_height, normalized_flip);
+  const uint32_t target_height = OrientedImageHeight(source_width, source_height, normalized_flip);
+  std::vector<uint8_t> rotated(static_cast<size_t>(target_width) * target_height * preview->colors, 0);
+
+  for (uint32_t row = 0; row < source_height; ++row) {
+    for (uint32_t col = 0; col < source_width; ++col) {
+      uint32_t target_col = col;
+      uint32_t target_row = row;
+      if ((normalized_flip & 1) != 0) {
+        target_col = source_width - 1 - target_col;
+      }
+      if ((normalized_flip & 2) != 0) {
+        target_row = source_height - 1 - target_row;
+      }
+      if ((normalized_flip & 4) != 0) {
+        std::swap(target_col, target_row);
+      }
+
+      const size_t source_index = (static_cast<size_t>(row) * source_width + col) * preview->colors;
+      const size_t target_index = (static_cast<size_t>(target_row) * target_width + target_col) * preview->colors;
+      for (uint32_t channel = 0; channel < preview->colors; ++channel) {
+        rotated[target_index + channel] = preview->pixels[source_index + channel];
+      }
+    }
+  }
+
+  preview->width = target_width;
+  preview->height = target_height;
+  preview->pixels = std::move(rotated);
+}
+
+int InverseLibRawFlip(int libraw_flip) {
+  switch (NormalizeLibRawFlip(libraw_flip)) {
+    case 5:
+      return 6;
+    case 6:
+      return 5;
+    default:
+      return NormalizeLibRawFlip(libraw_flip);
+  }
+}
+
 PreviewImage BuildDisplayPreviewFromRaster(const SourceLinearDngMetadata& metadata,
                                           const RasterImage& source,
                                           bool source_is_camera_space,
@@ -2804,7 +2858,9 @@ PreviewImage BuildDisplayPreviewFromRaster(const SourceLinearDngMetadata& metada
   }
   ApplyLinearGain(extra_linear_gain, &preview_raster);
   ApplyLinearSrgbGamma(&preview_raster);
-  return BuildPreviewImage(preview_raster, 0);
+  PreviewImage preview = BuildPreviewImage(preview_raster, 0);
+  ApplyLibRawOrientationToPreview(metadata.libraw_flip, &preview);
+  return preview;
 }
 
 CropRect ClampCropRectToBounds(const CropRect& requested,
@@ -2985,7 +3041,7 @@ void PopulateLinearRawNegative(dng_host& host,
   negative.SetLocalName(local_name.c_str());
   negative.SetOriginalRawFileName(std::filesystem::path(source_path).filename().string().c_str());
   negative.SetColorChannels(raw_image.colors);
-  negative.SetBaseOrientation(dng_orientation::Normal());
+  negative.SetBaseOrientation(dng_orientation::TIFFtoDNG(LibRawFlipToTiffOrientation(metadata.libraw_flip)));
   if (metadata.has_default_crop) {
     negative.SetDefaultCropOrigin(metadata.default_crop_origin_h, metadata.default_crop_origin_v);
     negative.SetDefaultCropSize(metadata.default_crop_width, metadata.default_crop_height);
@@ -3125,6 +3181,7 @@ bool BuildOriginalPreviewFromRaw(const std::string& source_path,
   }
 
   *preview = BuildPreviewImage(rendered, 0);
+  ApplyLibRawOrientationToPreview(metadata.libraw_flip, preview.get());
   ReportProgress(progress, "preview", 1.0, "Original preview ready");
   return true;
 }
@@ -3473,6 +3530,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     if (preview_override && preview_override->width > 0 && preview_override->height > 0) {
       const hiraco::ScopedTimingLog timer("convert", "Scale cached embedded preview");
       preview_image = BuildPreviewImage(*preview_override, 1024);
+      ApplyLibRawOrientationToPreview(InverseLibRawFlip(metadata.libraw_flip), &preview_image);
     } else {
       auto embedded_preview = std::make_shared<PreviewImage>();
       auto preview_progress = [&progress](const ProcessingProgress& update) {
@@ -3505,6 +3563,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
         }
       }
       preview_image = BuildPreviewImage(*embedded_preview, 1024);
+      ApplyLibRawOrientationToPreview(InverseLibRawFlip(metadata.libraw_flip), &preview_image);
     }
 
     LinearDngPayload payload;

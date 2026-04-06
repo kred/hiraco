@@ -18,6 +18,7 @@ namespace {
 struct DecodeSummary {
   std::string camera_make;
   std::string camera_model;
+  int libraw_flip = 0;
   unsigned raw_width = 0;
   unsigned raw_height = 0;
   unsigned image_width = 0;
@@ -161,6 +162,7 @@ bool DecodeWithLibRaw(const std::string& source_path,
 
   summary->camera_make = processor->imgdata.idata.make;
   summary->camera_model = processor->imgdata.idata.model;
+  summary->libraw_flip = processor->imgdata.sizes.flip;
   summary->raw_width = processor->imgdata.sizes.raw_width;
   summary->raw_height = processor->imgdata.sizes.raw_height;
   summary->image_width = processor->imgdata.sizes.width;
@@ -177,6 +179,7 @@ bool DecodeWithLibRaw(const std::string& source_path,
 
   summary->black_level = processor->imgdata.color.black;
   summary->white_level = processor->imgdata.color.maximum;
+  summary->libraw_flip = processor->imgdata.sizes.flip;
 
   bool all_zero = true;
   for (int row = 0; row < 3; ++row) {
@@ -231,6 +234,7 @@ SourceLinearDngMetadata BuildMetadataFromLibRaw(const std::string& source_path,
   metadata.make = decode_summary.camera_make;
   metadata.model = decode_summary.camera_model;
   metadata.unique_camera_model = decode_summary.camera_make + " " + decode_summary.camera_model;
+  metadata.libraw_flip = NormalizeLibRawFlip(decode_summary.libraw_flip);
 
   const unsigned raw_white = decode_summary.white_level;
   if (raw_white > 0) {

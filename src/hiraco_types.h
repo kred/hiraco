@@ -15,6 +15,7 @@ struct SourceLinearDngMetadata {
   std::string make;
   std::string model;
   std::string unique_camera_model;
+  int libraw_flip = 0;
   bool has_black_level = false;
   double black_level = 0.0;
   bool has_white_level = false;
@@ -150,6 +151,46 @@ struct CropRect {
   uint32_t width = 0;
   uint32_t height = 0;
 };
+
+inline int NormalizeLibRawFlip(int flip) {
+  const int normalized = flip % 8;
+  return normalized < 0 ? normalized + 8 : normalized;
+}
+
+inline bool LibRawFlipSwapsAxes(int flip) {
+  return (NormalizeLibRawFlip(flip) & 4) != 0;
+}
+
+inline uint32_t OrientedImageWidth(uint32_t width, uint32_t height, int flip) {
+  return LibRawFlipSwapsAxes(flip) ? height : width;
+}
+
+inline uint32_t OrientedImageHeight(uint32_t width, uint32_t height, int flip) {
+  return LibRawFlipSwapsAxes(flip) ? width : height;
+}
+
+inline uint32_t LibRawFlipToTiffOrientation(int flip) {
+  switch (NormalizeLibRawFlip(flip)) {
+    case 0:
+      return 1;
+    case 1:
+      return 2;
+    case 2:
+      return 4;
+    case 3:
+      return 3;
+    case 4:
+      return 5;
+    case 5:
+      return 8;
+    case 6:
+      return 6;
+    case 7:
+      return 7;
+    default:
+      return 1;
+  }
+}
 
 inline constexpr uint32_t kCropPreviewProcessingBorder = 96;
 

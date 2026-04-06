@@ -3,6 +3,7 @@
 #include <wx/bitmap.h>
 #include <wx/bmpbuttn.h>
 #include <wx/button.h>
+#include <wx/collpane.h>
 #include <wx/dcbuffer.h>
 #include <wx/dnd.h>
 #include <wx/dirctrl.h>
@@ -17,11 +18,13 @@
 #include <wx/statbmp.h>
 #include <wx/statline.h>
 #include <wx/stattext.h>
+#include <wx/splitter.h>
 #include <wx/timer.h>
 #include <wx/wx.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <future>
@@ -172,6 +175,137 @@ wxString ResolutionTooltipForPrepared(const PreparedSource& prepared) {
     return exact;
   }
   return wxString::Format("%s (%s)", compact, exact);
+}
+
+struct ContinuousRect {
+  double left = 0.0;
+  double top = 0.0;
+  double right = 0.0;
+  double bottom = 0.0;
+};
+
+ContinuousRect ToContinuousRect(const CropRect& rect) {
+  ContinuousRect result;
+  result.left = static_cast<double>(rect.x);
+  result.top = static_cast<double>(rect.y);
+  result.right = static_cast<double>(rect.x + rect.width);
+  result.bottom = static_cast<double>(rect.y + rect.height);
+  return result;
+}
+
+ContinuousRect TransformNativeRectToDisplay(const ContinuousRect& rect,
+                                            uint32_t native_width,
+                                            uint32_t native_height,
+                                            int libraw_flip) {
+  ContinuousRect mapped = rect;
+  const int normalized_flip = NormalizeLibRawFlip(libraw_flip);
+  if ((normalized_flip & 1) != 0) {
+    const double flipped_left = static_cast<double>(native_width) - mapped.right;
+    const double flipped_right = static_cast<double>(native_width) - mapped.left;
+    mapped.left = flipped_left;
+    mapped.right = flipped_right;
+  }
+  if ((normalized_flip & 2) != 0) {
+    const double flipped_top = static_cast<double>(native_height) - mapped.bottom;
+    const double flipped_bottom = static_cast<double>(native_height) - mapped.top;
+    mapped.top = flipped_top;
+    mapped.bottom = flipped_bottom;
+  }
+  if ((normalized_flip & 4) != 0) {
+    std::swap(mapped.left, mapped.top);
+    std::swap(mapped.right, mapped.bottom);
+  }
+  return mapped;
+}
+
+ContinuousRect TransformDisplayRectToNative(const ContinuousRect& rect,
+                                            uint32_t native_width,
+                                            uint32_t native_height,
+                                            int libraw_flip) {
+  ContinuousRect mapped = rect;
+  const int normalized_flip = NormalizeLibRawFlip(libraw_flip);
+  if ((normalized_flip & 4) != 0) {
+    std::swap(mapped.left, mapped.top);
+    std::swap(mapped.right, mapped.bottom);
+  }
+  if ((normalized_flip & 2) != 0) {
+    const double flipped_top = static_cast<double>(native_height) - mapped.bottom;
+    const double flipped_bottom = static_cast<double>(native_height) - mapped.top;
+    mapped.top = flipped_top;
+    mapped.bottom = flipped_bottom;
+  }
+  if ((normalized_flip & 1) != 0) {
+    const double flipped_left = static_cast<double>(native_width) - mapped.right;
+    const double flipped_right = static_cast<double>(native_width) - mapped.left;
+    mapped.left = flipped_left;
+    mapped.right = flipped_right;
+  }
+  return mapped;
+}
+
+CropRect PreviewCoverageRectInNative(const PreparedSource& prepared,
+                                     uint32_t preview_width,
+                                     uint32_t preview_height) {
+  CropRect coverage;
+  coverage.width = prepared.image_width;
+  coverage.height = prepared.image_height;
+
+  const SourceLinearDngMetadata& metadata = prepared.metadata;
+  if (!metadata.has_default_crop ||
+      metadata.default_crop_width == 0 ||
+      metadata.default_crop_height == 0) {
+    return coverage;
+  }
+
+  const uint32_t oriented_crop_width =
+      OrientedImageWidth(metadata.default_crop_width, metadata.default_crop_height, metadata.libraw_flip);
+  const uint32_t oriented_crop_height =
+      OrientedImageHeight(metadata.default_crop_width, metadata.default_crop_height, metadata.libraw_flip);
+  const bool matches_default_crop =
+      preview_width == oriented_crop_width && preview_height == oriented_crop_height;
+  const bool matches_half_default_crop =
+      preview_width * 2 == oriented_crop_width && preview_height * 2 == oriented_crop_height;
+
+  if (!matches_default_crop && !matches_half_default_crop) {
+    return coverage;
+  }
+
+  coverage.x = metadata.default_crop_origin_h;
+  coverage.y = metadata.default_crop_origin_v;
+  coverage.width = metadata.default_crop_width;
+  coverage.height = metadata.default_crop_height;
+  return coverage;
+}
+
+CropRect ContinuousRectToCropRect(const ContinuousRect& rect,
+                                  uint32_t native_width,
+                                  uint32_t native_height) {
+  CropRect result;
+  if (native_width == 0 || native_height == 0) {
+    return result;
+  }
+
+  const double max_width = static_cast<double>(native_width);
+  const double max_height = static_cast<double>(native_height);
+  const double clamped_left = std::clamp(rect.left, 0.0, max_width);
+  const double clamped_top = std::clamp(rect.top, 0.0, max_height);
+  const double clamped_right = std::clamp(rect.right, 0.0, max_width);
+  const double clamped_bottom = std::clamp(rect.bottom, 0.0, max_height);
+
+  const uint32_t x = static_cast<uint32_t>(std::clamp<long long>(
+      static_cast<long long>(std::llround(clamped_left)), 0, static_cast<long long>(native_width - 1)));
+  const uint32_t y = static_cast<uint32_t>(std::clamp<long long>(
+      static_cast<long long>(std::llround(clamped_top)), 0, static_cast<long long>(native_height - 1)));
+  const uint32_t right = static_cast<uint32_t>(std::clamp<long long>(
+      static_cast<long long>(std::llround(clamped_right)), static_cast<long long>(x + 1), static_cast<long long>(native_width)));
+  const uint32_t bottom = static_cast<uint32_t>(std::clamp<long long>(
+      static_cast<long long>(std::llround(clamped_bottom)), static_cast<long long>(y + 1), static_cast<long long>(native_height)));
+
+  result.x = x;
+  result.y = y;
+  result.width = right - x;
+  result.height = bottom - y;
+  return result;
 }
 
 void ApplyStageOverridesToResolvedSettings(const StageOverrideSet& overrides,
@@ -400,19 +534,42 @@ class PreviewCanvas final : public wxScrolledWindow {
     return 1.0;
   }
 
+  wxSize CurrentDrawSize() const {
+    if (!preview_ || preview_->width == 0 || preview_->height == 0) {
+      return wxSize(0, 0);
+    }
+
+    const double scale = CurrentScale();
+    return wxSize(std::max(1, static_cast<int>(std::round(bitmap_.GetWidth() * scale))),
+                  std::max(1, static_cast<int>(std::round(bitmap_.GetHeight() * scale))));
+  }
+
+  wxPoint CurrentImageOffset() const {
+    if (zoom_mode_ != ZoomMode::kFit || !preview_) {
+      return wxPoint(0, 0);
+    }
+
+    const wxSize client = GetClientSize();
+    const wxSize draw_size = CurrentDrawSize();
+    return wxPoint(std::max(0, (client.GetWidth() - draw_size.GetWidth()) / 2),
+                   std::max(0, (client.GetHeight() - draw_size.GetHeight()) / 2));
+  }
+
   wxPoint ToImagePoint(const wxPoint& point) const {
     int logical_x = 0;
     int logical_y = 0;
     CalcUnscrolledPosition(point.x, point.y, &logical_x, &logical_y);
+    const wxPoint offset = CurrentImageOffset();
     const double scale = CurrentScale();
-    return wxPoint(static_cast<int>(std::floor(logical_x / scale)),
-                   static_cast<int>(std::floor(logical_y / scale)));
+    return wxPoint(static_cast<int>(std::floor((logical_x - offset.x) / scale)),
+                   static_cast<int>(std::floor((logical_y - offset.y) / scale)));
   }
 
   wxRect CropRectToView() const {
     const double scale = CurrentScale();
-    return wxRect(static_cast<int>(std::round(crop_rect_.x * scale)),
-                  static_cast<int>(std::round(crop_rect_.y * scale)),
+    const wxPoint offset = CurrentImageOffset();
+    return wxRect(offset.x + static_cast<int>(std::round(crop_rect_.x * scale)),
+                  offset.y + static_cast<int>(std::round(crop_rect_.y * scale)),
                   static_cast<int>(std::round(crop_rect_.width * scale)),
                   static_cast<int>(std::round(crop_rect_.height * scale)));
   }
@@ -459,19 +616,20 @@ class PreviewCanvas final : public wxScrolledWindow {
       return;
     }
 
-    const double scale = CurrentScale();
-    const int draw_width = std::max(1, static_cast<int>(std::round(bitmap_.GetWidth() * scale)));
-    const int draw_height = std::max(1, static_cast<int>(std::round(bitmap_.GetHeight() * scale)));
+    const wxSize draw_size = CurrentDrawSize();
+    const wxPoint offset = CurrentImageOffset();
 
     std::unique_ptr<wxGraphicsContext> gc(wxGraphicsContext::Create(dc));
     if (gc) {
-      gc->DrawBitmap(bitmap_, 0, 0, draw_width, draw_height);
+      gc->DrawBitmap(bitmap_, offset.x, offset.y, draw_size.GetWidth(), draw_size.GetHeight());
       gc->SetPen(wxPen(wxColour(255, 193, 7), 2.0));
       gc->SetBrush(*wxTRANSPARENT_BRUSH);
       const wxRect crop_rect = CropRectToView();
       gc->DrawRectangle(crop_rect.x, crop_rect.y, crop_rect.width, crop_rect.height);
     } else {
-      dc.DrawBitmap(bitmap_.ConvertToImage().Scale(draw_width, draw_height), 0, 0);
+      dc.DrawBitmap(bitmap_.ConvertToImage().Scale(draw_size.GetWidth(), draw_size.GetHeight()),
+                    offset.x,
+                    offset.y);
       dc.SetPen(wxPen(wxColour(255, 193, 7), 2));
       dc.SetBrush(*wxTRANSPARENT_BRUSH);
       dc.DrawRectangle(CropRectToView());
@@ -668,6 +826,11 @@ struct SliderControl {
   int decimals = 2;
 };
 
+enum class OutputLocationMode {
+  kSpecificDirectory,
+  kRelativeToOriginal,
+};
+
 class HiracoMainFrame final : public wxFrame {
  public:
   HiracoMainFrame()
@@ -681,6 +844,7 @@ class HiracoMainFrame final : public wxFrame {
 
     base_output_dir_ = std::filesystem::current_path();
     output_dir_picker_->SetPath(base_output_dir_.string());
+    UpdateOutputLocationControls();
     UpdateCompressionChoice();
     UpdateResolvedSliderValues();
     UpdateButtons();
@@ -699,7 +863,7 @@ class HiracoMainFrame final : public wxFrame {
       QueueItem item;
       item.id = next_item_id_++;
       item.source_path = path;
-      item.target_path = ResolveOutputPath(path, base_output_dir_, relative_subdir_);
+      item.target_path = ResolveOutputPathForMode(path);
       item.resolution_label = "...";
       metadata_jobs.emplace_back(item.id, item.source_path);
       queue_.push_back(item);
@@ -734,7 +898,17 @@ class HiracoMainFrame final : public wxFrame {
   }
 
   void BuildUi() {
-    auto* root = new wxBoxSizer(wxHORIZONTAL);
+    auto* root = new wxBoxSizer(wxVERTICAL);
+    workspace_splitter_ = new wxSplitterWindow(this,
+                           wxID_ANY,
+                           wxDefaultPosition,
+                           wxDefaultSize,
+                           wxSP_LIVE_UPDATE);
+    auto* detail_splitter = new wxSplitterWindow(workspace_splitter_,
+                           wxID_ANY,
+                           wxDefaultPosition,
+                           wxDefaultSize,
+                           wxSP_LIVE_UPDATE);
     auto make_section_label = [](wxWindow* parent, const wxString& text) {
       auto* label = new wxStaticText(parent, wxID_ANY, text);
       wxFont font = label->GetFont();
@@ -743,29 +917,30 @@ class HiracoMainFrame final : public wxFrame {
       return label;
     };
 
-    auto* left_panel = new wxPanel(this);
+    left_panel_ = new wxPanel(workspace_splitter_);
+    left_panel_->SetMinSize(wxSize(320, -1));
     auto* left_sizer = new wxBoxSizer(wxVERTICAL);
     auto* queue_buttons = new wxBoxSizer(wxHORIZONTAL);
-    add_files_button_ = new wxButton(left_panel, wxID_ANY, "Add Files");
-    remove_button_ = new wxButton(left_panel, wxID_ANY, "Remove Selected");
-    clear_button_ = new wxButton(left_panel, wxID_ANY, "Clear");
+    add_files_button_ = new wxButton(left_panel_, wxID_ANY, "Add Files");
+    remove_button_ = new wxButton(left_panel_, wxID_ANY, "Remove Selected");
+    clear_button_ = new wxButton(left_panel_, wxID_ANY, "Clear");
+    queue_view_toggle_button_ = new wxButton(left_panel_, wxID_ANY, ">");
+    queue_view_toggle_button_->SetMinSize(wxSize(36, -1));
     queue_buttons->Add(add_files_button_, 0, wxRIGHT, 8);
     queue_buttons->Add(remove_button_, 0, wxRIGHT, 8);
     queue_buttons->Add(clear_button_, 0);
+    queue_buttons->AddStretchSpacer();
+    queue_buttons->Add(queue_view_toggle_button_, 0);
 
-    queue_ctrl_ = new wxListCtrl(left_panel, wxID_ANY, wxDefaultPosition, wxSize(540, -1),
+    queue_ctrl_ = new wxListCtrl(left_panel_, wxID_ANY, wxDefaultPosition, wxSize(420, -1),
                                  wxLC_REPORT | wxLC_HRULES | wxLC_VRULES);
-    queue_ctrl_->AppendColumn("File", wxLIST_FORMAT_LEFT, 120);
-    queue_ctrl_->AppendColumn("Size", wxLIST_FORMAT_CENTER, 70);
-    queue_ctrl_->AppendColumn("Settings", wxLIST_FORMAT_CENTER, 75);
-    queue_ctrl_->AppendColumn("Target", wxLIST_FORMAT_LEFT, 215);
-    queue_ctrl_->AppendColumn("Processed", wxLIST_FORMAT_CENTER, 55);
+    ConfigureQueueColumns();
 
     left_sizer->Add(queue_buttons, 0, wxALL | wxEXPAND, 10);
     left_sizer->Add(queue_ctrl_, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
-    left_panel->SetSizer(left_sizer);
+    left_panel_->SetSizer(left_sizer);
 
-    auto* center_panel = new wxPanel(this);
+    auto* center_panel = new wxPanel(detail_splitter);
     auto* center_sizer = new wxBoxSizer(wxVERTICAL);
     auto* zoom_row = new wxBoxSizer(wxHORIZONTAL);
     zoom_row->Add(new wxStaticText(center_panel, wxID_ANY, "Zoom:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
@@ -786,8 +961,8 @@ class HiracoMainFrame final : public wxFrame {
     center_sizer->Add(original_canvas_, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
     center_panel->SetSizer(center_sizer);
 
-    auto* right_panel = new wxPanel(this);
-    right_panel->SetMinSize(wxSize(430, -1));
+    auto* right_panel = new wxPanel(detail_splitter);
+    right_panel->SetMinSize(wxSize(460, -1));
     auto* right_sizer = new wxBoxSizer(wxVERTICAL);
 
     right_sizer->Add(make_section_label(right_panel, "Converted Crop"), 0, wxLEFT | wxTOP, 10);
@@ -795,7 +970,7 @@ class HiracoMainFrame final : public wxFrame {
     right_sizer->Add(crop_preview_panel_, 0, wxALL | wxEXPAND, 10);
     right_sizer->Add(new wxStaticLine(right_panel), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
 
-    right_sizer->Add(make_section_label(right_panel, "Output"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
+    right_sizer->Add(make_section_label(right_panel, "Output"), 0, wxLEFT, 10);
     auto* output_panel = new wxPanel(right_panel);
     auto* output_sizer = new wxBoxSizer(wxVERTICAL);
     auto* compression_row = new wxBoxSizer(wxHORIZONTAL);
@@ -810,25 +985,30 @@ class HiracoMainFrame final : public wxFrame {
     compression_choice_->SetSelection(1);
     compression_row->Add(compression_choice_, 1);
     output_sizer->Add(compression_row, 0, wxEXPAND);
-    output_sizer->Add(new wxStaticText(output_panel, wxID_ANY, "Output Directory"),
-              0,
-              wxTOP,
-              10);
+    specific_directory_radio_ =
+      new wxRadioButton(output_panel, wxID_ANY, "Write to specific directory", wxDefaultPosition, wxDefaultSize, wxRB_GROUP);
+    output_sizer->Add(specific_directory_radio_, 0, wxTOP, 10);
     output_dir_picker_ = new wxDirPickerCtrl(output_panel, wxID_ANY);
-    output_sizer->Add(output_dir_picker_, 0, wxTOP | wxEXPAND, 10);
-    output_sizer->Add(new wxStaticText(output_panel, wxID_ANY, "Relative Subfolder"),
-              0,
-              wxTOP,
-              10);
-    relative_subdir_ctrl_ = new wxTextCtrl(output_panel, wxID_ANY);
-    output_sizer->Add(relative_subdir_ctrl_, 0, wxTOP | wxEXPAND, 10);
+    output_sizer->Add(output_dir_picker_, 0, wxTOP | wxEXPAND, 6);
+    relative_to_source_radio_ =
+      new wxRadioButton(output_panel, wxID_ANY, "Write relative to original image");
+    output_sizer->Add(relative_to_source_radio_, 0, wxTOP, 10);
+    relative_subdir_hint_label_ =
+      new wxStaticText(output_panel, wxID_ANY, "Leave empty to write next to the original image.");
+    relative_subdir_hint_label_->SetForegroundColour(wxColour(110, 110, 110));
+    output_sizer->Add(relative_subdir_hint_label_, 0, wxTOP | wxEXPAND, 4);
+    relative_subdir_ctrl_ =
+      new wxTextCtrl(output_panel, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE);
+    relative_subdir_ctrl_->SetHint("Optional subfolder, e.g. converted");
+    output_sizer->Add(relative_subdir_ctrl_, 0, wxTOP | wxEXPAND, 6);
     output_panel->SetSizer(output_sizer);
     right_sizer->Add(output_panel, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
     right_sizer->Add(new wxStaticLine(right_panel), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
 
-    right_sizer->Add(make_section_label(right_panel, "Processing"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 10);
+    right_sizer->Add(make_section_label(right_panel, "Processing"), 0, wxLEFT, 10);
+    auto* processing_panel = new wxPanel(right_panel);
     auto* sliders_scroll =
-      new wxScrolledWindow(right_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL);
+      new wxScrolledWindow(processing_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL);
     sliders_scroll->SetScrollRate(0, 16);
     auto* sliders_sizer = new wxBoxSizer(wxVERTICAL);
 
@@ -895,7 +1075,10 @@ class HiracoMainFrame final : public wxFrame {
     sliders_sizer->AddSpacer(10);
     sliders_scroll->SetSizer(sliders_sizer);
     sliders_scroll->FitInside();
-    right_sizer->Add(sliders_scroll, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
+    auto* processing_sizer = new wxBoxSizer(wxVERTICAL);
+    processing_sizer->Add(sliders_scroll, 1, wxEXPAND);
+    processing_panel->SetSizer(processing_sizer);
+    right_sizer->Add(processing_panel, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
     right_sizer->Add(new wxStaticLine(right_panel), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
 
     auto* settings_action_row = new wxBoxSizer(wxHORIZONTAL);
@@ -904,9 +1087,10 @@ class HiracoMainFrame final : public wxFrame {
     paste_settings_button_ = new wxButton(right_panel, wxID_ANY, "Paste to Selected");
     copy_settings_button_->SetToolTip("Copy the current file's resolved processing settings.");
     paste_settings_button_->SetToolTip("Paste copied settings to all selected queue items.");
-    settings_action_row->Add(reset_button_, 1, wxRIGHT, 8);
-    settings_action_row->Add(copy_settings_button_, 1, wxRIGHT, 8);
-    settings_action_row->Add(paste_settings_button_, 1);
+    settings_action_row->Add(reset_button_, 0, wxRIGHT, 8);
+    settings_action_row->Add(copy_settings_button_, 0, wxRIGHT, 8);
+    settings_action_row->Add(paste_settings_button_, 0);
+    settings_action_row->AddStretchSpacer();
     right_sizer->Add(settings_action_row, 0, wxLEFT | wxRIGHT | wxTOP | wxEXPAND, 10);
 
     auto* convert_action_row = new wxBoxSizer(wxHORIZONTAL);
@@ -922,10 +1106,16 @@ class HiracoMainFrame final : public wxFrame {
     right_sizer->Add(status_label_, 0, wxALL | wxEXPAND, 10);
     right_panel->SetSizer(right_sizer);
 
-    root->Add(left_panel, 0, wxEXPAND);
-    root->Add(center_panel, 1, wxEXPAND);
-    root->Add(right_panel, 0, wxEXPAND);
+    detail_splitter->SetMinimumPaneSize(360);
+    detail_splitter->SetSashGravity(1.0);
+    detail_splitter->SplitVertically(center_panel, right_panel, -470);
+    workspace_splitter_->SetMinimumPaneSize(260);
+    workspace_splitter_->SetSashGravity(0.0);
+    workspace_splitter_->SplitVertically(left_panel_, detail_splitter, 340);
+
+    root->Add(workspace_splitter_, 1, wxEXPAND);
     SetSizer(root);
+    ApplyQueueViewMode();
   }
 
   wxBoxSizer* CreateStageSectionSizer(wxWindow* parent,
@@ -962,13 +1152,14 @@ class HiracoMainFrame final : public wxFrame {
     auto* header = new wxBoxSizer(wxHORIZONTAL);
     auto* label_ctrl = new wxStaticText(panel, wxID_ANY, label);
     auto* value_ctrl = new wxStaticText(panel, wxID_ANY, "0");
+    value_ctrl->SetMinSize(wxSize(44, -1));
     auto* slider = new wxSlider(panel,
                                 wxID_ANY,
                                 static_cast<int>(min_value * scale),
                                 static_cast<int>(min_value * scale),
                                 static_cast<int>(max_value * scale));
     header->Add(label_ctrl, 1, wxRIGHT, 8);
-    header->Add(value_ctrl, 0);
+    header->Add(value_ctrl, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 8);
     row->Add(header, 0, wxBOTTOM | wxEXPAND, 4);
     row->Add(slider, 0, wxEXPAND);
     panel->SetSizer(row);
@@ -993,9 +1184,10 @@ class HiracoMainFrame final : public wxFrame {
     auto* header = new wxBoxSizer(wxHORIZONTAL);
     auto* label_ctrl = new wxStaticText(panel, wxID_ANY, label);
     auto* value_ctrl = new wxStaticText(panel, wxID_ANY, "0");
+    value_ctrl->SetMinSize(wxSize(44, -1));
     auto* slider = new wxSlider(panel, wxID_ANY, min_value, min_value, max_value);
     header->Add(label_ctrl, 1, wxRIGHT, 8);
-    header->Add(value_ctrl, 0);
+    header->Add(value_ctrl, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 8);
     row->Add(header, 0, wxBOTTOM | wxEXPAND, 4);
     row->Add(slider, 0, wxEXPAND);
     panel->SetSizer(row);
@@ -1014,6 +1206,7 @@ class HiracoMainFrame final : public wxFrame {
     add_files_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnAddFiles, this);
     remove_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnRemoveSelected, this);
     clear_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnClearQueue, this);
+    queue_view_toggle_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnToggleQueueView, this);
     convert_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnConvert, this);
     cancel_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnCancel, this);
     reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetDefaults, this);
@@ -1024,6 +1217,8 @@ class HiracoMainFrame final : public wxFrame {
     stage3_reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetStage3Defaults, this);
     output_dir_picker_->Bind(wxEVT_DIRPICKER_CHANGED, &HiracoMainFrame::OnOutputDirChanged, this);
     relative_subdir_ctrl_->Bind(wxEVT_TEXT, &HiracoMainFrame::OnRelativeSubdirChanged, this);
+    specific_directory_radio_->Bind(wxEVT_RADIOBUTTON, &HiracoMainFrame::OnOutputModeChanged, this);
+    relative_to_source_radio_->Bind(wxEVT_RADIOBUTTON, &HiracoMainFrame::OnOutputModeChanged, this);
     compression_choice_->Bind(wxEVT_CHOICE, &HiracoMainFrame::OnCompressionChanged, this);
     zoom_choice_->Bind(wxEVT_CHOICE, &HiracoMainFrame::OnZoomChanged, this);
     queue_ctrl_->Bind(wxEVT_LIST_ITEM_SELECTED, &HiracoMainFrame::OnQueueSelectionChanged, this);
@@ -1250,19 +1445,11 @@ class HiracoMainFrame final : public wxFrame {
       return CropRect();
     }
 
-    uint32_t mapped_width = prepared.image_width;
-    uint32_t mapped_height = prepared.image_height;
-    uint32_t offset_x = 0;
-    uint32_t offset_y = 0;
-    ResolveDisplayCropMapping(prepared,
-                              preview_width,
-                              preview_height,
-                              &mapped_width,
-                              &mapped_height,
-                              &offset_x,
-                              &offset_y);
-    (void) offset_x;
-    (void) offset_y;
+    const CropRect coverage = PreviewCoverageRectInNative(prepared, preview_width, preview_height);
+    const uint32_t mapped_width =
+      OrientedImageWidth(coverage.width, coverage.height, prepared.metadata.libraw_flip);
+    const uint32_t mapped_height =
+      OrientedImageHeight(coverage.width, coverage.height, prepared.metadata.libraw_flip);
 
     const uint32_t display_crop_width =
         std::max(1u, ScaleCoordBetweenExtents(512, mapped_width, preview_width));
@@ -1316,24 +1503,41 @@ class HiracoMainFrame final : public wxFrame {
       return ClampCropRect(display_crop, prepared.image_width, prepared.image_height);
     }
 
-    uint32_t mapped_width = prepared.image_width;
-    uint32_t mapped_height = prepared.image_height;
-    uint32_t offset_x = 0;
-    uint32_t offset_y = 0;
-    ResolveDisplayCropMapping(prepared,
-                              display_preview_width_,
-                              display_preview_height_,
-                              &mapped_width,
-                              &mapped_height,
-                              &offset_x,
-                              &offset_y);
+    const CropRect clamped_display = ClampCropRect(display_crop, display_preview_width_, display_preview_height_);
+    const CropRect coverage = PreviewCoverageRectInNative(prepared,
+                                display_preview_width_,
+                                display_preview_height_);
+    const ContinuousRect display_coverage =
+      TransformNativeRectToDisplay(ToContinuousRect(coverage),
+                     prepared.image_width,
+                     prepared.image_height,
+                     prepared.metadata.libraw_flip);
 
-    CropRect mapped;
-    mapped.x = offset_x + ScaleCoordBetweenExtents(display_crop.x, display_preview_width_, mapped_width);
-    mapped.y = offset_y + ScaleCoordBetweenExtents(display_crop.y, display_preview_height_, mapped_height);
-    mapped.width = std::max(1u, ScaleCoordBetweenExtents(display_crop.width, display_preview_width_, mapped_width));
-    mapped.height = std::max(1u, ScaleCoordBetweenExtents(display_crop.height, display_preview_height_, mapped_height));
-    return ClampCropRect(mapped, prepared.image_width, prepared.image_height);
+    const double display_coverage_width = std::max(1.0, display_coverage.right - display_coverage.left);
+    const double display_coverage_height = std::max(1.0, display_coverage.bottom - display_coverage.top);
+
+    ContinuousRect display_rect;
+    display_rect.left = display_coverage.left +
+      (static_cast<double>(clamped_display.x) * display_coverage_width) / static_cast<double>(display_preview_width_);
+    display_rect.top = display_coverage.top +
+      (static_cast<double>(clamped_display.y) * display_coverage_height) / static_cast<double>(display_preview_height_);
+    display_rect.right = display_coverage.left +
+      (static_cast<double>(clamped_display.x + clamped_display.width) * display_coverage_width) /
+        static_cast<double>(display_preview_width_);
+    display_rect.bottom = display_coverage.top +
+      (static_cast<double>(clamped_display.y + clamped_display.height) * display_coverage_height) /
+        static_cast<double>(display_preview_height_);
+
+    const ContinuousRect native_rect =
+      TransformDisplayRectToNative(display_rect,
+                     prepared.image_width,
+                     prepared.image_height,
+                     prepared.metadata.libraw_flip);
+    return ClampCropRect(ContinuousRectToCropRect(native_rect,
+                            prepared.image_width,
+                            prepared.image_height),
+               prepared.image_width,
+               prepared.image_height);
   }
 
   void BindSlider(SliderControl& control, std::function<void(double)> on_change) {
@@ -1395,13 +1599,116 @@ class HiracoMainFrame final : public wxFrame {
     }
   }
 
+  std::filesystem::path ResolveOutputPathForMode(const std::string& source_path) const {
+    const std::filesystem::path source(source_path);
+    std::filesystem::path output_directory;
+    if (output_location_mode_ == OutputLocationMode::kSpecificDirectory) {
+      output_directory = base_output_dir_;
+    } else {
+      output_directory = source.parent_path();
+      if (!relative_subdir_.empty()) {
+        output_directory /= relative_subdir_;
+      }
+    }
+    return output_directory / (source.stem().string() + ".dng");
+  }
+
+  void UpdateOutputLocationControls() {
+    const bool specific_directory_mode = output_location_mode_ == OutputLocationMode::kSpecificDirectory;
+    const bool controls_enabled = !conversion_running_ && !close_requested_.load();
+    specific_directory_radio_->SetValue(specific_directory_mode);
+    relative_to_source_radio_->SetValue(!specific_directory_mode);
+    output_dir_picker_->Enable(controls_enabled && specific_directory_mode);
+    relative_subdir_ctrl_->Enable(controls_enabled && !specific_directory_mode);
+    relative_subdir_hint_label_->Enable(controls_enabled && !specific_directory_mode);
+  }
+
+  void ConfigureQueueColumns() {
+    if (!queue_ctrl_) {
+      return;
+    }
+
+    queue_ctrl_->ClearAll();
+    queue_ctrl_->AppendColumn("File", wxLIST_FORMAT_LEFT, queue_details_expanded_ ? 180 : 220);
+    if (queue_details_expanded_) {
+      queue_ctrl_->AppendColumn("Size", wxLIST_FORMAT_CENTER, 72);
+      queue_ctrl_->AppendColumn("Settings", wxLIST_FORMAT_CENTER, 82);
+      queue_ctrl_->AppendColumn("Target", wxLIST_FORMAT_LEFT, 240);
+    }
+    queue_ctrl_->AppendColumn("Processed", wxLIST_FORMAT_CENTER, 112);
+  }
+
+  void PopulateQueueRow(long row, const QueueItem& item) {
+    if (queue_details_expanded_) {
+      queue_ctrl_->SetItem(row, 1, item.resolution_label);
+      queue_ctrl_->SetItem(row, 2, SettingsMarkerForItem(item));
+      queue_ctrl_->SetItem(row, 3, item.target_path.string());
+      queue_ctrl_->SetItem(row, 4, ProcessedMarkerForItem(item));
+      return;
+    }
+
+    queue_ctrl_->SetItem(row, 1, ProcessedMarkerForItem(item));
+  }
+
+  void ApplyQueueViewMode() {
+    if (!queue_ctrl_) {
+      return;
+    }
+
+    const int desired_left_width = queue_details_expanded_ ? 690 : 368;
+    const int selected_row = selected_row_;
+
+    ConfigureQueueColumns();
+    RefreshQueue();
+    if (selected_row >= 0 && selected_row < static_cast<int>(queue_.size())) {
+      queue_ctrl_->SetItemState(selected_row,
+                                wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED,
+                                wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED);
+    }
+
+    if (queue_view_toggle_button_) {
+      queue_view_toggle_button_->SetLabel(queue_details_expanded_ ? "<" : ">");
+      queue_view_toggle_button_->SetToolTip(queue_details_expanded_ ? "Collapse queue details" : "Expand queue details");
+    }
+    if (left_panel_) {
+      left_panel_->SetMinSize(wxSize(desired_left_width, -1));
+    }
+    queue_ctrl_->SetMinSize(wxSize(desired_left_width - 20, -1));
+    if (workspace_splitter_ && workspace_splitter_->IsSplit()) {
+      workspace_splitter_->SetSashPosition(desired_left_width);
+    }
+    Layout();
+  }
+
+  void OnToggleQueueView(wxCommandEvent&) {
+    queue_details_expanded_ = !queue_details_expanded_;
+    ApplyQueueViewMode();
+  }
+
   void UpdateButtons() {
     if (close_requested_.load()) {
       add_files_button_->Enable(false);
       remove_button_->Enable(false);
       clear_button_->Enable(false);
+      queue_view_toggle_button_->Enable(false);
       convert_button_->Enable(false);
       cancel_button_->Enable(false);
+      reset_button_->Enable(false);
+      copy_settings_button_->Enable(false);
+      paste_settings_button_->Enable(false);
+      stage1_reset_button_->Enable(false);
+      stage2_reset_button_->Enable(false);
+      stage3_reset_button_->Enable(false);
+      stage1_sigma_.slider->Enable(false);
+      stage1_nsr_.slider->Enable(false);
+      stage2_denoise_.slider->Enable(false);
+      stage2_gain0_.slider->Enable(false);
+      stage2_gain1_.slider->Enable(false);
+      stage2_gain2_.slider->Enable(false);
+      stage2_gain3_.slider->Enable(false);
+      stage3_radius_.slider->Enable(false);
+      stage3_gain_.slider->Enable(false);
+      UpdateOutputLocationControls();
       return;
     }
 
@@ -1412,6 +1719,7 @@ class HiracoMainFrame final : public wxFrame {
     remove_button_->Enable(has_selection && !conversion_running_);
     clear_button_->Enable(!queue_.empty() && !conversion_running_);
     add_files_button_->Enable(!conversion_running_);
+    queue_view_toggle_button_->Enable(true);
     convert_button_->Enable(!queue_.empty() && !conversion_running_);
     cancel_button_->Enable(conversion_running_);
     reset_button_->Enable(has_selection && !conversion_running_);
@@ -1429,6 +1737,7 @@ class HiracoMainFrame final : public wxFrame {
     stage2_gain3_.slider->Enable(has_selection && !conversion_running_);
     stage3_radius_.slider->Enable(has_selection && !conversion_running_);
     stage3_gain_.slider->Enable(has_selection && !conversion_running_);
+    UpdateOutputLocationControls();
   }
 
   void UpdateQueueTooltip(const wxString& tooltip) {
@@ -1455,36 +1764,46 @@ class HiracoMainFrame final : public wxFrame {
 
     const QueueItem& item = queue_[static_cast<size_t>(row)];
     const int file_width = queue_ctrl_->GetColumnWidth(0);
-    const int size_width = queue_ctrl_->GetColumnWidth(1);
-    const int settings_width = queue_ctrl_->GetColumnWidth(2);
-    const int target_width = queue_ctrl_->GetColumnWidth(3);
     wxString tooltip;
     if (point.x < file_width) {
       tooltip = item.source_path;
-    } else if (point.x < file_width + size_width) {
-      if (item.prepared.has_value()) {
-        tooltip = ResolutionTooltipForPrepared(*item.prepared);
-      } else if (item.resolution_label == "...") {
-        tooltip = "Reading file metadata...";
+    } else if (!queue_details_expanded_) {
+      if (item.state == "Done") {
+        tooltip = "Converted";
+      } else if (item.state == "Skipped") {
+        tooltip = "Skipped";
+      } else if (item.state == "Failed" || item.state == "Canceled") {
+        tooltip = item.message.empty() ? wxString(item.state) : wxString(item.message);
       } else {
-        tooltip = "Resolution unavailable";
+        tooltip = "Not converted yet";
       }
-    } else if (point.x < file_width + size_width + settings_width) {
-      tooltip = item.stage_overrides.HasAnyOverrides()
-                    ? wxString("Custom per-file processing settings")
-                    : wxString("Using file-specific defaults");
-    } else if (point.x < file_width + size_width + settings_width + target_width) {
-      tooltip = item.target_path.string();
-    } else if (item.state == "Done") {
-      tooltip = "Converted";
-    } else if (item.state == "Skipped") {
-      tooltip = "Skipped";
-    } else if (item.state == "Loading" || item.state == "Converting") {
-      tooltip = item.message.empty() ? wxString("In progress") : wxString(item.message);
-    } else if (item.state == "Failed" || item.state == "Canceled") {
-      tooltip = item.message.empty() ? item.state : wxString(item.message);
     } else {
-      tooltip = "Not converted yet";
+      const int size_width = queue_ctrl_->GetColumnWidth(1);
+      const int settings_width = queue_ctrl_->GetColumnWidth(2);
+      const int target_width = queue_ctrl_->GetColumnWidth(3);
+      if (point.x < file_width + size_width) {
+        if (item.prepared.has_value()) {
+          tooltip = ResolutionTooltipForPrepared(*item.prepared);
+        } else if (item.resolution_label == "...") {
+          tooltip = "Reading file metadata...";
+        } else {
+          tooltip = "Resolution unavailable";
+        }
+      } else if (point.x < file_width + size_width + settings_width) {
+        tooltip = item.stage_overrides.HasAnyOverrides()
+                      ? wxString("Custom per-file processing settings")
+                      : wxString("Using file-specific defaults");
+      } else if (point.x < file_width + size_width + settings_width + target_width) {
+        tooltip = item.target_path.string();
+      } else if (item.state == "Done") {
+        tooltip = "Converted";
+      } else if (item.state == "Skipped") {
+        tooltip = "Skipped";
+      } else if (item.state == "Failed" || item.state == "Canceled") {
+        tooltip = item.message.empty() ? wxString(item.state) : wxString(item.message);
+      } else {
+        tooltip = "Not converted yet";
+      }
     }
 
     UpdateQueueTooltip(tooltip);
@@ -1502,10 +1821,7 @@ class HiracoMainFrame final : public wxFrame {
     for (size_t index = 0; index < queue_.size(); ++index) {
       const QueueItem& item = queue_[index];
       const long row = queue_ctrl_->InsertItem(index, std::filesystem::path(item.source_path).filename().string());
-      queue_ctrl_->SetItem(row, 1, item.resolution_label);
-      queue_ctrl_->SetItem(row, 2, SettingsMarkerForItem(item));
-      queue_ctrl_->SetItem(row, 3, item.target_path.string());
-      queue_ctrl_->SetItem(row, 4, ProcessedMarkerForItem(item));
+      PopulateQueueRow(row, item);
     }
     queue_ctrl_->Thaw();
     UpdateButtons();
@@ -1524,10 +1840,7 @@ class HiracoMainFrame final : public wxFrame {
     if (index < 0 || index >= static_cast<int>(queue_.size())) {
       return;
     }
-    queue_ctrl_->SetItem(index, 1, queue_[index].resolution_label);
-    queue_ctrl_->SetItem(index, 2, SettingsMarkerForItem(queue_[index]));
-    queue_ctrl_->SetItem(index, 3, queue_[index].target_path.string());
-    queue_ctrl_->SetItem(index, 4, ProcessedMarkerForItem(queue_[index]));
+    PopulateQueueRow(index, queue_[index]);
   }
 
   void BeginMetadataProbe(uint64_t item_id, const std::string& source_path) {
@@ -1594,7 +1907,7 @@ class HiracoMainFrame final : public wxFrame {
         display_preview_height_ = cached_preview->height;
         original_canvas_->SetPreview(cached_preview);
         original_canvas_->SetCropRect(*current_crop_rect_);
-        crop_preview_panel_->SetPreview(CropPreviewImage(cached_preview, *current_crop_rect_));
+        crop_preview_panel_->SetPreview(nullptr);
         queue_[selected_row_].state = "Ready";
         queue_[selected_row_].message = "Original preview ready";
         queue_[selected_row_].resolution_label = ResolutionLabelForPrepared(*item_copy.prepared);
@@ -1905,9 +2218,17 @@ class HiracoMainFrame final : public wxFrame {
     RebuildTargetPaths();
   }
 
+  void OnOutputModeChanged(wxCommandEvent&) {
+    output_location_mode_ = specific_directory_radio_->GetValue()
+                                ? OutputLocationMode::kSpecificDirectory
+                                : OutputLocationMode::kRelativeToOriginal;
+    UpdateOutputLocationControls();
+    RebuildTargetPaths();
+  }
+
   void RebuildTargetPaths() {
     for (QueueItem& item : queue_) {
-      item.target_path = ResolveOutputPath(item.source_path, base_output_dir_, relative_subdir_);
+      item.target_path = ResolveOutputPathForMode(item.source_path);
     }
     RefreshQueue();
   }
@@ -2090,7 +2411,7 @@ class HiracoMainFrame final : public wxFrame {
       display_preview_height_ = payload.original_preview->height;
       original_canvas_->SetPreview(payload.original_preview);
       original_canvas_->SetCropRect(*current_crop_rect_);
-      crop_preview_panel_->SetPreview(CropPreviewImage(payload.original_preview, *current_crop_rect_));
+      crop_preview_panel_->SetPreview(nullptr);
       status_label_->SetLabel("Original preview ready. Rendering converted crop...");
       UpdateResolvedSliderValues();
       ScheduleCropPreview(false);
@@ -2322,6 +2643,7 @@ class HiracoMainFrame final : public wxFrame {
   wxButton* add_files_button_ = nullptr;
   wxButton* remove_button_ = nullptr;
   wxButton* clear_button_ = nullptr;
+  wxButton* queue_view_toggle_button_ = nullptr;
   wxButton* reset_button_ = nullptr;
   wxButton* copy_settings_button_ = nullptr;
   wxButton* paste_settings_button_ = nullptr;
@@ -2331,17 +2653,23 @@ class HiracoMainFrame final : public wxFrame {
   wxButton* convert_button_ = nullptr;
   wxButton* cancel_button_ = nullptr;
   wxListCtrl* queue_ctrl_ = nullptr;
+  wxPanel* left_panel_ = nullptr;
   PreviewCanvas* original_canvas_ = nullptr;
   FitImagePanel* crop_preview_panel_ = nullptr;
+  wxSplitterWindow* workspace_splitter_ = nullptr;
   wxChoice* zoom_choice_ = nullptr;
   wxChoice* compression_choice_ = nullptr;
+  wxRadioButton* specific_directory_radio_ = nullptr;
+  wxRadioButton* relative_to_source_radio_ = nullptr;
   wxDirPickerCtrl* output_dir_picker_ = nullptr;
+  wxStaticText* relative_subdir_hint_label_ = nullptr;
   wxTextCtrl* relative_subdir_ctrl_ = nullptr;
   wxGauge* progress_gauge_ = nullptr;
   wxStaticText* status_label_ = nullptr;
   wxTimer shutdown_timer_;
   wxTimer crop_preview_timer_;
   wxString queue_tooltip_text_;
+  bool queue_details_expanded_ = false;
 
   SliderControl stage1_sigma_;
   SliderControl stage1_nsr_;
@@ -2356,6 +2684,7 @@ class HiracoMainFrame final : public wxFrame {
   std::vector<QueueItem> queue_;
   std::filesystem::path base_output_dir_;
   std::filesystem::path relative_subdir_;
+  OutputLocationMode output_location_mode_ = OutputLocationMode::kSpecificDirectory;
   HiracoCompression compression_ = HiracoCompression::kDeflate;
   std::optional<StageOverrideSet> copied_stage_overrides_;
   std::optional<CropRect> current_crop_rect_;
