@@ -4,6 +4,7 @@
 #include <wx/bmpbuttn.h>
 #include <wx/button.h>
 #include <wx/collpane.h>
+#include <wx/config.h>
 #include <wx/dcbuffer.h>
 #include <wx/dnd.h>
 #include <wx/dirctrl.h>
@@ -175,6 +176,22 @@ wxString ResolutionTooltipForPrepared(const PreparedSource& prepared) {
     return exact;
   }
   return wxString::Format("%s (%s)", compact, exact);
+}
+
+std::filesystem::path PathFromWxString(const wxString& value) {
+#if defined(_WIN32)
+  return std::filesystem::path(value.ToStdWstring());
+#else
+  return std::filesystem::path(value.ToStdString());
+#endif
+}
+
+wxString WxStringFromPath(const std::filesystem::path& path) {
+#if defined(_WIN32)
+  return wxString(path.wstring());
+#else
+  return wxString::FromUTF8(path.string().c_str());
+#endif
 }
 
 struct ContinuousRect {
@@ -843,7 +860,9 @@ class HiracoMainFrame final : public wxFrame {
     BindEvents();
 
     base_output_dir_ = std::filesystem::current_path();
-    output_dir_picker_->SetPath(base_output_dir_.string());
+    LoadAppSettings();
+    output_dir_picker_->SetPath(WxStringFromPath(base_output_dir_));
+    relative_subdir_ctrl_->ChangeValue(WxStringFromPath(relative_subdir_));
     UpdateOutputLocationControls();
     UpdateCompressionChoice();
     UpdateResolvedSliderValues();
@@ -1300,19 +1319,31 @@ class HiracoMainFrame final : public wxFrame {
     updating_sliders_ = false;
   }
 
+  ResolvedStageSettings HardcodedSafeStageSettingsForItem(const QueueItem* item) const {
+    if (item != nullptr && item->prepared.has_value()) {
+      return GetResolvedStageSettings(*item->prepared, StageOverrideSet());
+    }
+    return ResolvedStageSettings();
+  }
+
+  StageOverrideSet HardcodedSafeStageOverridesForItem(const QueueItem* item) const {
+    return MakeExplicitStageOverrides(HardcodedSafeStageSettingsForItem(item));
+  }
+
   void UpdateResolvedSliderValues() {
     const QueueItem* item = SelectedItem();
     if (item == nullptr) {
-      ApplyStageSettingsToSliders(ResolvedStageSettings());
+      ApplyStageSettingsToSliders(ResolveDisplayStageSettings(app_stage_defaults_));
       return;
     }
 
     if (item->prepared.has_value()) {
-      ApplyStageSettingsToSliders(GetResolvedStageSettings(*item->prepared, item->stage_overrides));
+      ApplyStageSettingsToSliders(
+          GetResolvedStageSettings(*item->prepared, ResolveEffectiveStageOverrides(item->stage_overrides)));
       return;
     }
 
-    ApplyStageSettingsToSliders(ResolveDisplayStageSettings(item->stage_overrides));
+    ApplyStageSettingsToSliders(ResolveDisplayStageSettings(ResolveEffectiveStageOverrides(item->stage_overrides)));
   }
 
   QueueItem* SelectedItem() {
@@ -1546,6 +1577,7 @@ class HiracoMainFrame final : public wxFrame {
       UpdateSliderLabel(control);
       if (!updating_sliders_) {
         on_change(value);
+        SaveAppSettingsFromControls();
         ScheduleCropPreview(debounce);
       }
     };
@@ -1597,6 +1629,148 @@ class HiracoMainFrame final : public wxFrame {
         compression_choice_->SetSelection(2);
         break;
     }
+  }
+
+  StageOverrideSet ResolveEffectiveStageOverrides(const StageOverrideSet& item_overrides) const {
+    StageOverrideSet effective = app_stage_defaults_;
+    if (item_overrides.stage1_psf_sigma.has_value()) {
+      effective.stage1_psf_sigma = item_overrides.stage1_psf_sigma;
+    }
+    if (item_overrides.stage1_nsr.has_value()) {
+      effective.stage1_nsr = item_overrides.stage1_nsr;
+    }
+    if (item_overrides.stage2_denoise.has_value()) {
+      effective.stage2_denoise = item_overrides.stage2_denoise;
+    }
+    if (item_overrides.stage2_gain0.has_value()) {
+      effective.stage2_gain0 = item_overrides.stage2_gain0;
+    }
+    if (item_overrides.stage2_gain1.has_value()) {
+      effective.stage2_gain1 = item_overrides.stage2_gain1;
+    }
+    if (item_overrides.stage2_gain2.has_value()) {
+      effective.stage2_gain2 = item_overrides.stage2_gain2;
+    }
+    if (item_overrides.stage2_gain3.has_value()) {
+      effective.stage2_gain3 = item_overrides.stage2_gain3;
+    }
+    if (item_overrides.stage3_radius.has_value()) {
+      effective.stage3_radius = item_overrides.stage3_radius;
+    }
+    if (item_overrides.stage3_gain.has_value()) {
+      effective.stage3_gain = item_overrides.stage3_gain;
+    }
+    return effective;
+  }
+
+  void LoadAppSettings() {
+    wxConfigBase* config = wxConfigBase::Get(false);
+    if (config == nullptr) {
+      return;
+    }
+
+    wxString compression_text;
+    if (config->Read("ui/compression", &compression_text)) {
+      HiracoCompression loaded = compression_;
+      if (ParseCompressionString(compression_text.ToStdString(), &loaded)) {
+        compression_ = loaded;
+      }
+    }
+
+    long output_mode = 0;
+    if (config->Read("ui/output_mode", &output_mode)) {
+      output_location_mode_ = output_mode == 1
+                                  ? OutputLocationMode::kRelativeToOriginal
+                                  : OutputLocationMode::kSpecificDirectory;
+    }
+
+    wxString output_dir;
+    if (config->Read("ui/output_dir", &output_dir) && !output_dir.empty()) {
+      base_output_dir_ = PathFromWxString(output_dir);
+    }
+
+    wxString relative_subdir;
+    if (config->Read("ui/relative_subdir", &relative_subdir)) {
+      relative_subdir_ = PathFromWxString(relative_subdir);
+    }
+
+    double double_value = 0.0;
+    if (config->Read("ui/stage1_nsr", &double_value)) {
+      app_stage_defaults_.stage1_nsr = static_cast<float>(double_value);
+    }
+    if (config->Read("ui/stage2_denoise", &double_value)) {
+      app_stage_defaults_.stage2_denoise = static_cast<float>(double_value);
+    }
+    if (config->Read("ui/stage2_gain0", &double_value)) {
+      app_stage_defaults_.stage2_gain0 = static_cast<float>(double_value);
+    }
+    if (config->Read("ui/stage2_gain1", &double_value)) {
+      app_stage_defaults_.stage2_gain1 = static_cast<float>(double_value);
+    }
+    if (config->Read("ui/stage2_gain2", &double_value)) {
+      app_stage_defaults_.stage2_gain2 = static_cast<float>(double_value);
+    }
+    if (config->Read("ui/stage2_gain3", &double_value)) {
+      app_stage_defaults_.stage2_gain3 = static_cast<float>(double_value);
+    }
+    long int_value = 0;
+    if (config->Read("ui/stage3_radius", &int_value)) {
+      app_stage_defaults_.stage3_radius = static_cast<int>(int_value);
+    }
+    if (config->Read("ui/stage3_gain", &double_value)) {
+      app_stage_defaults_.stage3_gain = static_cast<float>(double_value);
+    }
+  }
+
+  void SaveAppSettings() const {
+    wxConfigBase* config = wxConfigBase::Get(false);
+    if (config == nullptr) {
+      return;
+    }
+
+    config->Write("ui/compression", wxString::FromUTF8(ToCompressionString(compression_)));
+    config->Write("ui/output_mode", output_location_mode_ == OutputLocationMode::kRelativeToOriginal ? 1L : 0L);
+    config->Write("ui/output_dir", WxStringFromPath(base_output_dir_));
+    config->Write("ui/relative_subdir", WxStringFromPath(relative_subdir_));
+
+    if (app_stage_defaults_.stage1_nsr.has_value()) {
+      config->Write("ui/stage1_nsr", static_cast<double>(*app_stage_defaults_.stage1_nsr));
+    }
+    if (app_stage_defaults_.stage2_denoise.has_value()) {
+      config->Write("ui/stage2_denoise", static_cast<double>(*app_stage_defaults_.stage2_denoise));
+    }
+    if (app_stage_defaults_.stage2_gain0.has_value()) {
+      config->Write("ui/stage2_gain0", static_cast<double>(*app_stage_defaults_.stage2_gain0));
+    }
+    if (app_stage_defaults_.stage2_gain1.has_value()) {
+      config->Write("ui/stage2_gain1", static_cast<double>(*app_stage_defaults_.stage2_gain1));
+    }
+    if (app_stage_defaults_.stage2_gain2.has_value()) {
+      config->Write("ui/stage2_gain2", static_cast<double>(*app_stage_defaults_.stage2_gain2));
+    }
+    if (app_stage_defaults_.stage2_gain3.has_value()) {
+      config->Write("ui/stage2_gain3", static_cast<double>(*app_stage_defaults_.stage2_gain3));
+    }
+    if (app_stage_defaults_.stage3_radius.has_value()) {
+      config->Write("ui/stage3_radius", static_cast<long>(*app_stage_defaults_.stage3_radius));
+    }
+    if (app_stage_defaults_.stage3_gain.has_value()) {
+      config->Write("ui/stage3_gain", static_cast<double>(*app_stage_defaults_.stage3_gain));
+    }
+    config->Flush();
+  }
+
+  void SaveAppSettingsFromControls() {
+    app_stage_defaults_.stage1_psf_sigma.reset();
+    app_stage_defaults_.stage1_nsr = static_cast<float>(SliderValue(stage1_nsr_));
+    app_stage_defaults_.stage2_denoise = static_cast<float>(SliderValue(stage2_denoise_));
+    app_stage_defaults_.stage2_gain0 = static_cast<float>(SliderValue(stage2_gain0_));
+    app_stage_defaults_.stage2_gain1 = static_cast<float>(SliderValue(stage2_gain1_));
+    app_stage_defaults_.stage2_gain2 = static_cast<float>(SliderValue(stage2_gain2_));
+    app_stage_defaults_.stage2_gain3 = static_cast<float>(SliderValue(stage2_gain3_));
+    app_stage_defaults_.stage3_radius = static_cast<int>(std::round(SliderValue(stage3_radius_)));
+    app_stage_defaults_.stage3_gain = static_cast<float>(SliderValue(stage3_gain_));
+    SaveAppSettings();
   }
 
   std::filesystem::path ResolveOutputPathForMode(const std::string& source_path) const {
@@ -2034,7 +2208,7 @@ class HiracoMainFrame final : public wxFrame {
     PreparedSource prepared = *item.prepared;
     const CropRect display_crop_rect = *current_crop_rect_;
     const CropRect crop_rect = MapDisplayCropToProcessingCrop(display_crop_rect, prepared);
-    const StageOverrideSet stage_overrides = item.stage_overrides;
+    const StageOverrideSet stage_overrides = ResolveEffectiveStageOverrides(item.stage_overrides);
     item.message = "Rendering crop preview";
     RefreshQueueRow(selected_row_);
     progress_gauge_->SetValue(0);
@@ -2209,13 +2383,15 @@ class HiracoMainFrame final : public wxFrame {
   }
 
   void OnOutputDirChanged(wxFileDirPickerEvent&) {
-    base_output_dir_ = output_dir_picker_->GetPath().ToStdString();
+    base_output_dir_ = PathFromWxString(output_dir_picker_->GetPath());
     RebuildTargetPaths();
+    SaveAppSettings();
   }
 
   void OnRelativeSubdirChanged(wxCommandEvent&) {
-    relative_subdir_ = relative_subdir_ctrl_->GetValue().ToStdString();
+    relative_subdir_ = PathFromWxString(relative_subdir_ctrl_->GetValue());
     RebuildTargetPaths();
+    SaveAppSettings();
   }
 
   void OnOutputModeChanged(wxCommandEvent&) {
@@ -2224,6 +2400,7 @@ class HiracoMainFrame final : public wxFrame {
                                 : OutputLocationMode::kRelativeToOriginal;
     UpdateOutputLocationControls();
     RebuildTargetPaths();
+    SaveAppSettings();
   }
 
   void RebuildTargetPaths() {
@@ -2248,6 +2425,7 @@ class HiracoMainFrame final : public wxFrame {
         compression_ = HiracoCompression::kDeflate;
         break;
     }
+    SaveAppSettings();
   }
 
   void OnZoomChanged(wxCommandEvent&) {
@@ -2270,36 +2448,50 @@ class HiracoMainFrame final : public wxFrame {
 
   void OnResetDefaults(wxCommandEvent&) {
     if (QueueItem* item = SelectedItem()) {
-      item->stage_overrides = StageOverrideSet();
+      item->stage_overrides = HardcodedSafeStageOverridesForItem(item);
+      RefreshQueueRow(selected_row_);
     }
     RefreshCropPreviewIfPossible();
+    SaveAppSettingsFromControls();
   }
 
   void OnResetStage1Defaults(wxCommandEvent&) {
+    QueueItem* item = SelectedItem();
     if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-      overrides->stage1_psf_sigma.reset();
-      overrides->stage1_nsr.reset();
+      const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
+      overrides->stage1_psf_sigma = safe.stage1_psf_sigma;
+      overrides->stage1_nsr = safe.stage1_nsr;
+      RefreshQueueRow(selected_row_);
     }
     RefreshCropPreviewIfPossible();
+    SaveAppSettingsFromControls();
   }
 
   void OnResetStage2Defaults(wxCommandEvent&) {
+    QueueItem* item = SelectedItem();
     if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-      overrides->stage2_denoise.reset();
-      overrides->stage2_gain0.reset();
-      overrides->stage2_gain1.reset();
-      overrides->stage2_gain2.reset();
-      overrides->stage2_gain3.reset();
+      const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
+      overrides->stage2_denoise = safe.stage2_denoise;
+      overrides->stage2_gain0 = safe.stage2_gain0;
+      overrides->stage2_gain1 = safe.stage2_gain1;
+      overrides->stage2_gain2 = safe.stage2_gain2;
+      overrides->stage2_gain3 = safe.stage2_gain3;
+      RefreshQueueRow(selected_row_);
     }
     RefreshCropPreviewIfPossible();
+    SaveAppSettingsFromControls();
   }
 
   void OnResetStage3Defaults(wxCommandEvent&) {
+    QueueItem* item = SelectedItem();
     if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-      overrides->stage3_radius.reset();
-      overrides->stage3_gain.reset();
+      const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
+      overrides->stage3_radius = safe.stage3_radius;
+      overrides->stage3_gain = safe.stage3_gain;
+      RefreshQueueRow(selected_row_);
     }
     RefreshCropPreviewIfPossible();
+    SaveAppSettingsFromControls();
   }
 
   void OnCopySettings(wxCommandEvent&) {
@@ -2309,7 +2501,7 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     copied_stage_overrides_ = MakeExplicitStageOverrides(
-        GetResolvedStageSettings(*item->prepared, item->stage_overrides));
+        GetResolvedStageSettings(*item->prepared, ResolveEffectiveStageOverrides(item->stage_overrides)));
     status_label_->SetLabel("Copied settings from selected file");
     UpdateButtons();
   }
@@ -2336,6 +2528,7 @@ class HiracoMainFrame final : public wxFrame {
 
     if (current_row_updated) {
       RefreshCropPreviewIfPossible();
+      SaveAppSettingsFromControls();
     }
 
     status_label_->SetLabel(wxString::Format("Pasted settings to %zu file%s",
@@ -2538,9 +2731,9 @@ class HiracoMainFrame final : public wxFrame {
         }
 
         DngWriteResult result = ConvertToDng(prepared,
-                                             item.target_path,
-                                             compression_,
-                                             item.stage_overrides,
+                     item.target_path,
+                     compression_,
+                     ResolveEffectiveStageOverrides(item.stage_overrides),
                                              {},
                                              [this, item_index, total = queue_snapshot.size(), item_id = item.id](const ProcessingProgress& progress) {
                                                auto* event = new wxThreadEvent(EVT_HIRACO_CONVERT_PROGRESS);
@@ -2684,6 +2877,7 @@ class HiracoMainFrame final : public wxFrame {
   std::vector<QueueItem> queue_;
   std::filesystem::path base_output_dir_;
   std::filesystem::path relative_subdir_;
+  StageOverrideSet app_stage_defaults_;
   OutputLocationMode output_location_mode_ = OutputLocationMode::kSpecificDirectory;
   HiracoCompression compression_ = HiracoCompression::kDeflate;
   std::optional<StageOverrideSet> copied_stage_overrides_;
@@ -2721,6 +2915,9 @@ bool HiracoDropTarget::OnDropFiles(wxCoord, wxCoord, const wxArrayString& filena
 class HiracoGuiApp final : public wxApp {
  public:
   bool OnInit() override {
+    SetVendorName("gorol");
+    SetAppName("hiraco");
+    wxConfigBase::Set(new wxConfig(GetAppName(), GetVendorName()));
     SetExitOnFrameDelete(true);
     auto* frame = new HiracoMainFrame();
     SetTopWindow(frame);
