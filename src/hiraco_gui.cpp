@@ -376,6 +376,26 @@ StageOverrideSet MakeExplicitStageOverrides(const ResolvedStageSettings& setting
   return overrides;
 }
 
+void SetFloatOverrideRelativeToBase(std::optional<float>* override_value,
+                                    float value,
+                                    float base_value) {
+  if (std::abs(value - base_value) <= 1e-6f) {
+    override_value->reset();
+    return;
+  }
+  *override_value = value;
+}
+
+void SetIntOverrideRelativeToBase(std::optional<int>* override_value,
+                                  int value,
+                                  int base_value) {
+  if (value == base_value) {
+    override_value->reset();
+    return;
+  }
+  *override_value = value;
+}
+
 wxBitmap MakeBitmapFromPreview(std::shared_ptr<const PreviewImage> preview) {
   if (!preview || preview->width == 0 || preview->height == 0 || preview->colors < 3) {
     return wxBitmap();
@@ -1101,14 +1121,18 @@ class HiracoMainFrame final : public wxFrame {
     right_sizer->Add(new wxStaticLine(right_panel), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
 
     auto* settings_action_row = new wxBoxSizer(wxHORIZONTAL);
-    reset_button_ = new wxButton(right_panel, wxID_ANY, "Restore File Defaults");
-    copy_settings_button_ = new wxButton(right_panel, wxID_ANY, "Copy Settings");
-    paste_settings_button_ = new wxButton(right_panel, wxID_ANY, "Paste to Selected");
+    reset_button_ = new wxButton(right_panel, wxID_ANY, "Reset file");
+    save_defaults_button_ = new wxButton(right_panel, wxID_ANY, "Save defaults");
+    copy_settings_button_ = new wxButton(right_panel, wxID_ANY, "Copy settings");
+    paste_settings_button_ = new wxButton(right_panel, wxID_ANY, "Paste settings");
+    reset_button_->SetToolTip("Reset the selected file to the built-in safe processing values.");
+    save_defaults_button_->SetToolTip("Save the current non-blur slider values as defaults for future files and launches.");
     copy_settings_button_->SetToolTip("Copy the current file's resolved processing settings.");
     paste_settings_button_->SetToolTip("Paste copied settings to all selected queue items.");
     settings_action_row->Add(reset_button_, 0, wxRIGHT, 8);
     settings_action_row->Add(copy_settings_button_, 0, wxRIGHT, 8);
-    settings_action_row->Add(paste_settings_button_, 0);
+    settings_action_row->Add(paste_settings_button_, 0, wxRIGHT, 8);
+    settings_action_row->Add(save_defaults_button_, 0);
     settings_action_row->AddStretchSpacer();
     right_sizer->Add(settings_action_row, 0, wxLEFT | wxRIGHT | wxTOP | wxEXPAND, 10);
 
@@ -1229,6 +1253,7 @@ class HiracoMainFrame final : public wxFrame {
     convert_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnConvert, this);
     cancel_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnCancel, this);
     reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetDefaults, this);
+    save_defaults_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnSaveDefaults, this);
     copy_settings_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnCopySettings, this);
     paste_settings_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnPasteSettings, this);
     stage1_reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetStage1Defaults, this);
@@ -1259,49 +1284,76 @@ class HiracoMainFrame final : public wxFrame {
     });
 
     BindSlider(stage1_sigma_, [this](double value) {
-      if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-        overrides->stage1_psf_sigma = static_cast<float>(value);
-      }
+      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
+                                          const ResolvedStageSettings& base_settings) {
+        SetFloatOverrideRelativeToBase(&overrides.stage1_psf_sigma,
+                                       static_cast<float>(value),
+                                       base_settings.stage1_psf_sigma);
+      });
     });
     BindSlider(stage1_nsr_, [this](double value) {
-      if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-        overrides->stage1_nsr = static_cast<float>(value);
-      }
+      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
+                                          const ResolvedStageSettings& base_settings) {
+        SetFloatOverrideRelativeToBase(&overrides.stage1_nsr,
+                                       static_cast<float>(value),
+                                       base_settings.stage1_nsr);
+      });
     });
     BindSlider(stage2_denoise_, [this](double value) {
-      if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-        overrides->stage2_denoise = static_cast<float>(value);
-      }
+      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
+                                          const ResolvedStageSettings& base_settings) {
+        SetFloatOverrideRelativeToBase(&overrides.stage2_denoise,
+                                       static_cast<float>(value),
+                                       base_settings.stage2_denoise);
+      });
     });
     BindSlider(stage2_gain0_, [this](double value) {
-      if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-        overrides->stage2_gain0 = static_cast<float>(value);
-      }
+      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
+                                          const ResolvedStageSettings& base_settings) {
+        SetFloatOverrideRelativeToBase(&overrides.stage2_gain0,
+                                       static_cast<float>(value),
+                                       base_settings.stage2_gain0);
+      });
     });
     BindSlider(stage2_gain1_, [this](double value) {
-      if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-        overrides->stage2_gain1 = static_cast<float>(value);
-      }
+      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
+                                          const ResolvedStageSettings& base_settings) {
+        SetFloatOverrideRelativeToBase(&overrides.stage2_gain1,
+                                       static_cast<float>(value),
+                                       base_settings.stage2_gain1);
+      });
     });
     BindSlider(stage2_gain2_, [this](double value) {
-      if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-        overrides->stage2_gain2 = static_cast<float>(value);
-      }
+      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
+                                          const ResolvedStageSettings& base_settings) {
+        SetFloatOverrideRelativeToBase(&overrides.stage2_gain2,
+                                       static_cast<float>(value),
+                                       base_settings.stage2_gain2);
+      });
     });
     BindSlider(stage2_gain3_, [this](double value) {
-      if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-        overrides->stage2_gain3 = static_cast<float>(value);
-      }
+      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
+                                          const ResolvedStageSettings& base_settings) {
+        SetFloatOverrideRelativeToBase(&overrides.stage2_gain3,
+                                       static_cast<float>(value),
+                                       base_settings.stage2_gain3);
+      });
     });
     BindSlider(stage3_radius_, [this](double value) {
-      if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-        overrides->stage3_radius = static_cast<int>(std::round(value));
-      }
+      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
+                                          const ResolvedStageSettings& base_settings) {
+        SetIntOverrideRelativeToBase(&overrides.stage3_radius,
+                                     static_cast<int>(std::round(value)),
+                                     base_settings.stage3_radius);
+      });
     });
     BindSlider(stage3_gain_, [this](double value) {
-      if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-        overrides->stage3_gain = static_cast<float>(value);
-      }
+      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
+                                          const ResolvedStageSettings& base_settings) {
+        SetFloatOverrideRelativeToBase(&overrides.stage3_gain,
+                                       static_cast<float>(value),
+                                       base_settings.stage3_gain);
+      });
     });
   }
 
@@ -1328,6 +1380,81 @@ class HiracoMainFrame final : public wxFrame {
 
   StageOverrideSet HardcodedSafeStageOverridesForItem(const QueueItem* item) const {
     return MakeExplicitStageOverrides(HardcodedSafeStageSettingsForItem(item));
+  }
+
+  ResolvedStageSettings BaseStageSettingsForItem(const QueueItem* item) const {
+    if (item != nullptr && item->prepared.has_value()) {
+      return GetResolvedStageSettings(*item->prepared, app_stage_defaults_);
+    }
+    return ResolveDisplayStageSettings(app_stage_defaults_);
+  }
+
+  void NormalizeStageOverrides(QueueItem* item) {
+    if (item == nullptr) {
+      return;
+    }
+
+    const ResolvedStageSettings base_settings = BaseStageSettingsForItem(item);
+    if (item->stage_overrides.stage1_psf_sigma.has_value()) {
+      SetFloatOverrideRelativeToBase(&item->stage_overrides.stage1_psf_sigma,
+                                     *item->stage_overrides.stage1_psf_sigma,
+                                     base_settings.stage1_psf_sigma);
+    }
+    if (item->stage_overrides.stage1_nsr.has_value()) {
+      SetFloatOverrideRelativeToBase(&item->stage_overrides.stage1_nsr,
+                                     *item->stage_overrides.stage1_nsr,
+                                     base_settings.stage1_nsr);
+    }
+    if (item->stage_overrides.stage2_denoise.has_value()) {
+      SetFloatOverrideRelativeToBase(&item->stage_overrides.stage2_denoise,
+                                     *item->stage_overrides.stage2_denoise,
+                                     base_settings.stage2_denoise);
+    }
+    if (item->stage_overrides.stage2_gain0.has_value()) {
+      SetFloatOverrideRelativeToBase(&item->stage_overrides.stage2_gain0,
+                                     *item->stage_overrides.stage2_gain0,
+                                     base_settings.stage2_gain0);
+    }
+    if (item->stage_overrides.stage2_gain1.has_value()) {
+      SetFloatOverrideRelativeToBase(&item->stage_overrides.stage2_gain1,
+                                     *item->stage_overrides.stage2_gain1,
+                                     base_settings.stage2_gain1);
+    }
+    if (item->stage_overrides.stage2_gain2.has_value()) {
+      SetFloatOverrideRelativeToBase(&item->stage_overrides.stage2_gain2,
+                                     *item->stage_overrides.stage2_gain2,
+                                     base_settings.stage2_gain2);
+    }
+    if (item->stage_overrides.stage2_gain3.has_value()) {
+      SetFloatOverrideRelativeToBase(&item->stage_overrides.stage2_gain3,
+                                     *item->stage_overrides.stage2_gain3,
+                                     base_settings.stage2_gain3);
+    }
+    if (item->stage_overrides.stage3_radius.has_value()) {
+      SetIntOverrideRelativeToBase(&item->stage_overrides.stage3_radius,
+                                   *item->stage_overrides.stage3_radius,
+                                   base_settings.stage3_radius);
+    }
+    if (item->stage_overrides.stage3_gain.has_value()) {
+      SetFloatOverrideRelativeToBase(&item->stage_overrides.stage3_gain,
+                                     *item->stage_overrides.stage3_gain,
+                                     base_settings.stage3_gain);
+    }
+  }
+
+  void UpdateSelectedStageOverrides(
+      const std::function<void(StageOverrideSet&, const ResolvedStageSettings&)>& update) {
+    QueueItem* item = SelectedItem();
+    if (item == nullptr) {
+      return;
+    }
+
+    const ResolvedStageSettings base_settings = BaseStageSettingsForItem(item);
+    update(item->stage_overrides, base_settings);
+    NormalizeStageOverrides(item);
+    if (selected_row_ >= 0) {
+      RefreshQueueRow(selected_row_);
+    }
   }
 
   void UpdateResolvedSliderValues() {
@@ -1577,7 +1704,6 @@ class HiracoMainFrame final : public wxFrame {
       UpdateSliderLabel(control);
       if (!updating_sliders_) {
         on_change(value);
-        SaveAppSettingsFromControls();
         ScheduleCropPreview(debounce);
       }
     };
@@ -1868,6 +1994,7 @@ class HiracoMainFrame final : public wxFrame {
       convert_button_->Enable(false);
       cancel_button_->Enable(false);
       reset_button_->Enable(false);
+      save_defaults_button_->Enable(false);
       copy_settings_button_->Enable(false);
       paste_settings_button_->Enable(false);
       stage1_reset_button_->Enable(false);
@@ -1897,6 +2024,7 @@ class HiracoMainFrame final : public wxFrame {
     convert_button_->Enable(!queue_.empty() && !conversion_running_);
     cancel_button_->Enable(conversion_running_);
     reset_button_->Enable(has_selection && !conversion_running_);
+    save_defaults_button_->Enable(has_selection && !conversion_running_);
     stage1_reset_button_->Enable(has_selection && !conversion_running_);
     stage2_reset_button_->Enable(has_selection && !conversion_running_);
     stage3_reset_button_->Enable(has_selection && !conversion_running_);
@@ -2449,10 +2577,24 @@ class HiracoMainFrame final : public wxFrame {
   void OnResetDefaults(wxCommandEvent&) {
     if (QueueItem* item = SelectedItem()) {
       item->stage_overrides = HardcodedSafeStageOverridesForItem(item);
+      NormalizeStageOverrides(item);
       RefreshQueueRow(selected_row_);
     }
     RefreshCropPreviewIfPossible();
+  }
+
+  void OnSaveDefaults(wxCommandEvent&) {
+    if (SelectedItem() == nullptr) {
+      return;
+    }
+
     SaveAppSettingsFromControls();
+    for (QueueItem& item : queue_) {
+      NormalizeStageOverrides(&item);
+    }
+    RefreshQueue();
+    UpdateResolvedSliderValues();
+    status_label_->SetLabel("Saved current defaults");
   }
 
   void OnResetStage1Defaults(wxCommandEvent&) {
@@ -2461,10 +2603,10 @@ class HiracoMainFrame final : public wxFrame {
       const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
       overrides->stage1_psf_sigma = safe.stage1_psf_sigma;
       overrides->stage1_nsr = safe.stage1_nsr;
+      NormalizeStageOverrides(item);
       RefreshQueueRow(selected_row_);
     }
     RefreshCropPreviewIfPossible();
-    SaveAppSettingsFromControls();
   }
 
   void OnResetStage2Defaults(wxCommandEvent&) {
@@ -2476,10 +2618,10 @@ class HiracoMainFrame final : public wxFrame {
       overrides->stage2_gain1 = safe.stage2_gain1;
       overrides->stage2_gain2 = safe.stage2_gain2;
       overrides->stage2_gain3 = safe.stage2_gain3;
+      NormalizeStageOverrides(item);
       RefreshQueueRow(selected_row_);
     }
     RefreshCropPreviewIfPossible();
-    SaveAppSettingsFromControls();
   }
 
   void OnResetStage3Defaults(wxCommandEvent&) {
@@ -2488,10 +2630,10 @@ class HiracoMainFrame final : public wxFrame {
       const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
       overrides->stage3_radius = safe.stage3_radius;
       overrides->stage3_gain = safe.stage3_gain;
+      NormalizeStageOverrides(item);
       RefreshQueueRow(selected_row_);
     }
     RefreshCropPreviewIfPossible();
-    SaveAppSettingsFromControls();
   }
 
   void OnCopySettings(wxCommandEvent&) {
@@ -2522,13 +2664,13 @@ class HiracoMainFrame final : public wxFrame {
         continue;
       }
       queue_[row].stage_overrides = *copied_stage_overrides_;
+      NormalizeStageOverrides(&queue_[row]);
       RefreshQueueRow(row);
       current_row_updated = current_row_updated || row == selected_row_;
     }
 
     if (current_row_updated) {
       RefreshCropPreviewIfPossible();
-      SaveAppSettingsFromControls();
     }
 
     status_label_->SetLabel(wxString::Format("Pasted settings to %zu file%s",
@@ -2838,6 +2980,7 @@ class HiracoMainFrame final : public wxFrame {
   wxButton* clear_button_ = nullptr;
   wxButton* queue_view_toggle_button_ = nullptr;
   wxButton* reset_button_ = nullptr;
+  wxButton* save_defaults_button_ = nullptr;
   wxButton* copy_settings_button_ = nullptr;
   wxButton* paste_settings_button_ = nullptr;
   wxButton* stage1_reset_button_ = nullptr;
