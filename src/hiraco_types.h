@@ -126,7 +126,7 @@ struct ResolvedStageSettings {
   float stage2_gain2 = 1.3f;
   float stage2_gain3 = 1.1f;
   int stage3_radius = 2;
-  float stage3_gain = 2.0f;
+  float stage3_gain = 1.0f;
 };
 
 struct RasterImage {
