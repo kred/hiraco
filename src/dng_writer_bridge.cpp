@@ -9,6 +9,7 @@
 #include "dng_abort_sniffer.h"
 #include "dng_camera_profile.h"
 #include "dng_exceptions.h"
+#include "dng_exif.h"
 #include "dng_file_stream.h"
 #include "dng_host.h"
 #include "dng_image.h"
@@ -191,8 +192,6 @@ void SaveFftwWisdom() {
     fftw_export_wisdom_to_filename(path.c_str());
   }
 }
-
-
 
 double RawDomainBlackLevel(const LibRaw& processor) {
   const unsigned black = processor.imgdata.color.black;
@@ -859,9 +858,8 @@ bool ShouldUseOm3AdobeMetadata(const SourceLinearDngMetadata& metadata,
 
 double SourceDrivenBaselineExposure(const SourceLinearDngMetadata& metadata,
                                     const RasterImage& image) {
-  if (ShouldApplyOm3SourceDrivenLinearTransform(metadata, image) && metadata.has_black_level) {
-    return 0.37;
-  }
+  (void)metadata;
+  (void)image;
   return 0.0;
 }
 
@@ -1001,6 +999,7 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   const uint32_t height = image->height;
   const uint32_t colors = image->colors;
   const size_t pixel_count = static_cast<size_t>(width) * height;
+  const double stage1_nsr = settings.stage1_nsr;
 
   if (colors != 3) {
     return true;
@@ -1038,6 +1037,102 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   constexpr size_t kRobustStatSampleTarget = 1u << 16;
 
   std::vector<double> confidence(pixel_count);
+  std::vector<double> signal_weight(pixel_count, 1.0);
+  std::vector<double> enhancement_weight(pixel_count, 1.0);
+
+  std::vector<uint32_t> row_prev1(height, 0);
+  std::vector<uint32_t> row_next1(height, 0);
+  for (uint32_t row = 0; row < height; ++row) {
+    row_prev1[row] = row > 0 ? row - 1 : 0;
+    row_next1[row] = row + 1 < height ? row + 1 : height - 1;
+  }
+  std::vector<uint32_t> col_prev1(width, 0);
+  std::vector<uint32_t> col_next1(width, 0);
+  for (uint32_t col = 0; col < width; ++col) {
+    col_prev1[col] = col > 0 ? col - 1 : 0;
+    col_next1[col] = col + 1 < width ? col + 1 : width - 1;
+  }
+
+  auto blur3 = [&](const std::vector<double>& src,
+                   std::vector<double>& dst,
+                   std::vector<double>* scratch) {
+    if (scratch == nullptr) {
+      return;
+    }
+    scratch->resize(pixel_count);
+    std::vector<double>& tmp = *scratch;
+
+    #pragma omp parallel for schedule(static) if(height > 100)
+    for (uint32_t row = 0; row < height; ++row) {
+      const size_t row_off = static_cast<size_t>(row) * width;
+      for (uint32_t col = 0; col < width; ++col) {
+        const uint32_t c0 = col_prev1[col];
+        const uint32_t c2 = col_next1[col];
+        tmp[row_off + col] = 0.25 * src[row_off + c0] +
+                             0.50 * src[row_off + col] +
+                             0.25 * src[row_off + c2];
+      }
+    }
+
+    #pragma omp parallel for schedule(static) if(height > 100)
+    for (uint32_t row = 0; row < height; ++row) {
+      const uint32_t r0 = row_prev1[row];
+      const uint32_t r2 = row_next1[row];
+      const size_t row_off = static_cast<size_t>(row) * width;
+      for (uint32_t col = 0; col < width; ++col) {
+        dst[row_off + col] = 0.25 * tmp[static_cast<size_t>(r0) * width + col] +
+                             0.50 * tmp[row_off + col] +
+                             0.25 * tmp[static_cast<size_t>(r2) * width + col];
+      }
+    }
+  };
+
+  auto blur3_pair = [&](const std::vector<double>& src_a,
+                        const std::vector<double>& src_b,
+                        std::vector<double>& dst_a,
+                        std::vector<double>& dst_b,
+                        std::vector<double>* scratch_a,
+                        std::vector<double>* scratch_b) {
+    if (scratch_a == nullptr || scratch_b == nullptr) {
+      return;
+    }
+    scratch_a->resize(pixel_count);
+    scratch_b->resize(pixel_count);
+    std::vector<double>& tmp_a = *scratch_a;
+    std::vector<double>& tmp_b = *scratch_b;
+
+    #pragma omp parallel for schedule(static) if(height > 100)
+    for (uint32_t row = 0; row < height; ++row) {
+      const size_t row_off = static_cast<size_t>(row) * width;
+      for (uint32_t col = 0; col < width; ++col) {
+        const uint32_t c0 = col_prev1[col];
+        const uint32_t c2 = col_next1[col];
+        tmp_a[row_off + col] = 0.25 * src_a[row_off + c0] +
+                               0.50 * src_a[row_off + col] +
+                               0.25 * src_a[row_off + c2];
+        tmp_b[row_off + col] = 0.25 * src_b[row_off + c0] +
+                               0.50 * src_b[row_off + col] +
+                               0.25 * src_b[row_off + c2];
+      }
+    }
+
+    #pragma omp parallel for schedule(static) if(height > 100)
+    for (uint32_t row = 0; row < height; ++row) {
+      const uint32_t r0 = row_prev1[row];
+      const uint32_t r2 = row_next1[row];
+      const size_t row_off = static_cast<size_t>(row) * width;
+      const size_t row0_off = static_cast<size_t>(r0) * width;
+      const size_t row2_off = static_cast<size_t>(r2) * width;
+      for (uint32_t col = 0; col < width; ++col) {
+        dst_a[row_off + col] = 0.25 * tmp_a[row0_off + col] +
+                               0.50 * tmp_a[row_off + col] +
+                               0.25 * tmp_a[row2_off + col];
+        dst_b[row_off + col] = 0.25 * tmp_b[row0_off + col] +
+                               0.50 * tmp_b[row_off + col] +
+                               0.25 * tmp_b[row2_off + col];
+      }
+    }
+  };
 
   auto approximate_median_from_samples = [&](size_t sample_target, const auto& sample_value) {
     const size_t desired_samples = std::min(pixel_count, std::max<size_t>(sample_target, 1));
@@ -1062,100 +1157,6 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
       cfa_guide_image->colors == 4;
 
   if (cfa_ok) {
-    std::vector<uint32_t> row_prev1(height, 0);
-    std::vector<uint32_t> row_next1(height, 0);
-    for (uint32_t row = 0; row < height; ++row) {
-      row_prev1[row] = row > 0 ? row - 1 : 0;
-      row_next1[row] = row + 1 < height ? row + 1 : height - 1;
-    }
-    std::vector<uint32_t> col_prev1(width, 0);
-    std::vector<uint32_t> col_next1(width, 0);
-    for (uint32_t col = 0; col < width; ++col) {
-      col_prev1[col] = col > 0 ? col - 1 : 0;
-      col_next1[col] = col + 1 < width ? col + 1 : width - 1;
-    }
-
-    auto blur3 = [&](const std::vector<double>& src,
-                     std::vector<double>& dst,
-                     std::vector<double>* scratch) {
-      if (scratch == nullptr) {
-        return;
-      }
-      scratch->resize(pixel_count);
-      std::vector<double>& tmp = *scratch;
-
-      #pragma omp parallel for schedule(static) if(height > 100)
-      for (uint32_t row = 0; row < height; ++row) {
-        const size_t row_off = static_cast<size_t>(row) * width;
-        for (uint32_t col = 0; col < width; ++col) {
-          const uint32_t c0 = col_prev1[col];
-          const uint32_t c2 = col_next1[col];
-          tmp[row_off + col] = 0.25 * src[row_off + c0] +
-                               0.50 * src[row_off + col] +
-                               0.25 * src[row_off + c2];
-        }
-      }
-
-      #pragma omp parallel for schedule(static) if(height > 100)
-      for (uint32_t row = 0; row < height; ++row) {
-        const uint32_t r0 = row_prev1[row];
-        const uint32_t r2 = row_next1[row];
-        const size_t row_off = static_cast<size_t>(row) * width;
-        for (uint32_t col = 0; col < width; ++col) {
-          dst[row_off + col] = 0.25 * tmp[static_cast<size_t>(r0) * width + col] +
-                               0.50 * tmp[row_off + col] +
-                               0.25 * tmp[static_cast<size_t>(r2) * width + col];
-        }
-      }
-    };
-
-    auto blur3_pair = [&](const std::vector<double>& src_a,
-                          const std::vector<double>& src_b,
-                          std::vector<double>& dst_a,
-                          std::vector<double>& dst_b,
-                          std::vector<double>* scratch_a,
-                          std::vector<double>* scratch_b) {
-      if (scratch_a == nullptr || scratch_b == nullptr) {
-        return;
-      }
-      scratch_a->resize(pixel_count);
-      scratch_b->resize(pixel_count);
-      std::vector<double>& tmp_a = *scratch_a;
-      std::vector<double>& tmp_b = *scratch_b;
-
-      #pragma omp parallel for schedule(static) if(height > 100)
-      for (uint32_t row = 0; row < height; ++row) {
-        const size_t row_off = static_cast<size_t>(row) * width;
-        for (uint32_t col = 0; col < width; ++col) {
-          const uint32_t c0 = col_prev1[col];
-          const uint32_t c2 = col_next1[col];
-          tmp_a[row_off + col] = 0.25 * src_a[row_off + c0] +
-                                 0.50 * src_a[row_off + col] +
-                                 0.25 * src_a[row_off + c2];
-          tmp_b[row_off + col] = 0.25 * src_b[row_off + c0] +
-                                 0.50 * src_b[row_off + col] +
-                                 0.25 * src_b[row_off + c2];
-        }
-      }
-
-      #pragma omp parallel for schedule(static) if(height > 100)
-      for (uint32_t row = 0; row < height; ++row) {
-        const uint32_t r0 = row_prev1[row];
-        const uint32_t r2 = row_next1[row];
-        const size_t row_off = static_cast<size_t>(row) * width;
-        const size_t row0_off = static_cast<size_t>(r0) * width;
-        const size_t row2_off = static_cast<size_t>(r2) * width;
-        for (uint32_t col = 0; col < width; ++col) {
-          dst_a[row_off + col] = 0.25 * tmp_a[row0_off + col] +
-                                 0.50 * tmp_a[row_off + col] +
-                                 0.25 * tmp_a[row2_off + col];
-          dst_b[row_off + col] = 0.25 * tmp_b[row0_off + col] +
-                                 0.50 * tmp_b[row_off + col] +
-                                 0.25 * tmp_b[row2_off + col];
-        }
-      }
-    };
-
     std::vector<double> green_split(pixel_count);
     std::vector<double> green_mean(pixel_count);
     #pragma omp parallel for schedule(static) if(pixel_count > 100000)
@@ -1163,20 +1164,39 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
       const size_t px = i * cfa_guide_image->colors;
       const double green_a = cfa_guide_image->pixels[px + 1];
       const double green_b = cfa_guide_image->pixels[px + 3];
-      green_split[i] = std::abs(green_a - green_b);
-      green_mean[i] = 0.5 * (green_a + green_b);
+      green_split[i] = green_a;
+      green_mean[i] = green_b;
     }
 
     std::vector<double> smooth_split(pixel_count);
     std::vector<double> smooth_green(pixel_count);
     std::vector<double> blur_scratch_a(pixel_count);
     std::vector<double> blur_scratch_b(pixel_count);
+
+    // Smooth the two green-phase estimates before differencing so the
+    // confidence mask tracks regional disagreement, not interpolation-phase
+    // stipple from the CFA guide construction.
     blur3_pair(green_split,
-           green_mean,
-           smooth_split,
-           smooth_green,
-           &blur_scratch_a,
-           &blur_scratch_b);
+               green_mean,
+               smooth_split,
+               smooth_green,
+               &blur_scratch_a,
+               &blur_scratch_b);
+
+    #pragma omp parallel for schedule(static) if(pixel_count > 100000)
+    for (size_t i = 0; i < pixel_count; ++i) {
+      const double phase_a = smooth_split[i];
+      const double phase_b = smooth_green[i];
+      green_split[i] = std::abs(phase_a - phase_b);
+      green_mean[i] = 0.5 * (phase_a + phase_b);
+    }
+
+    blur3_pair(green_split,
+               green_mean,
+               smooth_split,
+               smooth_green,
+               &blur_scratch_a,
+               &blur_scratch_b);
 
     const double median_residual = approximate_median_from_samples(
         kRobustStatSampleTarget,
@@ -1196,14 +1216,43 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
       confidence[i] = std::clamp(atten, 0.15, 1.0);
     }
 
-    // Suppress single-pixel mask speckle.
+    const double black_level = metadata.has_black_level ? metadata.black_level : 0.0;
+    const double white_level = metadata.has_white_level ? metadata.white_level : 65535.0;
+    const double signal_range = std::max(white_level - black_level, 1024.0);
+    #pragma omp parallel for schedule(static) if(pixel_count > 100000)
+    for (size_t i = 0; i < pixel_count; ++i) {
+      const double normalized_signal = std::clamp(
+          (smooth_green[i] - black_level) / signal_range,
+          0.0,
+          1.0);
+      const double lifted_signal = std::clamp((normalized_signal - 0.02) / 0.10, 0.0, 1.0);
+      signal_weight[i] = 0.35 + 0.65 * std::sqrt(lifted_signal);
+    }
+
+    // Keep the Stage 1 gate regional rather than phase-locked to CFA speckle.
+    // A wider low-pass removes the faint dotted mask pattern that can
+    // otherwise survive into blend_weight in smooth sky.
+    constexpr int kConfidenceBlurPasses = 4;
     std::vector<double> smooth_conf;
     smooth_conf.swap(green_mean);
     smooth_conf.resize(pixel_count);
-    blur3(confidence, smooth_conf, &blur_scratch_a);
-    blur3(smooth_conf, confidence, &blur_scratch_a);
+    for (int pass = 0; pass < kConfidenceBlurPasses; ++pass) {
+      if ((pass & 1) == 0) {
+        blur3(confidence, smooth_conf, &blur_scratch_a);
+      } else {
+        blur3(smooth_conf, confidence, &blur_scratch_a);
+      }
+    }
+    if ((kConfidenceBlurPasses & 1) != 0) {
+      confidence.swap(smooth_conf);
+    }
   } else {
     std::fill(confidence.begin(), confidence.end(), 1.0);
+  }
+
+  #pragma omp parallel for schedule(static) if(pixel_count > 100000)
+  for (size_t i = 0; i < pixel_count; ++i) {
+    enhancement_weight[i] = confidence[i] * signal_weight[i];
   }
 
   hiraco::LogTiming("enhance", "Stage 0 prepare luma", std::chrono::steady_clock::now() - stage0_start);
@@ -1352,9 +1401,33 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
             }
           }
 
-          #pragma omp parallel for schedule(static) if(pixel_count > 100000)
-          for (size_t i = 0; i < pixel_count; ++i) {
-            luma[i] = base_luma[i] + confidence[i] * (luma[i] - base_luma[i]);
+          if (cfa_ok) {
+            std::vector<double> residual(pixel_count, 0.0);
+            #pragma omp parallel for schedule(static) if(pixel_count > 100000)
+            for (size_t i = 0; i < pixel_count; ++i) {
+              residual[i] = luma[i] - base_luma[i];
+            }
+
+            std::vector<double> smooth_residual(pixel_count, 0.0);
+            std::vector<double> residual_scratch(pixel_count, 0.0);
+            blur3(residual, smooth_residual, &residual_scratch);
+
+            const double residual_smoothing = std::clamp(3.0 * stage1_nsr, 0.0, 0.6);
+            #pragma omp parallel for schedule(static) if(pixel_count > 100000)
+            for (size_t i = 0; i < pixel_count; ++i) {
+              const double blend_confidence = enhancement_weight[i];
+              const double suspicious = 1.0 - blend_confidence;
+              const double mix = std::clamp(residual_smoothing * suspicious, 0.0, 1.0);
+              const double high_frequency_residual = residual[i] - smooth_residual[i];
+              const double filtered_residual =
+                  (1.0 - mix) * residual[i] + mix * smooth_residual[i];
+              luma[i] = base_luma[i] + blend_confidence * filtered_residual;
+            }
+          } else {
+            #pragma omp parallel for schedule(static) if(pixel_count > 100000)
+            for (size_t i = 0; i < pixel_count; ++i) {
+              luma[i] = base_luma[i] + confidence[i] * (luma[i] - base_luma[i]);
+            }
           }
         }
       }
@@ -1439,7 +1512,7 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
           else
             detail = 0.0;
 
-          detail_accum[i] += extra_gain * confidence[i] * detail;
+          detail_accum[i] += extra_gain * enhancement_weight[i] * detail;
         }
       }
 
@@ -1471,7 +1544,7 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
 
     // Halide AOT: guided filter with adaptive gain.
     Halide::Runtime::Buffer<double> luma_buf(luma.data(), width, height);
-    Halide::Runtime::Buffer<double> conf_buf(confidence.data(), width, height);
+    Halide::Runtime::Buffer<double> conf_buf(enhancement_weight.data(), width, height);
     std::vector<double> gf_output(pixel_count);
     Halide::Runtime::Buffer<double> result_buf(gf_output.data(), width, height);
     hiraco_guided_filter(luma_buf, conf_buf, gf_radius, kGfEps, gf_gain,
@@ -3033,7 +3106,8 @@ void PopulateLinearRawNegative(dng_host& host,
                                const std::string& source_path,
                                const RasterImage& raw_image,
                                const SourceLinearDngMetadata& metadata,
-                               dng_negative& negative) {
+                               dng_negative& negative,
+                               double preview_auto_bright_gain) {
   const std::string model_name = metadata.unique_camera_model.empty() ? "hiraco" : metadata.unique_camera_model;
   const std::string local_name = metadata.model.empty() ? "hiraco" : metadata.model;
 
@@ -3059,8 +3133,27 @@ void PopulateLinearRawNegative(dng_host& host,
     negative.SetBlackLevel(0.0);
   }
   negative.SetWhiteLevel((1u << raw_image.bits) - 1);
-  negative.SetBaselineExposure(SourceDrivenBaselineExposure(metadata, raw_image));
+  negative.SetBaselineExposure(std::log2(std::max(preview_auto_bright_gain, 1e-6)));
   negative.SetLinearResponseLimit(1.0);
+
+  if (dng_exif* exif = negative.GetExif()) {
+    if (!metadata.make.empty()) {
+      exif->fMake.Set(metadata.make.c_str());
+    }
+    if (!metadata.model.empty()) {
+      exif->fModel.Set(metadata.model.c_str());
+    }
+    if (metadata.has_exif_iso) {
+      exif->fISOSpeedRatings[0] = static_cast<uint32_t>(metadata.exif_iso);
+    }
+    if (metadata.has_exif_shutter_speed) {
+      exif->SetExposureTime(metadata.exif_shutter_speed, true);
+    }
+    if (metadata.has_exif_aperture) {
+      exif->SetFNumber(metadata.exif_aperture);
+    }
+  }
+
   negative.UpdateDateTimeToNow();
 
   dng_vector analog_balance(raw_image.colors);
@@ -3260,6 +3353,7 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
   cache->cfa_guide_image = RasterImage();
   cache->raw_image_is_camera_space = false;
   cache->preview_auto_bright_gain = 1.0;
+  EstimatePreviewAutoBrightGainFromRaw(source_path, metadata, libraw_overrides, &cache->preview_auto_bright_gain, nullptr);
   cache->source_width = source_width;
   cache->source_height = source_height;
   cache->region_origin_x = 0;
@@ -3509,6 +3603,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const StageOverrideSet& stage_overrides,
                                      const LibRawOverrideSet& libraw_overrides,
                                      std::shared_ptr<const PreviewImage> preview_override,
+                                     double preview_auto_bright_gain,
                                      ProgressCallback progress,
                                      CancelCheck cancel) {
   const hiraco::ScopedTimingLog convert_timer("convert", "Write linear DNG from raw");
@@ -3627,7 +3722,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     ConfigureHost(host, compression);
 
     AutoPtr<dng_negative> negative(host.Make_dng_negative());
-    PopulateLinearRawNegative(host, source_path, payload.raw_image, metadata, *negative.Get());
+    PopulateLinearRawNegative(host, source_path, payload.raw_image, metadata, *negative.Get(), preview_auto_bright_gain);
 
     dng_preview_list preview_list;
     AppendImagePreview(host, preview_image, &preview_list);
@@ -3684,7 +3779,7 @@ DngWriteResult WriteSyntheticLinearDng(const std::string& output_path,
     ConfigureHost(host, compression);
 
     AutoPtr<dng_negative> negative(host.Make_dng_negative());
-    PopulateLinearRawNegative(host, "synthetic-gradient.raw", processed, SourceLinearDngMetadata(), *negative.Get());
+    PopulateLinearRawNegative(host, "synthetic-gradient.raw", processed, SourceLinearDngMetadata(), *negative.Get(), 1.0);
 
     dng_preview_list preview_list;
     AppendImagePreview(host, preview_image, &preview_list);
@@ -3814,6 +3909,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string&,
                                      const StageOverrideSet&,
                                      const LibRawOverrideSet&,
                                      std::shared_ptr<const PreviewImage>,
+                                     double,
                                      ProgressCallback,
                                      CancelCheck) {
   DngWriteResult result;

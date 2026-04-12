@@ -40,6 +40,12 @@ struct DecodeSummary {
   uint32_t default_crop_origin_v = 0;
   uint32_t default_crop_width = 0;
   uint32_t default_crop_height = 0;
+  bool has_exif_iso = false;
+  float exif_iso = 0.0f;
+  bool has_exif_shutter_speed = false;
+  float exif_shutter_speed = 0.0f;
+  bool has_exif_aperture = false;
+  float exif_aperture = 0.0f;
 };
 
 bool ReadEnvInt(const char* name, int* value) {
@@ -224,6 +230,19 @@ bool DecodeWithLibRaw(const std::string& source_path,
     summary->default_crop_height = sizes.raw_inset_crops[0].cheight;
   }
 
+  if (processor->imgdata.other.iso_speed > 0.0f) {
+    summary->has_exif_iso = true;
+    summary->exif_iso = processor->imgdata.other.iso_speed;
+  }
+  if (processor->imgdata.other.shutter > 0.0f) {
+    summary->has_exif_shutter_speed = true;
+    summary->exif_shutter_speed = processor->imgdata.other.shutter;
+  }
+  if (processor->imgdata.other.aperture > 0.0f) {
+    summary->has_exif_aperture = true;
+    summary->exif_aperture = processor->imgdata.other.aperture;
+  }
+
   processor->recycle();
   return true;
 }
@@ -279,6 +298,13 @@ SourceLinearDngMetadata BuildMetadataFromLibRaw(const std::string& source_path,
     metadata.default_crop_width = decode_summary.default_crop_width;
     metadata.default_crop_height = decode_summary.default_crop_height;
   }
+
+  metadata.has_exif_iso = decode_summary.has_exif_iso;
+  metadata.exif_iso = decode_summary.exif_iso;
+  metadata.has_exif_shutter_speed = decode_summary.has_exif_shutter_speed;
+  metadata.exif_shutter_speed = decode_summary.exif_shutter_speed;
+  metadata.has_exif_aperture = decode_summary.has_exif_aperture;
+  metadata.exif_aperture = decode_summary.exif_aperture;
 
   metadata.has_predicted_detail_gain = true;
   metadata.predicted_detail_gain = 1.8;
@@ -727,10 +753,20 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
   }
 
   std::shared_ptr<const PreviewImage> preview_override;
+  double preview_gain = 1.0;
   if (prepared.data) {
     std::lock_guard<std::mutex> lock(prepared.data->mutex);
     if (prepared.data->has_original_preview) {
       preview_override = std::make_shared<PreviewImage>(prepared.data->original_preview);
+    }
+    if (prepared.data->has_processing_cache) {
+      preview_gain = prepared.data->processing_cache.preview_auto_bright_gain;
+    } else {
+      EstimatePreviewAutoBrightGainFromRaw(prepared.source_path,
+                                           *enhancement_metadata,
+                                           libraw_overrides,
+                                           &preview_gain,
+                                           nullptr);
     }
   }
 
@@ -741,6 +777,7 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
                                stage_overrides,
                                libraw_overrides,
                                preview_override,
+                               preview_gain,
                                progress,
                                cancel);
 }

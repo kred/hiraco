@@ -69,6 +69,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const StageOverrideSet& stage_overrides = {},
                                      const LibRawOverrideSet& libraw_overrides = {},
                                      std::shared_ptr<const PreviewImage> preview_override = {},
+                                     double preview_auto_bright_gain = 1.0,
                                      ProgressCallback progress = {},
                                      CancelCheck cancel = {});
 

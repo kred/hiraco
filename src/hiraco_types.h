@@ -68,6 +68,12 @@ struct SourceLinearDngMetadata {
   uint32_t default_crop_origin_v = 0;
   uint32_t default_crop_width = 0;
   uint32_t default_crop_height = 0;
+  bool has_exif_iso = false;
+  float exif_iso = 0.0f;
+  bool has_exif_shutter_speed = false;
+  float exif_shutter_speed = 0.0f;
+  bool has_exif_aperture = false;
+  float exif_aperture = 0.0f;
   bool has_working_geometry = false;
   uint32_t working_width = 0;
   uint32_t working_height = 0;
