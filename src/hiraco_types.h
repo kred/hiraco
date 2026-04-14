@@ -83,7 +83,6 @@ struct StageOverrideSet {
   std::optional<float> stage1_psf_sigma;
   std::optional<float> stage1_nsr;
   std::optional<float> stage2_denoise;
-  std::optional<float> stage2_gain0;
   std::optional<float> stage2_gain1;
   std::optional<float> stage2_gain2;
   std::optional<float> stage2_gain3;
@@ -94,7 +93,6 @@ struct StageOverrideSet {
     return stage1_psf_sigma.has_value() ||
            stage1_nsr.has_value() ||
            stage2_denoise.has_value() ||
-           stage2_gain0.has_value() ||
            stage2_gain1.has_value() ||
            stage2_gain2.has_value() ||
            stage2_gain3.has_value() ||
@@ -126,8 +124,7 @@ struct LibRawOverrideSet {
 struct ResolvedStageSettings {
   float stage1_psf_sigma = 2.0f;
   float stage1_nsr = 0.09f;
-  float stage2_denoise = 1.0f;
-  float stage2_gain0 = 2.0f;
+  float stage2_denoise = 0.33f;
   float stage2_gain1 = 1.6f;
   float stage2_gain2 = 1.3f;
   float stage2_gain3 = 1.1f;

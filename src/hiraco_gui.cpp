@@ -951,6 +951,8 @@ class HiracoMainFrame final : public wxFrame {
   }
 
   void BuildUi() {
+    const ResolvedStageSettings default_stage_settings;
+
     auto* root = new wxBoxSizer(wxVERTICAL);
     workspace_splitter_ = new wxSplitterWindow(this,
                            wxID_ANY,
@@ -1070,11 +1072,25 @@ class HiracoMainFrame final : public wxFrame {
                            "Detail Recovery",
                            "Recover fine detail from the stacked capture before later refinements.",
                            &stage1_reset_button_);
-    stage1_sizer->Add(CreateFloatSlider(stage1_section, "Blur Radius", 0.50, 4.00, 100, 2, &stage1_sigma_),
+    stage1_sizer->Add(CreateFloatSlider(stage1_section,
+                      "Blur Radius",
+                      0.50,
+                      4.00,
+                      default_stage_settings.stage1_psf_sigma,
+                      100,
+                      2,
+                      &stage1_sigma_),
                       0,
                       wxBOTTOM | wxEXPAND,
                       8);
-    stage1_sizer->Add(CreateFloatSlider(stage1_section, "Noise Protection", 0.00, 0.20, 1000, 3, &stage1_nsr_),
+    stage1_sizer->Add(CreateFloatSlider(stage1_section,
+                      "Noise Protection",
+                      0.00,
+                      0.20,
+                      default_stage_settings.stage1_nsr,
+                      1000,
+                      3,
+                      &stage1_nsr_),
                       0,
                       wxEXPAND,
                       0);
@@ -1086,19 +1102,47 @@ class HiracoMainFrame final : public wxFrame {
                            "Multi-scale Detail",
                            "Balance denoising and sharpening across small to large texture bands.",
                            &stage2_reset_button_);
-    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Denoise", 0.00, 1.00, 100, 2, &stage2_denoise_),
+    stage2_sizer->Add(CreateFloatSlider(stage2_section,
+                      "Denoise",
+                      0.00,
+                      1.00,
+                      default_stage_settings.stage2_denoise,
+                      100,
+                      2,
+                      &stage2_denoise_),
                       0,
                       wxBOTTOM | wxEXPAND,
                       8);
-    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Small Detail", 0.25, 4.00, 100, 2, &stage2_gain1_),
+    stage2_sizer->Add(CreateFloatSlider(stage2_section,
+                      "Small Detail",
+                      0.25,
+                      4.00,
+                      default_stage_settings.stage2_gain1,
+                      100,
+                      2,
+                      &stage2_gain1_),
                       0,
                       wxBOTTOM | wxEXPAND,
                       8);
-    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Medium Detail", 0.25, 4.00, 100, 2, &stage2_gain2_),
+    stage2_sizer->Add(CreateFloatSlider(stage2_section,
+                      "Medium Detail",
+                      0.25,
+                      4.00,
+                      default_stage_settings.stage2_gain2,
+                      100,
+                      2,
+                      &stage2_gain2_),
                       0,
                       wxBOTTOM | wxEXPAND,
                       8);
-    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Large Detail", 0.25, 4.00, 100, 2, &stage2_gain3_),
+    stage2_sizer->Add(CreateFloatSlider(stage2_section,
+                      "Large Detail",
+                      0.25,
+                      4.00,
+                      default_stage_settings.stage2_gain3,
+                      100,
+                      2,
+                      &stage2_gain3_),
                       0,
                       wxEXPAND,
                       0);
@@ -1110,11 +1154,23 @@ class HiracoMainFrame final : public wxFrame {
                            "Edge Refinement",
                            "Protect strong edges while adding local contrast and keeping halos under control.",
                            &stage3_reset_button_);
-    stage3_sizer->Add(CreateIntSlider(stage3_section, "Edge Radius", 1, 16, &stage3_radius_),
+    stage3_sizer->Add(CreateIntSlider(stage3_section,
+                      "Edge Radius",
+                      1,
+                      16,
+                      default_stage_settings.stage3_radius,
+                      &stage3_radius_),
                       0,
                       wxBOTTOM | wxEXPAND,
                       8);
-    stage3_sizer->Add(CreateFloatSlider(stage3_section, "Edge Gain", 0.00, 4.00, 100, 2, &stage3_gain_),
+    stage3_sizer->Add(CreateFloatSlider(stage3_section,
+                      "Edge Gain",
+                      0.00,
+                      4.00,
+                      default_stage_settings.stage3_gain,
+                      100,
+                      2,
+                      &stage3_gain_),
                       0,
                       wxEXPAND,
                       0);
@@ -1197,6 +1253,7 @@ class HiracoMainFrame final : public wxFrame {
                               const wxString& label,
                               double min_value,
                               double max_value,
+                              double initial_value,
                               int scale,
                               int decimals,
                               SliderControl* out_control) {
@@ -1206,9 +1263,11 @@ class HiracoMainFrame final : public wxFrame {
     auto* label_ctrl = new wxStaticText(panel, wxID_ANY, label);
     auto* value_ctrl = new wxStaticText(panel, wxID_ANY, "0");
     value_ctrl->SetMinSize(wxSize(44, -1));
+    const int initial_raw_value = static_cast<int>(std::round(
+      std::clamp(initial_value, min_value, max_value) * scale));
     auto* slider = new wxSlider(panel,
                                 wxID_ANY,
-                                static_cast<int>(min_value * scale),
+                  initial_raw_value,
                                 static_cast<int>(min_value * scale),
                                 static_cast<int>(max_value * scale));
     header->Add(label_ctrl, 1, wxRIGHT, 8);
@@ -1231,6 +1290,7 @@ class HiracoMainFrame final : public wxFrame {
                             const wxString& label,
                             int min_value,
                             int max_value,
+                            int initial_value,
                             SliderControl* out_control) {
     auto* panel = new wxPanel(parent);
     auto* row = new wxBoxSizer(wxVERTICAL);
@@ -1238,7 +1298,11 @@ class HiracoMainFrame final : public wxFrame {
     auto* label_ctrl = new wxStaticText(panel, wxID_ANY, label);
     auto* value_ctrl = new wxStaticText(panel, wxID_ANY, "0");
     value_ctrl->SetMinSize(wxSize(44, -1));
-    auto* slider = new wxSlider(panel, wxID_ANY, min_value, min_value, max_value);
+    auto* slider = new wxSlider(panel,
+                  wxID_ANY,
+                  std::clamp(initial_value, min_value, max_value),
+                  min_value,
+                  max_value);
     header->Add(label_ctrl, 1, wxRIGHT, 8);
     header->Add(value_ctrl, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 8);
     row->Add(header, 0, wxBOTTOM | wxEXPAND, 4);
@@ -1396,7 +1460,6 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     const ResolvedStageSettings base_settings = BaseStageSettingsForItem(item);
-    item->stage_overrides.stage2_gain0.reset();
     if (item->stage_overrides.stage1_psf_sigma.has_value()) {
       SetFloatOverrideRelativeToBase(&item->stage_overrides.stage1_psf_sigma,
                                      *item->stage_overrides.stage1_psf_sigma,
@@ -1821,17 +1884,16 @@ class HiracoMainFrame final : public wxFrame {
     if (config->Read("ui/stage2_denoise", &double_value)) {
       app_stage_defaults_.stage2_denoise = static_cast<float>(double_value);
     }
-    app_stage_defaults_.stage2_gain0.reset();
-    double legacy_stage2_gain0 = 0.0;
-    double legacy_stage2_gain1 = 0.0;
-    const bool has_legacy_stage2_gain0 = config->Read("ui/stage2_gain0", &legacy_stage2_gain0);
-    const bool has_legacy_stage2_gain1 = config->Read("ui/stage2_gain1", &legacy_stage2_gain1);
+    double legacy_fine_detail = 0.0;
+    double legacy_small_detail = 0.0;
+    const bool has_legacy_fine_detail = config->Read("ui/stage2_gain0", &legacy_fine_detail);
+    const bool has_legacy_small_detail = config->Read("ui/stage2_gain1", &legacy_small_detail);
     if (config->Read("ui/stage2_small_detail", &double_value)) {
       app_stage_defaults_.stage2_gain1 = ClampStage2UiGain(static_cast<float>(double_value));
     } else {
       const std::optional<float> migrated_small = MigrateLegacySmallDetailGain(
-          has_legacy_stage2_gain0 ? std::optional<float>(static_cast<float>(legacy_stage2_gain0)) : std::nullopt,
-          has_legacy_stage2_gain1 ? std::optional<float>(static_cast<float>(legacy_stage2_gain1)) : std::nullopt);
+          has_legacy_fine_detail ? std::optional<float>(static_cast<float>(legacy_fine_detail)) : std::nullopt,
+          has_legacy_small_detail ? std::optional<float>(static_cast<float>(legacy_small_detail)) : std::nullopt);
       if (migrated_small.has_value()) {
         app_stage_defaults_.stage2_gain1 = *migrated_small;
       }
@@ -1894,7 +1956,6 @@ class HiracoMainFrame final : public wxFrame {
     app_stage_defaults_.stage1_psf_sigma.reset();
     app_stage_defaults_.stage1_nsr = static_cast<float>(SliderValue(stage1_nsr_));
     app_stage_defaults_.stage2_denoise = static_cast<float>(SliderValue(stage2_denoise_));
-    app_stage_defaults_.stage2_gain0.reset();
     app_stage_defaults_.stage2_gain1 = static_cast<float>(SliderValue(stage2_gain1_));
     app_stage_defaults_.stage2_gain2 = static_cast<float>(SliderValue(stage2_gain2_));
     app_stage_defaults_.stage2_gain3 = static_cast<float>(SliderValue(stage2_gain3_));

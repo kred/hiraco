@@ -896,7 +896,6 @@ StageOverrideSet ReadStageOverridesFromEnvironment() {
   overrides.stage1_psf_sigma = maybe_float("HIRACO_STAGE1_PSF_SIGMA");
   overrides.stage1_nsr = maybe_float("HIRACO_STAGE1_NSR");
   overrides.stage2_denoise = maybe_float("HIRACO_STAGE2_DENOISE");
-  overrides.stage2_gain0 = maybe_float("HIRACO_STAGE2_GAIN0");
   overrides.stage2_gain1 = maybe_float_any({"HIRACO_STAGE2_SMALL_DETAIL", "HIRACO_STAGE2_GAIN1"});
   overrides.stage2_gain2 = maybe_float_any({"HIRACO_STAGE2_MEDIUM_DETAIL", "HIRACO_STAGE2_GAIN2"});
   overrides.stage2_gain3 = maybe_float_any({"HIRACO_STAGE2_LARGE_DETAIL", "HIRACO_STAGE2_GAIN3"});

@@ -130,16 +130,10 @@ float DeriveFineScaleGainFromSmall(float small_gain) {
   return ClampStage2Gain(1.0f + kStage2FineFromSmallScale * (small_gain - 1.0f));
 }
 
-void FinalizeStage2Settings(const StageOverrideSet& overrides,
-                            ResolvedStageSettings* settings) {
+void FinalizeStage2Settings(ResolvedStageSettings* settings) {
   settings->stage2_gain1 = ClampStage2Gain(settings->stage2_gain1);
   settings->stage2_gain2 = ClampStage2Gain(settings->stage2_gain2);
   settings->stage2_gain3 = ClampStage2Gain(settings->stage2_gain3);
-  if (overrides.stage2_gain0.has_value()) {
-    settings->stage2_gain0 = ClampStage2Gain(*overrides.stage2_gain0);
-  } else {
-    settings->stage2_gain0 = DeriveFineScaleGainFromSmall(settings->stage2_gain1);
-  }
 }
 
 ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMetadata& metadata,
@@ -149,7 +143,9 @@ ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMeta
   (void) metadata;
 
   ResolvedStageSettings settings;
-  settings.stage1_psf_sigma = Is80MpFrame(width, height) ? 2.5f : 2.0f;
+  if (Is80MpFrame(width, height)) {
+    settings.stage1_psf_sigma = 2.5f;
+  }
 
   if (overrides.stage1_psf_sigma.has_value()) {
     settings.stage1_psf_sigma = *overrides.stage1_psf_sigma;
@@ -159,9 +155,6 @@ ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMeta
   }
   if (overrides.stage2_denoise.has_value()) {
     settings.stage2_denoise = *overrides.stage2_denoise;
-  }
-  if (overrides.stage2_gain0.has_value()) {
-    settings.stage2_gain0 = *overrides.stage2_gain0;
   }
   if (overrides.stage2_gain1.has_value()) {
     settings.stage2_gain1 = *overrides.stage2_gain1;
@@ -179,7 +172,7 @@ ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMeta
     settings.stage3_gain = *overrides.stage3_gain;
   }
 
-  FinalizeStage2Settings(overrides, &settings);
+  FinalizeStage2Settings(&settings);
 
   return settings;
 }
@@ -1476,7 +1469,7 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     const hiraco::ScopedTimingLog timer("enhance", "Stage 2 wavelet refinement");
     constexpr int kNumScales = 4;
     const float denoise = settings.stage2_denoise;
-    const float gain0 = settings.stage2_gain0;
+    const float gain0 = DeriveFineScaleGainFromSmall(settings.stage2_gain1);
     const float gain1 = settings.stage2_gain1;
     const float gain2 = settings.stage2_gain2;
     const float gain3 = settings.stage2_gain3;
@@ -3897,7 +3890,7 @@ ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata
   if (overrides.stage2_gain3.has_value()) settings.stage2_gain3 = *overrides.stage2_gain3;
   if (overrides.stage3_radius.has_value()) settings.stage3_radius = *overrides.stage3_radius;
   if (overrides.stage3_gain.has_value()) settings.stage3_gain = *overrides.stage3_gain;
-  FinalizeStage2Settings(overrides, &settings);
+  FinalizeStage2Settings(&settings);
   return settings;
 }
 
