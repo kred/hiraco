@@ -877,6 +877,14 @@ StageOverrideSet ReadStageOverridesFromEnvironment() {
     }
     return value;
   };
+  auto maybe_float_any = [&](std::initializer_list<const char*> names) -> std::optional<float> {
+    for (const char* name : names) {
+      if (std::optional<float> value = maybe_float(name); value.has_value()) {
+        return value;
+      }
+    }
+    return std::nullopt;
+  };
   auto maybe_int = [](const char* name) -> std::optional<int> {
     int value = 0;
     if (!ReadEnvInt(name, &value)) {
@@ -889,9 +897,9 @@ StageOverrideSet ReadStageOverridesFromEnvironment() {
   overrides.stage1_nsr = maybe_float("HIRACO_STAGE1_NSR");
   overrides.stage2_denoise = maybe_float("HIRACO_STAGE2_DENOISE");
   overrides.stage2_gain0 = maybe_float("HIRACO_STAGE2_GAIN0");
-  overrides.stage2_gain1 = maybe_float("HIRACO_STAGE2_GAIN1");
-  overrides.stage2_gain2 = maybe_float("HIRACO_STAGE2_GAIN2");
-  overrides.stage2_gain3 = maybe_float("HIRACO_STAGE2_GAIN3");
+  overrides.stage2_gain1 = maybe_float_any({"HIRACO_STAGE2_SMALL_DETAIL", "HIRACO_STAGE2_GAIN1"});
+  overrides.stage2_gain2 = maybe_float_any({"HIRACO_STAGE2_MEDIUM_DETAIL", "HIRACO_STAGE2_GAIN2"});
+  overrides.stage2_gain3 = maybe_float_any({"HIRACO_STAGE2_LARGE_DETAIL", "HIRACO_STAGE2_GAIN3"});
   overrides.stage3_radius = maybe_int("HIRACO_STAGE3_RADIUS");
   overrides.stage3_gain = maybe_float("HIRACO_STAGE3_GAIN");
   return overrides;

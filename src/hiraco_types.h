@@ -128,7 +128,7 @@ struct ResolvedStageSettings {
   float stage1_nsr = 0.09f;
   float stage2_denoise = 1.0f;
   float stage2_gain0 = 2.0f;
-  float stage2_gain1 = 1.4f;
+  float stage2_gain1 = 1.6f;
   float stage2_gain2 = 1.3f;
   float stage2_gain3 = 1.1f;
   int stage3_radius = 2;

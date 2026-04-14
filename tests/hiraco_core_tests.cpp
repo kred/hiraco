@@ -40,6 +40,48 @@ RasterImage MakeSyntheticRgb(uint32_t width, uint32_t height) {
   return image;
 }
 
+RasterImage MakeSyntheticTexturedRgb(uint32_t width, uint32_t height) {
+  RasterImage image;
+  image.width = width;
+  image.height = height;
+  image.colors = 3;
+  image.bits = 16;
+  image.pixels.resize(static_cast<size_t>(width) * height * image.colors);
+
+  for (uint32_t row = 0; row < height; ++row) {
+  for (uint32_t col = 0; col < width; ++col) {
+    const size_t index = (static_cast<size_t>(row) * width + col) * image.colors;
+    const double fx = static_cast<double>(col) / std::max<uint32_t>(1, width - 1);
+    const double fy = static_cast<double>(row) / std::max<uint32_t>(1, height - 1);
+    const double micro =
+      950.0 * std::sin(1.11 * static_cast<double>(col) + 0.91 * static_cast<double>(row));
+    const double fine =
+      820.0 * std::cos(0.57 * static_cast<double>(col) - 0.49 * static_cast<double>(row));
+    const double small =
+      1700.0 * std::sin(0.19 * static_cast<double>(col)) *
+      std::cos(0.17 * static_cast<double>(row));
+    const double medium =
+      2600.0 * std::sin(fx * 13.0) + 2200.0 * std::cos(fy * 11.0);
+
+    image.pixels[index + 0] = static_cast<uint16_t>(std::clamp(
+      7000.0 + 17000.0 * fx + 12000.0 * fy + medium + 0.9 * small + micro,
+      0.0,
+      65535.0));
+    image.pixels[index + 1] = static_cast<uint16_t>(std::clamp(
+      8500.0 + 15000.0 * fy + 10000.0 * fx + 0.8 * medium + 1.1 * small + fine,
+      0.0,
+      65535.0));
+    image.pixels[index + 2] = static_cast<uint16_t>(std::clamp(
+      6500.0 + 13000.0 * fx * fy + 9000.0 * (1.0 - fx) + 0.7 * medium + 0.9 * small +
+        0.8 * micro - 0.6 * fine,
+      0.0,
+      65535.0));
+  }
+  }
+
+  return image;
+}
+
 RasterImage MakeSyntheticGuide(uint32_t width, uint32_t height) {
   RasterImage image;
   image.width = width;
@@ -97,6 +139,61 @@ PreviewImage ToPreview(const RasterImage& source) {
     preview.pixels[index] = static_cast<uint8_t>(source.pixels[index] >> 8);
   }
   return preview;
+}
+
+double ComputeLumaNeighborhoodEnergy(const RasterImage& image, uint32_t radius) {
+  Expect(image.colors >= 3, "energy metric expects RGB image");
+  if (image.width <= radius * 2 || image.height <= radius * 2) {
+    return 0.0;
+  }
+
+  auto luma_at = [&](uint32_t col, uint32_t row) {
+    const size_t index = (static_cast<size_t>(row) * image.width + col) * image.colors;
+    return 0.2126 * static_cast<double>(image.pixels[index + 0]) +
+           0.7152 * static_cast<double>(image.pixels[index + 1]) +
+           0.0722 * static_cast<double>(image.pixels[index + 2]);
+  };
+
+  double sum = 0.0;
+  size_t count = 0;
+  for (uint32_t row = radius; row + radius < image.height; ++row) {
+    for (uint32_t col = radius; col + radius < image.width; ++col) {
+      const double center = luma_at(col, row);
+      const double neighbor_mean = 0.25 * (
+          luma_at(col - radius, row) +
+          luma_at(col + radius, row) +
+          luma_at(col, row - radius) +
+          luma_at(col, row + radius));
+      sum += std::abs(center - neighbor_mean);
+      ++count;
+    }
+  }
+
+  return count > 0 ? sum / static_cast<double>(count) : 0.0;
+}
+
+RasterImage RunEnhancementForTesting(const RasterImage& source,
+                                     const RasterImage* guide,
+                                     const SourceLinearDngMetadata& metadata,
+                                     const ResolvedStageSettings& settings) {
+  RasterImage processed = source;
+  for (uint16_t& sample : processed.pixels) {
+    sample = static_cast<uint16_t>(std::clamp(
+        static_cast<double>(sample) - metadata.black_level,
+        0.0,
+        65535.0));
+  }
+
+  std::string error_message;
+  const bool ok = ApplyResolvedStageSettingsForTesting(metadata,
+                                                       settings,
+                                                       guide,
+                                                       &processed,
+                                                       {},
+                                                       {},
+                                                       &error_message);
+  Expect(ok, "synthetic enhancement should succeed: " + error_message);
+  return processed;
 }
 
 void ApplyPreviewTransform(const SourceLinearDngMetadata& metadata, RasterImage* image) {
@@ -310,6 +407,79 @@ void TestCropPreviewMatchesFullImageCrop() {
              std::to_string(max_abs_diff) + ")");
 }
 
+  void TestStage2SmallMediumLargeGainResponse() {
+    const SourceLinearDngMetadata metadata = MakeHighResMetadata();
+    const RasterImage source = MakeSyntheticTexturedRgb(640, 640);
+    const RasterImage guide = MakeSyntheticGuide(640, 640);
+
+    auto make_settings = [&](float small_detail,
+                             float medium_detail,
+                             float large_detail) {
+      StageOverrideSet overrides;
+      overrides.stage2_denoise = 0.35f;
+      overrides.stage2_gain1 = small_detail;
+      overrides.stage2_gain2 = medium_detail;
+      overrides.stage2_gain3 = large_detail;
+      overrides.stage3_gain = 0.0f;
+      return ResolveStageSettingsForImage(metadata, source.width, source.height, overrides);
+    };
+
+    const ResolvedStageSettings neutral = make_settings(1.0f, 1.0f, 1.0f);
+    const ResolvedStageSettings small_low = make_settings(0.5f, 1.0f, 1.0f);
+    const ResolvedStageSettings small_high = make_settings(3.5f, 1.0f, 1.0f);
+    const ResolvedStageSettings medium_low = make_settings(1.0f, 0.5f, 1.0f);
+    const ResolvedStageSettings medium_high = make_settings(1.0f, 3.0f, 1.0f);
+    const ResolvedStageSettings large_low = make_settings(1.0f, 1.0f, 0.5f);
+    const ResolvedStageSettings large_high = make_settings(1.0f, 1.0f, 3.0f);
+
+    const RasterImage neutral_out =
+      RunEnhancementForTesting(source, &guide, metadata, neutral);
+    const RasterImage small_low_out =
+      RunEnhancementForTesting(source, &guide, metadata, small_low);
+    const RasterImage small_high_out =
+      RunEnhancementForTesting(source, &guide, metadata, small_high);
+    const RasterImage medium_low_out =
+      RunEnhancementForTesting(source, &guide, metadata, medium_low);
+    const RasterImage medium_high_out =
+      RunEnhancementForTesting(source, &guide, metadata, medium_high);
+    const RasterImage large_low_out =
+      RunEnhancementForTesting(source, &guide, metadata, large_low);
+    const RasterImage large_high_out =
+      RunEnhancementForTesting(source, &guide, metadata, large_high);
+
+    const double neutral_micro_energy = ComputeLumaNeighborhoodEnergy(neutral_out, 1);
+    const double small_low_micro_energy = ComputeLumaNeighborhoodEnergy(small_low_out, 1);
+    const double small_high_micro_energy = ComputeLumaNeighborhoodEnergy(small_high_out, 1);
+    Expect(small_low_micro_energy + 5.0 < neutral_micro_energy,
+       "small-detail attenuation should reduce finest-scale energy");
+    Expect(small_high_micro_energy > neutral_micro_energy + 5.0,
+       "small-detail boost should increase finest-scale energy");
+
+    const double neutral_small_energy = ComputeLumaNeighborhoodEnergy(neutral_out, 2);
+    const double small_low_energy = ComputeLumaNeighborhoodEnergy(small_low_out, 2);
+    const double small_high_energy = ComputeLumaNeighborhoodEnergy(small_high_out, 2);
+    Expect(small_low_energy + 3.0 < neutral_small_energy,
+       "small-detail attenuation should reduce small-structure energy");
+    Expect(small_high_energy > neutral_small_energy + 3.0,
+       "small-detail boost should increase small-structure energy");
+
+    const double neutral_medium_energy = ComputeLumaNeighborhoodEnergy(neutral_out, 4);
+    const double medium_low_energy = ComputeLumaNeighborhoodEnergy(medium_low_out, 4);
+    const double medium_high_energy = ComputeLumaNeighborhoodEnergy(medium_high_out, 4);
+    Expect(medium_low_energy + 2.0 < neutral_medium_energy,
+       "medium-detail attenuation should reduce mid-scale energy");
+    Expect(medium_high_energy > neutral_medium_energy + 2.0,
+       "medium-detail boost should increase mid-scale energy");
+
+    const double neutral_large_energy = ComputeLumaNeighborhoodEnergy(neutral_out, 8);
+    const double large_low_energy = ComputeLumaNeighborhoodEnergy(large_low_out, 8);
+    const double large_high_energy = ComputeLumaNeighborhoodEnergy(large_high_out, 8);
+    Expect(large_low_energy + 1.0 < neutral_large_energy,
+       "large-detail attenuation should reduce broad-scale energy");
+    Expect(large_high_energy > neutral_large_energy + 1.0,
+       "large-detail boost should increase broad-scale energy");
+  }
+
 }  // namespace
 
 int main() {
@@ -322,6 +492,7 @@ int main() {
     TestRealOrfCropPreviewFollowsCropRect();
     TestRealOrfPreviewAutoBrightGainEstimate();
     TestCropPreviewMatchesFullImageCrop();
+    TestStage2SmallMediumLargeGainResponse();
   } catch (const std::exception& exception) {
     std::cerr << "Test failure: " << exception.what() << "\n";
     return 1;

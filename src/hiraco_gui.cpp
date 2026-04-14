@@ -336,9 +336,6 @@ void ApplyStageOverridesToResolvedSettings(const StageOverrideSet& overrides,
   if (overrides.stage2_denoise.has_value()) {
     settings->stage2_denoise = *overrides.stage2_denoise;
   }
-  if (overrides.stage2_gain0.has_value()) {
-    settings->stage2_gain0 = *overrides.stage2_gain0;
-  }
   if (overrides.stage2_gain1.has_value()) {
     settings->stage2_gain1 = *overrides.stage2_gain1;
   }
@@ -367,13 +364,30 @@ StageOverrideSet MakeExplicitStageOverrides(const ResolvedStageSettings& setting
   overrides.stage1_psf_sigma = settings.stage1_psf_sigma;
   overrides.stage1_nsr = settings.stage1_nsr;
   overrides.stage2_denoise = settings.stage2_denoise;
-  overrides.stage2_gain0 = settings.stage2_gain0;
   overrides.stage2_gain1 = settings.stage2_gain1;
   overrides.stage2_gain2 = settings.stage2_gain2;
   overrides.stage2_gain3 = settings.stage2_gain3;
   overrides.stage3_radius = settings.stage3_radius;
   overrides.stage3_gain = settings.stage3_gain;
   return overrides;
+}
+
+float ClampStage2UiGain(float value) {
+  return std::clamp(value, 0.25f, 4.0f);
+}
+
+std::optional<float> MigrateLegacySmallDetailGain(std::optional<float> legacy_fine,
+                                                  std::optional<float> legacy_small) {
+  if (legacy_fine.has_value() && legacy_small.has_value()) {
+    return ClampStage2UiGain(0.35f * *legacy_fine + 0.65f * *legacy_small);
+  }
+  if (legacy_small.has_value()) {
+    return ClampStage2UiGain(*legacy_small);
+  }
+  if (legacy_fine.has_value()) {
+    return ClampStage2UiGain(*legacy_fine);
+  }
+  return std::nullopt;
 }
 
 void SetFloatOverrideRelativeToBase(std::optional<float>* override_value,
@@ -1070,25 +1084,21 @@ class HiracoMainFrame final : public wxFrame {
     auto* stage2_section = new wxPanel(sliders_scroll, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_THEME);
     auto* stage2_sizer = CreateStageSectionSizer(stage2_section,
                            "Multi-scale Detail",
-                           "Balance denoising and sharpening across fine to coarse texture bands.",
+                           "Balance denoising and sharpening across small to large texture bands.",
                            &stage2_reset_button_);
     stage2_sizer->Add(CreateFloatSlider(stage2_section, "Denoise", 0.00, 1.00, 100, 2, &stage2_denoise_),
                       0,
                       wxBOTTOM | wxEXPAND,
                       8);
-    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Fine Detail", 0.50, 3.00, 100, 2, &stage2_gain0_),
+    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Small Detail", 0.25, 4.00, 100, 2, &stage2_gain1_),
                       0,
                       wxBOTTOM | wxEXPAND,
                       8);
-    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Small Detail", 0.50, 3.00, 100, 2, &stage2_gain1_),
+    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Medium Detail", 0.25, 4.00, 100, 2, &stage2_gain2_),
                       0,
                       wxBOTTOM | wxEXPAND,
                       8);
-    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Medium Detail", 0.50, 3.00, 100, 2, &stage2_gain2_),
-                      0,
-                      wxBOTTOM | wxEXPAND,
-                      8);
-    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Large Detail", 0.50, 3.00, 100, 2, &stage2_gain3_),
+    stage2_sizer->Add(CreateFloatSlider(stage2_section, "Large Detail", 0.25, 4.00, 100, 2, &stage2_gain3_),
                       0,
                       wxEXPAND,
                       0);
@@ -1307,14 +1317,6 @@ class HiracoMainFrame final : public wxFrame {
                                        base_settings.stage2_denoise);
       });
     });
-    BindSlider(stage2_gain0_, [this](double value) {
-      UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
-                                          const ResolvedStageSettings& base_settings) {
-        SetFloatOverrideRelativeToBase(&overrides.stage2_gain0,
-                                       static_cast<float>(value),
-                                       base_settings.stage2_gain0);
-      });
-    });
     BindSlider(stage2_gain1_, [this](double value) {
       UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
                                           const ResolvedStageSettings& base_settings) {
@@ -1362,7 +1364,6 @@ class HiracoMainFrame final : public wxFrame {
     SetSliderValue(stage1_sigma_, settings.stage1_psf_sigma);
     SetSliderValue(stage1_nsr_, settings.stage1_nsr);
     SetSliderValue(stage2_denoise_, settings.stage2_denoise);
-    SetSliderValue(stage2_gain0_, settings.stage2_gain0);
     SetSliderValue(stage2_gain1_, settings.stage2_gain1);
     SetSliderValue(stage2_gain2_, settings.stage2_gain2);
     SetSliderValue(stage2_gain3_, settings.stage2_gain3);
@@ -1395,6 +1396,7 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     const ResolvedStageSettings base_settings = BaseStageSettingsForItem(item);
+    item->stage_overrides.stage2_gain0.reset();
     if (item->stage_overrides.stage1_psf_sigma.has_value()) {
       SetFloatOverrideRelativeToBase(&item->stage_overrides.stage1_psf_sigma,
                                      *item->stage_overrides.stage1_psf_sigma,
@@ -1409,11 +1411,6 @@ class HiracoMainFrame final : public wxFrame {
       SetFloatOverrideRelativeToBase(&item->stage_overrides.stage2_denoise,
                                      *item->stage_overrides.stage2_denoise,
                                      base_settings.stage2_denoise);
-    }
-    if (item->stage_overrides.stage2_gain0.has_value()) {
-      SetFloatOverrideRelativeToBase(&item->stage_overrides.stage2_gain0,
-                                     *item->stage_overrides.stage2_gain0,
-                                     base_settings.stage2_gain0);
     }
     if (item->stage_overrides.stage2_gain1.has_value()) {
       SetFloatOverrideRelativeToBase(&item->stage_overrides.stage2_gain1,
@@ -1768,9 +1765,6 @@ class HiracoMainFrame final : public wxFrame {
     if (item_overrides.stage2_denoise.has_value()) {
       effective.stage2_denoise = item_overrides.stage2_denoise;
     }
-    if (item_overrides.stage2_gain0.has_value()) {
-      effective.stage2_gain0 = item_overrides.stage2_gain0;
-    }
     if (item_overrides.stage2_gain1.has_value()) {
       effective.stage2_gain1 = item_overrides.stage2_gain1;
     }
@@ -1827,17 +1821,30 @@ class HiracoMainFrame final : public wxFrame {
     if (config->Read("ui/stage2_denoise", &double_value)) {
       app_stage_defaults_.stage2_denoise = static_cast<float>(double_value);
     }
-    if (config->Read("ui/stage2_gain0", &double_value)) {
-      app_stage_defaults_.stage2_gain0 = static_cast<float>(double_value);
+    app_stage_defaults_.stage2_gain0.reset();
+    double legacy_stage2_gain0 = 0.0;
+    double legacy_stage2_gain1 = 0.0;
+    const bool has_legacy_stage2_gain0 = config->Read("ui/stage2_gain0", &legacy_stage2_gain0);
+    const bool has_legacy_stage2_gain1 = config->Read("ui/stage2_gain1", &legacy_stage2_gain1);
+    if (config->Read("ui/stage2_small_detail", &double_value)) {
+      app_stage_defaults_.stage2_gain1 = ClampStage2UiGain(static_cast<float>(double_value));
+    } else {
+      const std::optional<float> migrated_small = MigrateLegacySmallDetailGain(
+          has_legacy_stage2_gain0 ? std::optional<float>(static_cast<float>(legacy_stage2_gain0)) : std::nullopt,
+          has_legacy_stage2_gain1 ? std::optional<float>(static_cast<float>(legacy_stage2_gain1)) : std::nullopt);
+      if (migrated_small.has_value()) {
+        app_stage_defaults_.stage2_gain1 = *migrated_small;
+      }
     }
-    if (config->Read("ui/stage2_gain1", &double_value)) {
-      app_stage_defaults_.stage2_gain1 = static_cast<float>(double_value);
+    if (config->Read("ui/stage2_medium_detail", &double_value)) {
+      app_stage_defaults_.stage2_gain2 = ClampStage2UiGain(static_cast<float>(double_value));
+    } else if (config->Read("ui/stage2_gain2", &double_value)) {
+      app_stage_defaults_.stage2_gain2 = ClampStage2UiGain(static_cast<float>(double_value));
     }
-    if (config->Read("ui/stage2_gain2", &double_value)) {
-      app_stage_defaults_.stage2_gain2 = static_cast<float>(double_value);
-    }
-    if (config->Read("ui/stage2_gain3", &double_value)) {
-      app_stage_defaults_.stage2_gain3 = static_cast<float>(double_value);
+    if (config->Read("ui/stage2_large_detail", &double_value)) {
+      app_stage_defaults_.stage2_gain3 = ClampStage2UiGain(static_cast<float>(double_value));
+    } else if (config->Read("ui/stage2_gain3", &double_value)) {
+      app_stage_defaults_.stage2_gain3 = ClampStage2UiGain(static_cast<float>(double_value));
     }
     long int_value = 0;
     if (config->Read("ui/stage3_radius", &int_value)) {
@@ -1865,17 +1872,14 @@ class HiracoMainFrame final : public wxFrame {
     if (app_stage_defaults_.stage2_denoise.has_value()) {
       config->Write("ui/stage2_denoise", static_cast<double>(*app_stage_defaults_.stage2_denoise));
     }
-    if (app_stage_defaults_.stage2_gain0.has_value()) {
-      config->Write("ui/stage2_gain0", static_cast<double>(*app_stage_defaults_.stage2_gain0));
-    }
     if (app_stage_defaults_.stage2_gain1.has_value()) {
-      config->Write("ui/stage2_gain1", static_cast<double>(*app_stage_defaults_.stage2_gain1));
+      config->Write("ui/stage2_small_detail", static_cast<double>(*app_stage_defaults_.stage2_gain1));
     }
     if (app_stage_defaults_.stage2_gain2.has_value()) {
-      config->Write("ui/stage2_gain2", static_cast<double>(*app_stage_defaults_.stage2_gain2));
+      config->Write("ui/stage2_medium_detail", static_cast<double>(*app_stage_defaults_.stage2_gain2));
     }
     if (app_stage_defaults_.stage2_gain3.has_value()) {
-      config->Write("ui/stage2_gain3", static_cast<double>(*app_stage_defaults_.stage2_gain3));
+      config->Write("ui/stage2_large_detail", static_cast<double>(*app_stage_defaults_.stage2_gain3));
     }
     if (app_stage_defaults_.stage3_radius.has_value()) {
       config->Write("ui/stage3_radius", static_cast<long>(*app_stage_defaults_.stage3_radius));
@@ -1890,7 +1894,7 @@ class HiracoMainFrame final : public wxFrame {
     app_stage_defaults_.stage1_psf_sigma.reset();
     app_stage_defaults_.stage1_nsr = static_cast<float>(SliderValue(stage1_nsr_));
     app_stage_defaults_.stage2_denoise = static_cast<float>(SliderValue(stage2_denoise_));
-    app_stage_defaults_.stage2_gain0 = static_cast<float>(SliderValue(stage2_gain0_));
+    app_stage_defaults_.stage2_gain0.reset();
     app_stage_defaults_.stage2_gain1 = static_cast<float>(SliderValue(stage2_gain1_));
     app_stage_defaults_.stage2_gain2 = static_cast<float>(SliderValue(stage2_gain2_));
     app_stage_defaults_.stage2_gain3 = static_cast<float>(SliderValue(stage2_gain3_));
@@ -2003,7 +2007,6 @@ class HiracoMainFrame final : public wxFrame {
       stage1_sigma_.slider->Enable(false);
       stage1_nsr_.slider->Enable(false);
       stage2_denoise_.slider->Enable(false);
-      stage2_gain0_.slider->Enable(false);
       stage2_gain1_.slider->Enable(false);
       stage2_gain2_.slider->Enable(false);
       stage2_gain3_.slider->Enable(false);
@@ -2033,7 +2036,6 @@ class HiracoMainFrame final : public wxFrame {
     stage1_sigma_.slider->Enable(has_selection && !conversion_running_);
     stage1_nsr_.slider->Enable(has_selection && !conversion_running_);
     stage2_denoise_.slider->Enable(has_selection && !conversion_running_);
-    stage2_gain0_.slider->Enable(has_selection && !conversion_running_);
     stage2_gain1_.slider->Enable(has_selection && !conversion_running_);
     stage2_gain2_.slider->Enable(has_selection && !conversion_running_);
     stage2_gain3_.slider->Enable(has_selection && !conversion_running_);
@@ -2614,7 +2616,6 @@ class HiracoMainFrame final : public wxFrame {
     if (StageOverrideSet* overrides = SelectedStageOverrides()) {
       const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
       overrides->stage2_denoise = safe.stage2_denoise;
-      overrides->stage2_gain0 = safe.stage2_gain0;
       overrides->stage2_gain1 = safe.stage2_gain1;
       overrides->stage2_gain2 = safe.stage2_gain2;
       overrides->stage2_gain3 = safe.stage2_gain3;
@@ -3010,7 +3011,6 @@ class HiracoMainFrame final : public wxFrame {
   SliderControl stage1_sigma_;
   SliderControl stage1_nsr_;
   SliderControl stage2_denoise_;
-  SliderControl stage2_gain0_;
   SliderControl stage2_gain1_;
   SliderControl stage2_gain2_;
   SliderControl stage2_gain3_;

@@ -118,6 +118,30 @@ bool Is80MpFrame(uint32_t width, uint32_t height) {
   return width == 10386 && height == 7792;
 }
 
+constexpr float kStage2GainMin = 0.25f;
+constexpr float kStage2GainMax = 4.0f;
+constexpr float kStage2FineFromSmallScale = 1.6f;
+
+float ClampStage2Gain(float gain) {
+  return std::clamp(gain, kStage2GainMin, kStage2GainMax);
+}
+
+float DeriveFineScaleGainFromSmall(float small_gain) {
+  return ClampStage2Gain(1.0f + kStage2FineFromSmallScale * (small_gain - 1.0f));
+}
+
+void FinalizeStage2Settings(const StageOverrideSet& overrides,
+                            ResolvedStageSettings* settings) {
+  settings->stage2_gain1 = ClampStage2Gain(settings->stage2_gain1);
+  settings->stage2_gain2 = ClampStage2Gain(settings->stage2_gain2);
+  settings->stage2_gain3 = ClampStage2Gain(settings->stage2_gain3);
+  if (overrides.stage2_gain0.has_value()) {
+    settings->stage2_gain0 = ClampStage2Gain(*overrides.stage2_gain0);
+  } else {
+    settings->stage2_gain0 = DeriveFineScaleGainFromSmall(settings->stage2_gain1);
+  }
+}
+
 ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMetadata& metadata,
                                                        uint32_t width,
                                                        uint32_t height,
@@ -154,6 +178,8 @@ ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMeta
   if (overrides.stage3_gain.has_value()) {
     settings.stage3_gain = *overrides.stage3_gain;
   }
+
+  FinalizeStage2Settings(overrides, &settings);
 
   return settings;
 }
@@ -1454,7 +1480,31 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     const float gain1 = settings.stage2_gain1;
     const float gain2 = settings.stage2_gain2;
     const float gain3 = settings.stage2_gain3;
-    double scale_gains[kNumScales] = {gain0, gain1, gain2, gain3};
+    double user_scale_gains[kNumScales] = {gain0, gain1, gain2, gain3};
+    double top_down_gains[kNumScales] = {};
+    double bottom_up_gains[kNumScales] = {};
+    double effective_scale_gains[kNumScales] = {};
+
+    // Blend gains in both directions so neighboring wavelet bands overlap
+    // more like practical detail controls instead of isolated narrow bins.
+    top_down_gains[0] = user_scale_gains[0];
+    for (int scale = 1; scale < kNumScales; ++scale) {
+      top_down_gains[scale] =
+          0.68 * user_scale_gains[scale] + 0.32 * top_down_gains[scale - 1];
+    }
+    bottom_up_gains[kNumScales - 1] = user_scale_gains[kNumScales - 1];
+    for (int scale = kNumScales - 2; scale >= 0; --scale) {
+      bottom_up_gains[scale] =
+          0.68 * user_scale_gains[scale] + 0.32 * bottom_up_gains[scale + 1];
+    }
+    for (int scale = 0; scale < kNumScales; ++scale) {
+      effective_scale_gains[scale] = std::clamp(
+          0.50 * user_scale_gains[scale] +
+              0.25 * top_down_gains[scale] +
+              0.25 * bottom_up_gains[scale],
+          0.25,
+          4.0);
+    }
 
     std::vector<double> approx_prev(luma);
     std::vector<double> detail_accum;
@@ -1471,10 +1521,10 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
       hiraco_atrous_wavelet(in_buf, step, out_buf);
 
       // Detail = previous_approx - current_approx.
-      // Apply soft noise thresholding (BayesShrink-style) at finest
-      // scales to suppress residual Wiener deconvolution noise.
-      const double extra_gain = scale_gains[scale] - 1.0;
-      if (extra_gain > 1e-6) {
+      // Apply capped adaptive thresholding so the finest bands stay
+      // responsive instead of being wiped out when BayesShrink spikes.
+      const double extra_gain = effective_scale_gains[scale] - 1.0;
+      if (std::abs(extra_gain) > 1e-6) {
         // Estimate noise σ at this scale using robust MAD estimator.
         // σ_noise ≈ median(|detail|) / 0.6745
         const double median_abs = approximate_median_from_samples(
@@ -1496,23 +1546,39 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
         const double sigma_sq_noise = sigma_noise * sigma_noise;
         const double sigma_sq_signal =
             std::max(sigma_sq_total - sigma_sq_noise, 1e-10);
-        // Use BayesShrink threshold for gentler denoising that
-        // preserves more genuine detail.
-        const double threshold =
-            denoise * sigma_sq_noise / std::sqrt(sigma_sq_signal);
+        const double threshold_floor =
+          sigma_noise * (0.75 + 0.20 * static_cast<double>(scale));
+        const double threshold_ceiling = threshold_floor * 2.5;
+        double threshold = 0.0;
+        if (sigma_noise > 1e-12) {
+          const double bayes_threshold =
+            sigma_sq_noise / std::max(std::sqrt(sigma_sq_signal), 0.35 * sigma_noise);
+          threshold = std::clamp(bayes_threshold, threshold_floor, threshold_ceiling);
+        }
+        threshold *= denoise;
+        threshold /= 1.0 + 0.35 * std::max(extra_gain, 0.0);
 
         #pragma omp parallel for schedule(static) if(pixel_count > 100000)
         for (size_t i = 0; i < pixel_count; ++i) {
-          double detail = approx_prev[i] - approx_cur[i];
-          // Soft-threshold: shrink toward zero.
-          if (detail > threshold)
-            detail -= threshold;
-          else if (detail < -threshold)
-            detail += threshold;
-          else
-            detail = 0.0;
+          const double raw_detail = approx_prev[i] - approx_cur[i];
+          double detail = raw_detail;
+          if (extra_gain >= 0.0) {
+            // Soft-threshold: shrink toward zero when boosting detail.
+            if (detail > threshold)
+              detail -= threshold;
+            else if (detail < -threshold)
+              detail += threshold;
+            else
+              detail = 0.0;
+          }
 
-          detail_accum[i] += extra_gain * enhancement_weight[i] * detail;
+          const double signal_floor = 0.15 + 0.05 * static_cast<double>(kNumScales - 1 - scale);
+          const double scale_weight =
+              confidence[i] * (signal_floor + (1.0 - signal_floor) * signal_weight[i]);
+          const double activity =
+              std::abs(raw_detail) / (std::abs(raw_detail) + threshold + 1e-6);
+          const double band_weight = scale_weight * (0.55 + 0.45 * activity);
+          detail_accum[i] += extra_gain * band_weight * detail;
         }
       }
 
@@ -3826,12 +3892,12 @@ ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata
   if (overrides.stage1_psf_sigma.has_value()) settings.stage1_psf_sigma = *overrides.stage1_psf_sigma;
   if (overrides.stage1_nsr.has_value()) settings.stage1_nsr = *overrides.stage1_nsr;
   if (overrides.stage2_denoise.has_value()) settings.stage2_denoise = *overrides.stage2_denoise;
-  if (overrides.stage2_gain0.has_value()) settings.stage2_gain0 = *overrides.stage2_gain0;
   if (overrides.stage2_gain1.has_value()) settings.stage2_gain1 = *overrides.stage2_gain1;
   if (overrides.stage2_gain2.has_value()) settings.stage2_gain2 = *overrides.stage2_gain2;
   if (overrides.stage2_gain3.has_value()) settings.stage2_gain3 = *overrides.stage2_gain3;
   if (overrides.stage3_radius.has_value()) settings.stage3_radius = *overrides.stage3_radius;
   if (overrides.stage3_gain.has_value()) settings.stage3_gain = *overrides.stage3_gain;
+  FinalizeStage2Settings(overrides, &settings);
   return settings;
 }
 

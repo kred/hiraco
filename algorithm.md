@@ -164,7 +164,6 @@ This is the part of the pipeline that tries to recover lost fine detail while li
 User-facing controls:
 
 - `Denoise`
-- `Fine Detail`
 - `Small Detail`
 - `Medium Detail`
 - `Large Detail`
@@ -173,7 +172,9 @@ Implementation summary:
 
 - run a non-decimated à trous wavelet decomposition
 - use Halide AOT code for the main wavelet filtering work
-- estimate per-scale noise and apply thresholding
+- drive the finest wavelet band from the `Small Detail` control with extra sensitivity so tiny texture remains adjustable without a dedicated fourth slider
+- estimate per-scale noise and apply capped adaptive thresholding so fine bands stay responsive
+- blend adjacent scale gains in both directions before reconstruction so the controls overlap more like practical detail shaping instead of isolated bins
 - re-add weighted detail according to the configured scale gains
 
 This is the main texture and micro-contrast shaping stage.
