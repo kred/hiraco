@@ -179,16 +179,17 @@ ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMeta
 
 // --- FFTW threading and wisdom management ---
 
-bool g_fftw_threads_initialized = false;
+std::once_flag g_fftw_init_flag;
+std::mutex g_fftw_wisdom_mutex;
 
 void InitFftwThreads() {
-  if (g_fftw_threads_initialized) return;
-  if (fftw_init_threads()) {
-    const int num_threads = static_cast<int>(std::thread::hardware_concurrency());
-    fftw_plan_with_nthreads(std::max(num_threads, 1));
-    std::cerr << "[hiraco] FFTW using " << std::max(num_threads, 1) << " threads\n";
-  }
-  g_fftw_threads_initialized = true;
+  std::call_once(g_fftw_init_flag, [] {
+    if (fftw_init_threads()) {
+      const int num_threads = static_cast<int>(std::thread::hardware_concurrency());
+      fftw_plan_with_nthreads(std::max(num_threads, 1));
+      std::cerr << "[hiraco] FFTW using " << std::max(num_threads, 1) << " threads\n";
+    }
+  });
 }
 
 std::string FftwWisdomPath() {
@@ -201,6 +202,7 @@ std::string FftwWisdomPath() {
 void LoadFftwWisdom() {
   const std::string path = FftwWisdomPath();
   if (!path.empty()) {
+    std::lock_guard<std::mutex> lock(g_fftw_wisdom_mutex);
     fftw_import_wisdom_from_filename(path.c_str());
   }
 }
@@ -208,6 +210,7 @@ void LoadFftwWisdom() {
 void SaveFftwWisdom() {
   const std::string path = FftwWisdomPath();
   if (!path.empty()) {
+    std::lock_guard<std::mutex> lock(g_fftw_wisdom_mutex);
     fftw_export_wisdom_to_filename(path.c_str());
   }
 }
@@ -1050,9 +1053,9 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   // original luma directly from the untouched RGB input.
   std::vector<double> base_luma(luma);
 
-  const bool enable_stage1 = true;  // Wiener deconvolution (FFT-based);
-  const bool enable_stage2 = true;  // Spatially varying gain modulation (stack stability/guide maps);
-  const bool enable_stage3 = true;  // Spatially varying gain modulation (tensor maps);
+  const bool enable_stage1 = true;
+  const bool enable_stage2 = true;
+  const bool enable_stage3 = true;
   constexpr size_t kRobustStatSampleTarget = 1u << 16;
 
   std::vector<double> confidence(pixel_count);
@@ -1437,7 +1440,6 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
               const double blend_confidence = enhancement_weight[i];
               const double suspicious = 1.0 - blend_confidence;
               const double mix = std::clamp(residual_smoothing * suspicious, 0.0, 1.0);
-              const double high_frequency_residual = residual[i] - smooth_residual[i];
               const double filtered_residual =
                   (1.0 - mix) * residual[i] + mix * smooth_residual[i];
               luma[i] = base_luma[i] + blend_confidence * filtered_residual;
@@ -1667,6 +1669,9 @@ std::string UnsupportedCompressionMessage(const std::string& compression) {
   return "Unsupported compression requested for the current DNG writer path";
 }
 
+// Forward declaration needed because ExtractCfaGuideImage precedes the definition.
+void ApplyOm3HighResCfaPrecondition(const SourceLinearDngMetadata& metadata, LibRaw* processor);
+
 bool ExtractCfaGuideImage(const std::string& source_path,
                           const SourceLinearDngMetadata& metadata,
                           RasterImage* guide,
@@ -1690,6 +1695,8 @@ bool ExtractCfaGuideImage(const std::string& source_path,
     processor->recycle();
     return false;
   }
+
+  ApplyOm3HighResCfaPrecondition(metadata, processor.get());
 
   const ushort* raw = processor->imgdata.rawdata.raw_image;
   const uint32_t width = processor->imgdata.sizes.raw_width;
