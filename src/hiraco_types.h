@@ -122,7 +122,7 @@ struct LibRawOverrideSet {
 };
 
 struct ResolvedStageSettings {
-  float stage1_psf_sigma = 2.0f;
+  float stage1_psf_sigma = 1.0f;
   float stage1_nsr = 0.09f;
   float stage2_denoise = 0.33f;
   float stage2_gain1 = 1.6f;

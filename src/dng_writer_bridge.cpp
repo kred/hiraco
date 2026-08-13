@@ -143,9 +143,6 @@ ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMeta
   (void) metadata;
 
   ResolvedStageSettings settings;
-  if (Is80MpFrame(width, height)) {
-    settings.stage1_psf_sigma = 2.5f;
-  }
 
   if (overrides.stage1_psf_sigma.has_value()) {
     settings.stage1_psf_sigma = *overrides.stage1_psf_sigma;
@@ -1021,13 +1018,12 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   const uint32_t height = image->height;
   const uint32_t colors = image->colors;
   const size_t pixel_count = static_cast<size_t>(width) * height;
-  // Scale NSR with sqrt(ISO/400) so high-ISO files get more conservative deconvolution.
+  // Only scale upward: ringing is more visible in clean low-ISO images, so never reduce below the tuned base.
   const double iso_nsr_scale = (metadata.has_exif_iso && metadata.exif_iso > 0.0f)
-      ? std::sqrt(static_cast<double>(metadata.exif_iso) / 400.0)
+      ? std::max(1.0, std::sqrt(static_cast<double>(metadata.exif_iso) / 400.0))
       : 1.0;
-  const double stage1_nsr = std::clamp(
+  const double stage1_nsr = std::min(
       static_cast<double>(settings.stage1_nsr) * iso_nsr_scale,
-      static_cast<double>(settings.stage1_nsr) * 0.5,
       0.25);
 
   if (colors != 3) {
@@ -1438,6 +1434,23 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
             }
           }
 
+          // CFA confidence fails near clipped pixels (G1/G2 agree when both saturate).
+          // A gradient gate on base_luma catches ringing-prone edges independently.
+          constexpr double kEdgeSuppressThresholdSq = 5000.0 * 5000.0;
+          std::vector<double> edge_suppress(pixel_count);
+          #pragma omp parallel for schedule(static) if(height > 100)
+          for (uint32_t row = 0; row < height; ++row) {
+            const size_t row_off = static_cast<size_t>(row) * width;
+            for (uint32_t col = 0; col < width; ++col) {
+              const double dx = 0.5 * (base_luma[row_off + col_next1[col]] -
+                                       base_luma[row_off + col_prev1[col]]);
+              const double dy = 0.5 * (base_luma[static_cast<size_t>(row_next1[row]) * width + col] -
+                                       base_luma[static_cast<size_t>(row_prev1[row]) * width + col]);
+              const double grad_sq = dx * dx + dy * dy;
+              edge_suppress[row_off + col] = kEdgeSuppressThresholdSq / (kEdgeSuppressThresholdSq + grad_sq);
+            }
+          }
+
           if (cfa_ok) {
             std::vector<double> residual(pixel_count, 0.0);
             #pragma omp parallel for schedule(static) if(pixel_count > 100000)
@@ -1457,12 +1470,12 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
               const double mix = std::clamp(residual_smoothing * suspicious, 0.0, 1.0);
               const double filtered_residual =
                   (1.0 - mix) * residual[i] + mix * smooth_residual[i];
-              luma[i] = base_luma[i] + blend_confidence * filtered_residual;
+              luma[i] = base_luma[i] + blend_confidence * edge_suppress[i] * filtered_residual;
             }
           } else {
             #pragma omp parallel for schedule(static) if(pixel_count > 100000)
             for (size_t i = 0; i < pixel_count; ++i) {
-              luma[i] = base_luma[i] + confidence[i] * (luma[i] - base_luma[i]);
+              luma[i] = base_luma[i] + confidence[i] * edge_suppress[i] * (luma[i] - base_luma[i]);
             }
           }
         }
@@ -1579,7 +1592,9 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
         for (size_t i = 0; i < pixel_count; ++i) {
           const double raw_detail = approx_prev[i] - approx_cur[i];
           const double local_threshold =
-              threshold * std::sqrt(std::max(approx_cur[i], 64.0) / signal_median);
+              threshold * std::clamp(
+                  std::sqrt(std::max(approx_cur[i], 64.0) / signal_median),
+                  0.3, 2.0);
           double detail = raw_detail;
           if (extra_gain >= 0.0) {
             // Soft-threshold: shrink toward zero when boosting detail.
