@@ -1021,7 +1021,14 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   const uint32_t height = image->height;
   const uint32_t colors = image->colors;
   const size_t pixel_count = static_cast<size_t>(width) * height;
-  const double stage1_nsr = settings.stage1_nsr;
+  // Scale NSR with sqrt(ISO/400) so high-ISO files get more conservative deconvolution.
+  const double iso_nsr_scale = (metadata.has_exif_iso && metadata.exif_iso > 0.0f)
+      ? std::sqrt(static_cast<double>(metadata.exif_iso) / 400.0)
+      : 1.0;
+  const double stage1_nsr = std::clamp(
+      static_cast<double>(settings.stage1_nsr) * iso_nsr_scale,
+      static_cast<double>(settings.stage1_nsr) * 0.5,
+      0.25);
 
   if (colors != 3) {
     return true;
@@ -1292,7 +1299,7 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   if (enable_stage1) {
     const hiraco::ScopedTimingLog timer("enhance", "Stage 1 detail recovery");
     const float psf_sigma = settings.stage1_psf_sigma;
-    const float nsr = settings.stage1_nsr;
+    const float nsr = static_cast<float>(stage1_nsr);
 
     // Mirror-pad margins — enough to cover the PSF support and avoid
     // wrap-around artefacts.  32 px border is ample for σ ≤ 2.
@@ -1619,20 +1626,21 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
   constexpr double kMinLuma = 1.0;
   constexpr double kMinRatio = 0.3;
   constexpr double kMaxRatio = 4.0;
+  // Below this luma, blend ratio toward 1.0 to suppress noise-driven ratio instability near black.
+  constexpr double kShadowBlendRange = 1500.0;
 
   const auto stage4_start = std::chrono::steady_clock::now();
 
   #pragma omp parallel for schedule(static) if(pixel_count > 100000)
   for (size_t i = 0; i < pixel_count; ++i) {
     const size_t px = i * colors;
-    const double orig_y = std::max(
-        kLumaR * image->pixels[px] +
-        kLumaG * image->pixels[px + 1] +
-        kLumaB * image->pixels[px + 2],
-        kMinLuma);
+    const double raw_orig_y = kLumaR * image->pixels[px] +
+                               kLumaG * image->pixels[px + 1] +
+                               kLumaB * image->pixels[px + 2];
+    const double orig_y = std::max(raw_orig_y, kMinLuma);
     const double enhanced_y = std::max(luma[i], 0.0);
-    double ratio = enhanced_y / orig_y;
-    ratio = std::clamp(ratio, kMinRatio, kMaxRatio);
+    double ratio = std::clamp(enhanced_y / orig_y, kMinRatio, kMaxRatio);
+    ratio = 1.0 + std::clamp(raw_orig_y / kShadowBlendRange, 0.0, 1.0) * (ratio - 1.0);
 
     for (uint32_t ch = 0; ch < colors; ++ch) {
       const double val = static_cast<double>(image->pixels[px + ch]) * ratio;
