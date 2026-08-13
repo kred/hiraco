@@ -1307,11 +1307,19 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     const uint32_t padded_w = width + 2 * kPadMargin;
     const uint32_t padded_h = height + 2 * kPadMargin;
 
-    // Round up to efficient FFT size (next power of 2).
-    uint32_t fft_w = 1;
-    while (fft_w < padded_w) fft_w <<= 1;
-    uint32_t fft_h = 1;
-    while (fft_h < padded_h) fft_h <<= 1;
+    // Round up to next FFTW-efficient size (only factors 2, 3, 5 — smaller than next power-of-2).
+    auto next_smooth = [](uint32_t n) {
+      while (true) {
+        uint32_t k = n;
+        while (k % 2 == 0) k /= 2;
+        while (k % 3 == 0) k /= 3;
+        while (k % 5 == 0) k /= 5;
+        if (k == 1) return n;
+        ++n;
+      }
+    };
+    const uint32_t fft_w = next_smooth(padded_w);
+    const uint32_t fft_h = next_smooth(padded_h);
 
     const size_t fft_n = static_cast<size_t>(fft_w) * fft_h;
     const size_t complex_n = static_cast<size_t>(fft_h) * (fft_w / 2 + 1);
@@ -1560,16 +1568,25 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
         threshold *= denoise;
         threshold /= 1.0 + 0.35 * std::max(extra_gain, 0.0);
 
+        // Poisson noise variance ∝ signal, so scale threshold by sqrt(local / global_median).
+        const double signal_median = std::max(
+            approximate_median_from_samples(
+                kRobustStatSampleTarget,
+                [&](size_t i) { return approx_cur[i]; }),
+            64.0);
+
         #pragma omp parallel for schedule(static) if(pixel_count > 100000)
         for (size_t i = 0; i < pixel_count; ++i) {
           const double raw_detail = approx_prev[i] - approx_cur[i];
+          const double local_threshold =
+              threshold * std::sqrt(std::max(approx_cur[i], 64.0) / signal_median);
           double detail = raw_detail;
           if (extra_gain >= 0.0) {
             // Soft-threshold: shrink toward zero when boosting detail.
-            if (detail > threshold)
-              detail -= threshold;
-            else if (detail < -threshold)
-              detail += threshold;
+            if (detail > local_threshold)
+              detail -= local_threshold;
+            else if (detail < -local_threshold)
+              detail += local_threshold;
             else
               detail = 0.0;
           }
@@ -1578,7 +1595,7 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
           const double scale_weight =
               confidence[i] * (signal_floor + (1.0 - signal_floor) * signal_weight[i]);
           const double activity =
-              std::abs(raw_detail) / (std::abs(raw_detail) + threshold + 1e-6);
+              std::abs(raw_detail) / (std::abs(raw_detail) + local_threshold + 1e-6);
           const double band_weight = scale_weight * (0.55 + 0.45 * activity);
           detail_accum[i] += extra_gain * band_weight * detail;
         }
