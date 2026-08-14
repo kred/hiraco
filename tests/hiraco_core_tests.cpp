@@ -82,6 +82,34 @@ RasterImage MakeSyntheticTexturedRgb(uint32_t width, uint32_t height) {
   return image;
 }
 
+RasterImage MakeSyntheticHighlightRgb(uint32_t width, uint32_t height) {
+  RasterImage image;
+  image.width = width;
+  image.height = height;
+  image.colors = 3;
+  image.bits = 16;
+  image.pixels.resize(static_cast<size_t>(width) * height * image.colors);
+
+  for (uint32_t row = 0; row < height; ++row) {
+    for (uint32_t col = 0; col < width; ++col) {
+      const size_t index = (static_cast<size_t>(row) * width + col) * image.colors;
+      const double checker = ((row / 8 + col / 8) & 1) == 0 ? 1.0 : -1.0;
+      const double ripple = 1200.0 * std::sin(0.31 * static_cast<double>(row + col));
+      image.pixels[index + 0] = static_cast<uint16_t>(std::clamp(50500.0 + checker * 7200.0 + ripple,
+                                                                   0.0,
+                                                                   65534.0));
+      image.pixels[index + 1] = static_cast<uint16_t>(std::clamp(56000.0 + checker * 7600.0 + ripple,
+                                                                   0.0,
+                                                                   65534.0));
+      image.pixels[index + 2] = static_cast<uint16_t>(std::clamp(47000.0 + checker * 6800.0 + ripple,
+                                                                   0.0,
+                                                                   65534.0));
+    }
+  }
+
+  return image;
+}
+
 RasterImage MakeSyntheticGuide(uint32_t width, uint32_t height) {
   RasterImage image;
   image.width = width;
@@ -269,8 +297,22 @@ void TestResolvedStageDefaults() {
   const SourceLinearDngMetadata metadata = MakeHighResMetadata();
   const ResolvedStageSettings fifty_mp = ResolveStageSettingsForImage(metadata, 8172, 6132, {});
   const ResolvedStageSettings eighty_mp = ResolveStageSettingsForImage(metadata, 10386, 7792, {});
-  Expect(std::abs(fifty_mp.stage1_psf_sigma - 2.0f) < 1e-6f, "50 MP default sigma should be 2.0");
-  Expect(std::abs(eighty_mp.stage1_psf_sigma - 2.5f) < 1e-6f, "80 MP default sigma should be 2.5");
+  Expect(std::abs(fifty_mp.stage1_psf_sigma - 1.0f) < 1e-6f, "50 MP default sigma should be 1.0");
+  Expect(std::abs(eighty_mp.stage1_psf_sigma - 1.0f) < 1e-6f, "80 MP default sigma should be 1.0");
+}
+
+void TestEnhancementPreservesHighlightHeadroom() {
+  SourceLinearDngMetadata metadata = MakeHighResMetadata();
+  metadata.black_level = 0.0;
+  const RasterImage source = MakeSyntheticHighlightRgb(384, 384);
+  const ResolvedStageSettings settings =
+      ResolveStageSettingsForImage(metadata, source.width, source.height, {});
+  const RasterImage enhanced = RunEnhancementForTesting(source, nullptr, metadata, settings);
+
+  for (uint16_t sample : enhanced.pixels) {
+    Expect(sample < 65535,
+           "detail enhancement must not clip an originally unclipped highlight");
+  }
 }
 
 void TestRealOrfPreviewSmoke() {
@@ -488,6 +530,7 @@ int main() {
     TestOverwriteDecision();
     TestCropHelpers();
     TestResolvedStageDefaults();
+    TestEnhancementPreservesHighlightHeadroom();
     TestRealOrfPreviewSmoke();
     TestRealOrfCropPreviewFollowsCropRect();
     TestRealOrfPreviewAutoBrightGainEstimate();

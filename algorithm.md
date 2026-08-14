@@ -133,7 +133,11 @@ At a high level it performs:
 5. Reconstruct a base green plane.
 6. Refine that green plane with guide-aware directional logic.
 7. Apply stability-driven green detail lift.
-8. Reconstruct final RGB output from the green plane plus red/blue difference interpolation.
+8. Constrain every positive green reconstruction adjustment by its local linear
+   headroom. An input below sensor white remains below sensor white; genuinely
+   clipped source samples remain identifiable as such rather than being expanded
+   into a larger clipped area.
+9. Reconstruct final RGB output from the green plane plus red/blue difference interpolation.
 
 This path is where most high-res specific image recovery happens before the later enhancement stages.
 
@@ -194,7 +198,7 @@ Implementation summary:
 
 ### 7.4 Ratio Transfer
 
-After the luma pipeline is complete, the enhanced luma is transferred back onto RGB through a multiplicative ratio step.
+After the luma pipeline is complete, the enhanced luma is transferred back onto RGB through a multiplicative ratio step. Positive ratio gain is limited by the brightest input channel's remaining linear headroom. In normalized form, a channel at `x` can rise no higher than `2x - x²`; this is strictly below white for `0 < x < 1`, so detail enhancement cannot turn an originally recoverable highlight into a clipped DNG sample.
 
 This part is not surfaced as a separate GUI section, but it is still part of the internal enhancement pipeline.
 

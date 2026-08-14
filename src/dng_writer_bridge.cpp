@@ -1005,6 +1005,7 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
                               const ResolvedStageSettings& settings,
                               const RasterImage* cfa_guide_image,
                               RasterImage* image,
+                              double pixel_ceiling,
                               ProgressCallback progress,
                               CancelCheck cancel,
                               std::string* error_message) {
@@ -1674,6 +1675,21 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     double ratio = std::clamp(enhanced_y / orig_y, kMinRatio, kMaxRatio);
     ratio = 1.0 + std::clamp(raw_orig_y / kShadowBlendRange, 0.0, 1.0) * (ratio - 1.0);
 
+    // Preserve highlight headroom during the luma-to-RGB transfer.  Clamping
+    // the result at pixel_ceiling merely turns every overshoot into a newly
+    // clipped sample, which is irreversible in a linear DNG.  Instead, make
+    // the permitted positive gain vanish as the brightest source channel
+    // approaches the ceiling.  For 0 < x < 1 this limits x to at most
+    // 2x - x^2, which is strictly below 1; a source sample that was below the
+    // ceiling therefore cannot become clipped because of enhancement.
+    double max_channel = 0.0;
+    for (uint32_t ch = 0; ch < colors; ++ch) {
+      max_channel = std::max(max_channel, static_cast<double>(image->pixels[px + ch]));
+    }
+    if (max_channel > 0.0) {
+      ratio = std::min(ratio, pixel_ceiling / max_channel);
+    }
+
     for (uint32_t ch = 0; ch < colors; ++ch) {
       const double val = static_cast<double>(image->pixels[px + ch]) * ratio;
       image->pixels[px + ch] = static_cast<uint16_t>(std::clamp(val, 0.0, 65535.0));
@@ -2157,6 +2173,23 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
     return static_cast<uint16_t>(std::clamp(pedestal + value, 0.0, 65535.0));
   };
 
+  // Detail reconstruction is allowed to brighten a sample, but cannot spend
+  // its last unit of headroom.  This keeps a value that was below sensor white
+  // below sensor white after reconstruction; any already-clipped input remains
+  // clipped rather than being treated as recoverable detail.
+  auto limit_highlight_increase = [&](double original, double candidate) -> double {
+    original = std::clamp(original, 0.0, max_signal);
+    if (candidate <= original || original >= max_signal) {
+      return std::clamp(candidate, 0.0, max_signal);
+    }
+    // Use a one-code-value floor for black.  It avoids a division/ratio
+    // special case while retaining the same no-new-clipping invariant there.
+    const double normalized_original = std::max(original, 1.0) / max_signal;
+    const double headroom_limit =
+        max_signal * (2.0 * normalized_original - normalized_original * normalized_original);
+    return std::clamp(std::min(candidate, headroom_limit), 0.0, max_signal);
+  };
+
   auto clamp_row = [&](int row) -> uint32_t {
     return static_cast<uint32_t>(std::clamp(row, 0, static_cast<int>(height) - 1));
   };
@@ -2565,10 +2598,11 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
                            0.10 * alias_conf * guide_anisotropy,
                        0.04,
                        0.18);
-        refined_green[idx] = static_cast<WorkingValue>(std::clamp(
-          (1.0 - blend_weight) * static_cast<double>(green[idx]) + blend_weight * estimate,
-          0.0,
-          65535.0 - pedestal));
+        const double original_green = green[idx];
+        const double candidate_green =
+            (1.0 - blend_weight) * original_green + blend_weight * estimate;
+        refined_green[idx] = static_cast<WorkingValue>(
+            limit_highlight_increase(original_green, candidate_green));
       }
     }
     green.swap(refined_green);
@@ -2669,10 +2703,11 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
             std::clamp(green_detail,
                        -(0.45 * cap_scale) * local_scale - 320.0,
                         (0.45 * cap_scale) * local_scale + 320.0);
-        green[idx] = static_cast<WorkingValue>(std::clamp(
-            static_cast<double>(green[idx]) + detail_strength * detail_boost * mask * capped_detail,
-            0.0,
-            65535.0 - pedestal));
+        const double original_green = green[idx];
+        const double candidate_green =
+            original_green + detail_strength * detail_boost * mask * capped_detail;
+        green[idx] = static_cast<WorkingValue>(
+            limit_highlight_increase(original_green, candidate_green));
       }
     }
   }
@@ -3536,6 +3571,7 @@ bool ApplyResolvedStageSettingsForTesting(const SourceLinearDngMetadata& metadat
                                   settings,
                                   cfa_guide_image,
                                   image,
+                                  65535.0,
                                   progress,
                                   cancel,
                                   error_message);
@@ -3633,6 +3669,7 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                   settings,
                                   guide_ptr,
                                   &crop_image,
+                                  65535.0,
                                   progress,
                                   cancel,
                                   error_message)) {
@@ -3652,6 +3689,7 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                   settings,
                                   guide_ptr,
                                   &crop_image,
+                                  65535.0 - pedestal,
                                   progress,
                                   cancel,
                                   error_message)) {
@@ -3792,6 +3830,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                     resolved_settings,
                                     &payload.cfa_guide_image,
                                     &payload.raw_image,
+                                    65535.0,
                                     progress,
                                     cancel,
                                     &result.message)) {
@@ -3812,6 +3851,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                     resolved_settings,
                                     &payload.cfa_guide_image,
                                     &payload.raw_image,
+                                    65535.0 - pedestal,
                                     progress,
                                     cancel,
                                     &result.message)) {

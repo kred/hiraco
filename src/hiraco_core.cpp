@@ -390,9 +390,17 @@ bool BuildEnhancementMetadata(const std::string& source_path,
       enriched_metadata->working_height = maker_note.working_height;
     }
 
-    if (maker_note.has_stacked_image &&
-        maker_note.stacked_image_label == "Hand-held high resolution (11 12)" &&
-        !maker_note.unknown_block_3.empty()) {
+    // Extract guidance for any high-res capture (50 MP handheld, 80 MP tripod, ORI single frames)
+    // if UnknownBlock3 is present with the expected size.  The label gate was too narrow:
+    // tripod ORF files and ORI files carry byte-identical block3 but different stacked labels.
+    const bool is_om3_high_res =
+        enriched_metadata->has_default_crop &&
+        ((enriched_metadata->default_crop_origin_h == 6 &&
+          enriched_metadata->default_crop_width == 8160) ||
+         (enriched_metadata->default_crop_origin_h == 8 &&
+          enriched_metadata->default_crop_width == 10368));
+
+    if (is_om3_high_res && maker_note.unknown_block_3.size() == 63488) {
       StackGuidanceMaps guidance;
       {
         const hiraco::ScopedTimingLog timer("metadata", "Compute stack guidance");
