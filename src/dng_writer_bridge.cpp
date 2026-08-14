@@ -994,6 +994,63 @@ void ApplyLinearGain(double gain, RasterImage* image) {
   }
 }
 
+double SoftLimitWhiteBalancedHighlightPeak(double peak) {
+  constexpr double kShoulderStart = 0.80;
+  constexpr double kShoulderLimit = 0.85;
+  if (peak <= kShoulderStart) {
+    return peak;
+  }
+
+  const double shoulder = kShoulderLimit - kShoulderStart;
+  if (shoulder <= 0.0) {
+    return std::min(peak, kShoulderLimit);
+  }
+
+  const double x = peak - kShoulderStart;
+  return kShoulderStart + shoulder * (1.0 - std::exp(-x / shoulder));
+}
+
+void ReapplyCameraSpacePedestalWithHighlightShoulder(const SourceLinearDngMetadata& metadata,
+                                                     double pedestal,
+                                                     RasterImage* image) {
+  if (image == nullptr || image->colors == 0 || pedestal <= 0.0) {
+    return;
+  }
+
+  const uint32_t colors = image->colors;
+  const size_t pixel_count = static_cast<size_t>(image->width) * image->height;
+  const double signal_range = 65535.0 - pedestal;
+  const bool has_as_shot_neutral = metadata.has_as_shot_neutral && colors >= 3;
+
+  #pragma omp parallel for schedule(static) if(pixel_count > 100000)
+  for (size_t index = 0; index < pixel_count; ++index) {
+    const size_t sample_index = index * colors;
+    double highlight_scale = 1.0;
+
+    if (has_as_shot_neutral) {
+      double white_balanced_peak = 0.0;
+      for (uint32_t channel = 0; channel < 3; ++channel) {
+        const double safe_limit = std::max(
+            std::min(metadata.as_shot_neutral[channel], 1.0) * signal_range,
+            1.0);
+        white_balanced_peak = std::max(
+            white_balanced_peak,
+            static_cast<double>(image->pixels[sample_index + channel]) / safe_limit);
+      }
+
+      const double mapped_peak = SoftLimitWhiteBalancedHighlightPeak(white_balanced_peak);
+      if (mapped_peak < white_balanced_peak && white_balanced_peak > 1e-9) {
+        highlight_scale = mapped_peak / white_balanced_peak;
+      }
+    }
+
+    for (uint32_t channel = 0; channel < colors; ++channel) {
+      const double value = static_cast<double>(image->pixels[sample_index + channel]) * highlight_scale + pedestal;
+      image->pixels[sample_index + channel] = static_cast<uint16_t>(std::clamp(value, 0.0, 65535.0));
+    }
+  }
+}
+
 void ApplyLinearDngRasterTransform(const SourceLinearDngMetadata& metadata,
                                    RasterImage* image) {
   if (ShouldApplyOm3SourceDrivenLinearTransform(metadata, *image)) {
@@ -1687,7 +1744,15 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
       max_channel = std::max(max_channel, static_cast<double>(image->pixels[px + ch]));
     }
     if (max_channel > 0.0) {
-      ratio = std::min(ratio, pixel_ceiling / max_channel);
+      if (max_channel < pixel_ceiling) {
+        // Headroom-preserving: a non-saturated pixel cannot be pushed to saturation.
+        // The quadratic limit (2-n) keeps max_channel*(2-n) = pixel_ceiling*(2n-n²) < pixel_ceiling.
+        const double n = max_channel / pixel_ceiling;
+        ratio = std::min(ratio, 2.0 - n);
+      } else {
+        // Already at or above ceiling; do not amplify further.
+        ratio = std::min(ratio, 1.0);
+      }
     }
 
     for (uint32_t ch = 0; ch < colors; ++ch) {
@@ -3696,12 +3761,7 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
       return false;
     }
 
-    if (pedestal > 0.0) {
-      for (uint16_t& sample : crop_image.pixels) {
-        const double value = static_cast<double>(sample) + pedestal;
-        sample = static_cast<uint16_t>(std::clamp(value, 0.0, 65535.0));
-      }
-    }
+    ReapplyCameraSpacePedestalWithHighlightShoulder(metadata, pedestal, &crop_image);
   }
 
   if (CheckCancelled(cancel, error_message)) {
@@ -3858,12 +3918,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
         return result;
       }
       
-      if (pedestal > 0.0) {
-        for (size_t i = 0; i < pcount * payload.raw_image.colors; ++i) {
-          double val = static_cast<double>(payload.raw_image.pixels[i]) + pedestal;
-          payload.raw_image.pixels[i] = static_cast<uint16_t>(std::clamp(val, 0.0, 65535.0));
-        }
-      }
+      ReapplyCameraSpacePedestalWithHighlightShoulder(metadata, pedestal, &payload.raw_image);
     }
 
     CallbackAbortSniffer sniffer(progress, cancel);

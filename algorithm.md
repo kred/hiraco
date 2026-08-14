@@ -138,6 +138,9 @@ At a high level it performs:
    clipped source samples remain identifiable as such rather than being expanded
    into a larger clipped area.
 9. Reconstruct final RGB output from the green plane plus red/blue difference interpolation.
+10. Before crop-preview display or DNG write, reapply the camera-space pedestal
+  and a white-balance-aware highlight shoulder so recoverable highlights roll
+  off smoothly instead of being hard-clamped onto a flat ceiling.
 
 This path is where most high-res specific image recovery happens before the later enhancement stages.
 
