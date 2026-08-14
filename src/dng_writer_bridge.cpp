@@ -3239,7 +3239,10 @@ void PopulateLinearRawNegative(dng_host& host,
     negative.SetBlackLevel(0.0);
   }
   negative.SetWhiteLevel((1u << raw_image.bits) - 1);
-  negative.SetBaselineExposure(std::log2(std::max(preview_auto_bright_gain, 1e-6)));
+  // BaselineExposure 0: pixel values are already correctly normalised to [BlackLevel, WhiteLevel].
+  // preview_auto_bright_gain is a GUI display convenience only — embedding it here would
+  // make downstream apps render the DNG several EV brighter than the original raw.
+  negative.SetBaselineExposure(0.0);
   negative.SetLinearResponseLimit(1.0);
 
   if (dng_exif* exif = negative.GetExif()) {
