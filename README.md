@@ -18,6 +18,10 @@ The current implementation supports both a custom high-resolution raw-domain rec
 - `hiraco-cli`: command-line `convert` frontend.
 - `hiraco-gui`: wxWidgets desktop frontend with queueing, preview, crop inspection, output controls, and conversion.
 - Custom high-resolution raw-domain reconstruction driven by vendor metadata and stack-guidance maps.
+- Optional, per-file ORI-assisted highlight recovery for supported high-resolution
+  ORFs when a same-directory companion candidate is detected.  The correction is
+  disabled by default and is subtractive: it preserves high-resolution detail
+  while borrowing only a lower highlight base from the companion.
 - Rendered Linear DNG output with `uncompressed`, `deflate`, and `jpeg-xl` compression modes.
 - Three user-facing processing control groups in the GUI:
   - `Detail Recovery`
@@ -135,6 +139,8 @@ The GUI currently supports:
 - A movable crop box with live converted crop preview
 - Compression and output-path configuration
 - Interactive processing controls for detail recovery, multi-scale detail, and edge refinement
+- Per-file `HL Rec` switch when a high-resolution ORF has a detected companion
+  candidate; it is off by default
 - Overwrite prompts, progress reporting, and cancellation
 
 ## Tests
@@ -160,9 +166,14 @@ At a high level, the current pipeline is:
    - a cached converted crop preview, or
    - a full rendered Linear DNG payload.
 4. Apply enhancement stages when the source metadata requests predicted detail gain.
-5. Package the final rendered image through the Adobe DNG SDK.
+5. Optionally apply ORI-assisted highlight recovery for an enabled, detected
+   companion.
+6. Package the final rendered image through the Adobe DNG SDK.
 
-See [algorithm.md](algorithm.md) for the current implementation-level processing description.
+Companion detection is currently filename-based only; it does not verify that the
+ORI/ORF pair belongs to the same capture.  Enable `HL Rec` only for known matching
+pairs.  See [algorithm.md](algorithm.md) for the implementation details and current
+limitations.
 
 ## Legal Disclaimer
 

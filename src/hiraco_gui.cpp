@@ -53,6 +53,7 @@ struct QueueItem {
   std::string source_path;
   std::filesystem::path target_path;
   std::optional<PreparedSource> prepared;
+  bool enable_highlight_recovery = false;
   StageOverrideSet stage_overrides;
   wxString resolution_label;
   wxString state = "Ready";
@@ -117,6 +118,16 @@ wxString ProcessedMarkerForItem(const QueueItem& item) {
 
 wxString SettingsMarkerForItem(const QueueItem& item) {
   return item.stage_overrides.HasAnyOverrides() ? "Custom" : "Default";
+}
+
+wxString HighlightRecoveryMarkerForItem(const QueueItem& item) {
+  if (!item.prepared.has_value()) {
+    return item.resolution_label == "..." ? "..." : "n/a";
+  }
+  if (!item.prepared->HasHighlightRecoverySource()) {
+    return "n/a";
+  }
+  return item.enable_highlight_recovery ? "On" : "Off";
 }
 
 bool Is50MpFrame(const PreparedSource& prepared) {
@@ -1340,6 +1351,7 @@ class HiracoMainFrame final : public wxFrame {
     compression_choice_->Bind(wxEVT_CHOICE, &HiracoMainFrame::OnCompressionChanged, this);
     zoom_choice_->Bind(wxEVT_CHOICE, &HiracoMainFrame::OnZoomChanged, this);
     queue_ctrl_->Bind(wxEVT_LIST_ITEM_SELECTED, &HiracoMainFrame::OnQueueSelectionChanged, this);
+    queue_ctrl_->Bind(wxEVT_LEFT_DOWN, &HiracoMainFrame::OnQueueLeftDown, this);
     queue_ctrl_->Bind(wxEVT_MOTION, &HiracoMainFrame::OnQueueMouseMove, this);
     queue_ctrl_->Bind(wxEVT_LEAVE_WINDOW, &HiracoMainFrame::OnQueueMouseLeave, this);
     Bind(wxEVT_MENU, &HiracoMainFrame::OnQuit, this, wxID_EXIT);
@@ -1997,8 +2009,11 @@ class HiracoMainFrame final : public wxFrame {
     queue_ctrl_->AppendColumn("File", wxLIST_FORMAT_LEFT, queue_details_expanded_ ? 180 : 220);
     if (queue_details_expanded_) {
       queue_ctrl_->AppendColumn("Size", wxLIST_FORMAT_CENTER, 72);
+      queue_ctrl_->AppendColumn("HL Rec", wxLIST_FORMAT_CENTER, 72);
       queue_ctrl_->AppendColumn("Settings", wxLIST_FORMAT_CENTER, 82);
       queue_ctrl_->AppendColumn("Target", wxLIST_FORMAT_LEFT, 240);
+    } else {
+      queue_ctrl_->AppendColumn("HL Rec", wxLIST_FORMAT_CENTER, 72);
     }
     queue_ctrl_->AppendColumn("Processed", wxLIST_FORMAT_CENTER, 112);
   }
@@ -2006,13 +2021,15 @@ class HiracoMainFrame final : public wxFrame {
   void PopulateQueueRow(long row, const QueueItem& item) {
     if (queue_details_expanded_) {
       queue_ctrl_->SetItem(row, 1, item.resolution_label);
-      queue_ctrl_->SetItem(row, 2, SettingsMarkerForItem(item));
-      queue_ctrl_->SetItem(row, 3, item.target_path.string());
-      queue_ctrl_->SetItem(row, 4, ProcessedMarkerForItem(item));
+      queue_ctrl_->SetItem(row, 2, HighlightRecoveryMarkerForItem(item));
+      queue_ctrl_->SetItem(row, 3, SettingsMarkerForItem(item));
+      queue_ctrl_->SetItem(row, 4, item.target_path.string());
+      queue_ctrl_->SetItem(row, 5, ProcessedMarkerForItem(item));
       return;
     }
 
-    queue_ctrl_->SetItem(row, 1, ProcessedMarkerForItem(item));
+    queue_ctrl_->SetItem(row, 1, HighlightRecoveryMarkerForItem(item));
+    queue_ctrl_->SetItem(row, 2, ProcessedMarkerForItem(item));
   }
 
   void ApplyQueueViewMode() {
@@ -2020,7 +2037,7 @@ class HiracoMainFrame final : public wxFrame {
       return;
     }
 
-    const int desired_left_width = queue_details_expanded_ ? 690 : 368;
+    const int desired_left_width = queue_details_expanded_ ? 780 : 430;
     const int selected_row = selected_row_;
 
     ConfigureQueueColumns();
@@ -2117,6 +2134,51 @@ class HiracoMainFrame final : public wxFrame {
     }
   }
 
+  int HighlightRecoveryColumnIndex() const {
+    return queue_details_expanded_ ? 2 : 1;
+  }
+
+  int QueueColumnAtX(int x) const {
+    if (!queue_ctrl_) {
+      return -1;
+    }
+
+    int offset = 0;
+    const int column_count = queue_ctrl_->GetColumnCount();
+    for (int column = 0; column < column_count; ++column) {
+      offset += queue_ctrl_->GetColumnWidth(column);
+      if (x < offset) {
+        return column;
+      }
+    }
+
+    return column_count > 0 ? column_count - 1 : -1;
+  }
+
+  void OnQueueLeftDown(wxMouseEvent& event) {
+    int flags = 0;
+    const wxPoint point = event.GetPosition();
+    const long row = queue_ctrl_->HitTest(point, flags);
+    if (row != wxNOT_FOUND && row >= 0 && row < static_cast<long>(queue_.size()) &&
+        QueueColumnAtX(point.x) == HighlightRecoveryColumnIndex()) {
+      QueueItem& item = queue_[static_cast<size_t>(row)];
+      if (item.prepared.has_value() && item.prepared->HasHighlightRecoverySource()) {
+        item.enable_highlight_recovery = !item.enable_highlight_recovery;
+        item.prepared->enable_highlight_recovery = item.enable_highlight_recovery;
+        item.message = item.enable_highlight_recovery
+            ? "ORI-assisted highlight recovery enabled"
+            : "ORI-assisted highlight recovery disabled";
+        RefreshQueueRow(static_cast<int>(row));
+        if (row == selected_row_) {
+          status_label_->SetLabel(item.message);
+          ScheduleCropPreview(false);
+        }
+      }
+    }
+
+    event.Skip();
+  }
+
   void OnQueueMouseMove(wxMouseEvent& event) {
     int flags = 0;
     const wxPoint point = event.GetPosition();
@@ -2128,10 +2190,22 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     const QueueItem& item = queue_[static_cast<size_t>(row)];
-    const int file_width = queue_ctrl_->GetColumnWidth(0);
     wxString tooltip;
-    if (point.x < file_width) {
+    const int column = QueueColumnAtX(point.x);
+    if (column == 0) {
       tooltip = item.source_path;
+    } else if (column == HighlightRecoveryColumnIndex()) {
+      if (!item.prepared.has_value()) {
+        tooltip = item.resolution_label == "..."
+            ? wxString("Reading file metadata...")
+            : wxString("No highlight recovery companion detected");
+      } else if (!item.prepared->HasHighlightRecoverySource()) {
+        tooltip = "No ORI companion detected for this file";
+      } else {
+        tooltip = wxString::Format("Click to %s ORI-assisted highlight recovery\n%s",
+                                   item.enable_highlight_recovery ? "disable" : "enable",
+                                   item.prepared->highlight_recovery_source_path);
+      }
     } else if (!queue_details_expanded_) {
       if (item.state == "Done") {
         tooltip = "Converted";
@@ -2143,10 +2217,7 @@ class HiracoMainFrame final : public wxFrame {
         tooltip = "Not converted yet";
       }
     } else {
-      const int size_width = queue_ctrl_->GetColumnWidth(1);
-      const int settings_width = queue_ctrl_->GetColumnWidth(2);
-      const int target_width = queue_ctrl_->GetColumnWidth(3);
-      if (point.x < file_width + size_width) {
+      if (column == 1) {
         if (item.prepared.has_value()) {
           tooltip = ResolutionTooltipForPrepared(*item.prepared);
         } else if (item.resolution_label == "...") {
@@ -2154,11 +2225,11 @@ class HiracoMainFrame final : public wxFrame {
         } else {
           tooltip = "Resolution unavailable";
         }
-      } else if (point.x < file_width + size_width + settings_width) {
+      } else if (column == 3) {
         tooltip = item.stage_overrides.HasAnyOverrides()
                       ? wxString("Custom per-file processing settings")
                       : wxString("Using file-specific defaults");
-      } else if (point.x < file_width + size_width + settings_width + target_width) {
+      } else if (column == 4) {
         tooltip = item.target_path.string();
       } else if (item.state == "Done") {
         tooltip = "Converted";
@@ -2337,6 +2408,8 @@ class HiracoMainFrame final : public wxFrame {
         }
       }
 
+      prepared.enable_highlight_recovery = item_copy.enable_highlight_recovery;
+
       payload.prepared = prepared;
 
       auto original = std::make_shared<PreviewImage>();
@@ -2397,6 +2470,7 @@ class HiracoMainFrame final : public wxFrame {
     crop_cancel_ = std::make_shared<std::atomic_bool>(false);
     const uint64_t item_id = item.id;
     PreparedSource prepared = *item.prepared;
+    prepared.enable_highlight_recovery = item.enable_highlight_recovery;
     const CropRect display_crop_rect = *current_crop_rect_;
     const CropRect crop_rect = MapDisplayCropToProcessingCrop(display_crop_rect, prepared);
     const StageOverrideSet stage_overrides = ResolveEffectiveStageOverrides(item.stage_overrides);
@@ -2756,6 +2830,7 @@ class HiracoMainFrame final : public wxFrame {
       if (!queue_[index].prepared.has_value()) {
         queue_[index].prepared = payload.prepared;
       }
+      queue_[index].prepared->enable_highlight_recovery = queue_[index].enable_highlight_recovery;
       queue_[index].resolution_label = ResolutionLabelForPrepared(*queue_[index].prepared);
     } else if (queue_[index].resolution_label == "...") {
       queue_[index].resolution_label = "?";
@@ -2796,6 +2871,7 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     queue_[index].prepared = payload.prepared;
+  queue_[index].prepared->enable_highlight_recovery = queue_[index].enable_highlight_recovery;
     queue_[index].resolution_label = ResolutionLabelForPrepared(payload.prepared);
     queue_[index].state = "Ready";
     queue_[index].message = "Original preview ready";
@@ -2910,6 +2986,7 @@ class HiracoMainFrame final : public wxFrame {
             continue;
           }
         }
+        prepared.enable_highlight_recovery = item.enable_highlight_recovery;
 
         const bool target_exists = std::filesystem::exists(item.target_path);
         if (target_exists) {

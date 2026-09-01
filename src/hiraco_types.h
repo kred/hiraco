@@ -210,6 +210,7 @@ struct ProcessingCache {
   RasterImage raw_image;
   RasterImage cfa_guide_image;
   bool raw_image_is_camera_space = false;
+  bool highlight_recovery_enabled = false;
   double preview_auto_bright_gain = 1.0;
   uint32_t source_width = 0;
   uint32_t source_height = 0;

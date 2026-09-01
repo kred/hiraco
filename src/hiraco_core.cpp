@@ -12,6 +12,7 @@
 #include <libraw/libraw.h>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -78,6 +79,53 @@ bool ReadEnvFloat(const char* name, float* value) {
 
   *value = parsed;
   return true;
+}
+
+bool IsOm3HighResSummary(const DecodeSummary& summary) {
+  const bool is_50mp_high_res = summary.has_default_crop &&
+      summary.default_crop_origin_h == 6 &&
+      summary.default_crop_origin_v == 6 &&
+      summary.default_crop_width == 8160 &&
+      summary.default_crop_height == 6120;
+  const bool is_80mp_high_res = summary.has_default_crop &&
+      summary.default_crop_origin_h == 8 &&
+      summary.default_crop_origin_v == 8 &&
+      summary.default_crop_width == 10368 &&
+      summary.default_crop_height == 7776;
+  return is_50mp_high_res || is_80mp_high_res;
+}
+
+std::string DetectHighlightRecoverySourcePath(const std::string& source_path,
+                                             const DecodeSummary& summary) {
+  if (!IsOm3HighResSummary(summary)) {
+    return {};
+  }
+
+  const std::filesystem::path source(source_path);
+  const std::string extension = source.extension().string();
+  if (extension != ".ORF" && extension != ".orf") {
+    return {};
+  }
+
+  std::vector<std::filesystem::path> candidates;
+  const std::string stem = source.stem().string();
+  candidates.push_back(source.parent_path() / (stem + ".ORI"));
+  candidates.push_back(source.parent_path() / (stem + ".ori"));
+  candidates.push_back(source.parent_path() / (stem + "_.ORI"));
+  candidates.push_back(source.parent_path() / (stem + "_.ori"));
+  candidates.push_back(source.parent_path() / (stem + "_" + extension));
+  candidates.push_back(source.parent_path() / (stem + "_" + (extension == ".ORF" ? ".orf" : ".ORF")));
+
+  for (const std::filesystem::path& candidate : candidates) {
+    if (candidate == source) {
+      continue;
+    }
+    std::error_code ec;
+    if (std::filesystem::exists(candidate, ec) && !ec) {
+      return candidate.string();
+    }
+  }
+  return {};
 }
 
 bool IsCancelled(const CancelCheck& cancel) {
@@ -589,6 +637,8 @@ bool PrepareSource(const std::string& source_path,
     const hiraco::ScopedTimingLog timer("prepare", "Build base metadata");
     prepared->metadata = BuildMetadataFromLibRaw(source_path, summary);
   }
+  prepared->highlight_recovery_source_path = DetectHighlightRecoverySourcePath(source_path, summary);
+  prepared->enable_highlight_recovery = false;
   prepared->image_width = summary.raw_width > 0 ? summary.raw_width : summary.image_width;
   prepared->image_height = summary.raw_height > 0 ? summary.raw_height : summary.image_height;
   prepared->data = std::make_shared<PreparedSourceData>();
@@ -702,6 +752,8 @@ bool RenderConvertedCrop(PreparedSource* prepared,
         return RenderConvertedCropPreview(*enhancement_metadata,
                                         prepared->data->processing_cache,
                                         crop_rect,
+                                        prepared->highlight_recovery_source_path,
+                                        prepared->ShouldUseHighlightRecovery(),
                                         stage_overrides,
                                         preview,
                                         progress,
@@ -713,6 +765,8 @@ bool RenderConvertedCrop(PreparedSource* prepared,
   ProcessingCache cache;
   if (!BuildProcessingCacheFromRaw(prepared->source_path,
                                    *enhancement_metadata,
+                                   prepared->highlight_recovery_source_path,
+                                   prepared->ShouldUseHighlightRecovery(),
                                    prepared->image_width,
                                    prepared->image_height,
                                    crop_rect,
@@ -740,6 +794,8 @@ bool RenderConvertedCrop(PreparedSource* prepared,
   return RenderConvertedCropPreview(*enhancement_metadata,
                                     prepared->data->processing_cache,
                                     crop_rect,
+                                    prepared->highlight_recovery_source_path,
+                                    prepared->ShouldUseHighlightRecovery(),
                                     stage_overrides,
                                     preview,
                                     progress,
@@ -782,6 +838,8 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
                                output_path.string(),
                                ToCompressionString(compression),
                                *enhancement_metadata,
+                               prepared.highlight_recovery_source_path,
+                               prepared.ShouldUseHighlightRecovery(),
                                stage_overrides,
                                libraw_overrides,
                                preview_override,

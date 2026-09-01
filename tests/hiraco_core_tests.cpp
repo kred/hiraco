@@ -433,7 +433,16 @@ void TestCropPreviewMatchesFullImageCrop() {
   const PreviewImage expected = ToPreview(CropRaster(full_processed, crop));
 
   auto actual = std::make_shared<PreviewImage>();
-  const bool crop_ok = RenderConvertedCropPreview(metadata, cache, crop, {}, actual, {}, {}, &error_message);
+  const bool crop_ok = RenderConvertedCropPreview(metadata,
+                                                  cache,
+                                                  crop,
+                                                  "",
+                                                  false,
+                                                  {},
+                                                  actual,
+                                                  {},
+                                                  {},
+                                                  &error_message);
   Expect(crop_ok, "ROI crop enhancement should succeed");
   Expect(actual->width == expected.width && actual->height == expected.height,
          "crop preview dimensions should match expected crop dimensions");

@@ -20,6 +20,8 @@ struct PreparedSourceData;
 struct PreparedSource {
   std::string source_path;
   std::string source_name;
+  std::string highlight_recovery_source_path;
+  bool enable_highlight_recovery = false;
   SourceLinearDngMetadata metadata;
   uint32_t image_width = 0;
   uint32_t image_height = 0;
@@ -27,6 +29,14 @@ struct PreparedSource {
 
   bool IsValid() const {
     return !source_path.empty() && image_width > 0 && image_height > 0;
+  }
+
+  bool HasHighlightRecoverySource() const {
+    return !highlight_recovery_source_path.empty();
+  }
+
+  bool ShouldUseHighlightRecovery() const {
+    return enable_highlight_recovery && HasHighlightRecoverySource();
   }
 };
 

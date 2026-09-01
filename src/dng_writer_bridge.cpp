@@ -1,5 +1,6 @@
 #include <iostream>
 
+#include "hiraco_core.h"
 #include "dng_writer_bridge.h"
 #include "hiraco_timing.h"
 
@@ -994,58 +995,19 @@ void ApplyLinearGain(double gain, RasterImage* image) {
   }
 }
 
-double SoftLimitWhiteBalancedHighlightPeak(double peak) {
-  constexpr double kShoulderStart = 0.80;
-  constexpr double kShoulderLimit = 0.85;
-  if (peak <= kShoulderStart) {
-    return peak;
-  }
-
-  const double shoulder = kShoulderLimit - kShoulderStart;
-  if (shoulder <= 0.0) {
-    return std::min(peak, kShoulderLimit);
-  }
-
-  const double x = peak - kShoulderStart;
-  return kShoulderStart + shoulder * (1.0 - std::exp(-x / shoulder));
-}
-
-void ReapplyCameraSpacePedestalWithHighlightShoulder(const SourceLinearDngMetadata& metadata,
-                                                     double pedestal,
-                                                     RasterImage* image) {
+void ReapplyCameraSpacePedestal(double pedestal, RasterImage* image) {
   if (image == nullptr || image->colors == 0 || pedestal <= 0.0) {
     return;
   }
 
   const uint32_t colors = image->colors;
   const size_t pixel_count = static_cast<size_t>(image->width) * image->height;
-  const double signal_range = 65535.0 - pedestal;
-  const bool has_as_shot_neutral = metadata.has_as_shot_neutral && colors >= 3;
 
   #pragma omp parallel for schedule(static) if(pixel_count > 100000)
   for (size_t index = 0; index < pixel_count; ++index) {
     const size_t sample_index = index * colors;
-    double highlight_scale = 1.0;
-
-    if (has_as_shot_neutral) {
-      double white_balanced_peak = 0.0;
-      for (uint32_t channel = 0; channel < 3; ++channel) {
-        const double safe_limit = std::max(
-            std::min(metadata.as_shot_neutral[channel], 1.0) * signal_range,
-            1.0);
-        white_balanced_peak = std::max(
-            white_balanced_peak,
-            static_cast<double>(image->pixels[sample_index + channel]) / safe_limit);
-      }
-
-      const double mapped_peak = SoftLimitWhiteBalancedHighlightPeak(white_balanced_peak);
-      if (mapped_peak < white_balanced_peak && white_balanced_peak > 1e-9) {
-        highlight_scale = mapped_peak / white_balanced_peak;
-      }
-    }
-
     for (uint32_t channel = 0; channel < colors; ++channel) {
-      const double value = static_cast<double>(image->pixels[sample_index + channel]) * highlight_scale + pedestal;
+      const double value = static_cast<double>(image->pixels[sample_index + channel]) + pedestal;
       image->pixels[sample_index + channel] = static_cast<uint16_t>(std::clamp(value, 0.0, 65535.0));
     }
   }
@@ -2091,53 +2053,401 @@ bool RenderLibRawImage(const std::string& source_path,
   return true;
 }
 
-std::array<double, 9> IdentityMatrix3x3() {
-  return {1.0, 0.0, 0.0,
-          0.0, 1.0, 0.0,
-          0.0, 0.0, 1.0};
+bool RenderOm3RawDomainImage(const std::string& source_path,
+                             const SourceLinearDngMetadata& metadata,
+                             const CropRect* region,
+                             RasterImage* output,
+                             std::string* error_message);
+
+CropRect ResolveActiveRect(const SourceLinearDngMetadata& metadata,
+                           uint32_t width,
+                           uint32_t height) {
+  CropRect rect;
+  rect.width = width;
+  rect.height = height;
+  if (!metadata.has_default_crop ||
+      metadata.default_crop_width == 0 ||
+      metadata.default_crop_height == 0 ||
+      width == 0 ||
+      height == 0) {
+    return rect;
+  }
+
+  rect.x = std::min(metadata.default_crop_origin_h, width - 1);
+  rect.y = std::min(metadata.default_crop_origin_v, height - 1);
+  rect.width = std::max(1u, std::min(metadata.default_crop_width, width - rect.x));
+  rect.height = std::max(1u, std::min(metadata.default_crop_height, height - rect.y));
+  return rect;
 }
 
-bool InvertMatrix3x3(const std::array<double, 9>& input,
-                     std::array<double, 9>* inverse) {
-  const double a = input[0];
-  const double b = input[1];
-  const double c = input[2];
-  const double d = input[3];
-  const double e = input[4];
-  const double f = input[5];
-  const double g = input[6];
-  const double h = input[7];
-  const double i = input[8];
+double BilinearSampleChannel(const RasterImage& image,
+                             double row,
+                             double col,
+                             uint32_t channel) {
+  if (image.width == 0 || image.height == 0 || image.colors <= channel) {
+    return 0.0;
+  }
 
-  const double A = e * i - f * h;
-  const double B = -(d * i - f * g);
-  const double C = d * h - e * g;
-  const double D = -(b * i - c * h);
-  const double E = a * i - c * g;
-  const double F = -(a * h - b * g);
-  const double G = b * f - c * e;
-  const double H = -(a * f - c * d);
-  const double I = a * e - b * d;
+  const int y0 = static_cast<int>(std::floor(row));
+  const int x0 = static_cast<int>(std::floor(col));
+  const int y1 = y0 + 1;
+  const int x1 = x0 + 1;
+  const double wy = row - std::floor(row);
+  const double wx = col - std::floor(col);
+  const uint32_t sy0 = static_cast<uint32_t>(std::clamp(y0, 0, static_cast<int>(image.height) - 1));
+  const uint32_t sy1 = static_cast<uint32_t>(std::clamp(y1, 0, static_cast<int>(image.height) - 1));
+  const uint32_t sx0 = static_cast<uint32_t>(std::clamp(x0, 0, static_cast<int>(image.width) - 1));
+  const uint32_t sx1 = static_cast<uint32_t>(std::clamp(x1, 0, static_cast<int>(image.width) - 1));
 
-  const double det = a * A + b * B + c * C;
-  if (std::abs(det) < 1e-9) {
+  const auto sample = [&](uint32_t sample_row, uint32_t sample_col) {
+    return static_cast<double>(
+        image.pixels[(static_cast<size_t>(sample_row) * image.width + sample_col) * image.colors + channel]);
+  };
+
+  const double v00 = sample(sy0, sx0);
+  const double v01 = sample(sy0, sx1);
+  const double v10 = sample(sy1, sx0);
+  const double v11 = sample(sy1, sx1);
+  const double top = (1.0 - wx) * v00 + wx * v01;
+  const double bottom = (1.0 - wx) * v10 + wx * v11;
+  return (1.0 - wy) * top + wy * bottom;
+}
+
+bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_source_path,
+                                       const SourceLinearDngMetadata& metadata,
+                                       uint32_t full_width,
+                                       uint32_t full_height,
+                                       const CropRect* region,
+                                       RasterImage* image,
+                                       std::string* error_message) {
+  if (image == nullptr ||
+      image->colors < 3 ||
+      highlight_recovery_source_path.empty() ||
+      !IsOm3HighResMetadata(metadata) ||
+      !metadata.has_black_level ||
+      !metadata.has_as_shot_neutral) {
+    return true;
+  }
+
+  PreparedSource companion;
+  std::string companion_error;
+  if (!PrepareSource(highlight_recovery_source_path, &companion, &companion_error)) {
+    if (error_message != nullptr) {
+      *error_message = "Failed to prepare highlight recovery companion: " + companion_error;
+    }
     return false;
   }
 
-  const double inv_det = 1.0 / det;
-  *inverse = {A * inv_det, D * inv_det, G * inv_det,
-              B * inv_det, E * inv_det, H * inv_det,
-              C * inv_det, F * inv_det, I * inv_det};
-  return true;
-}
+  RasterImage companion_render;
+  if (!RenderOm3RawDomainImage(highlight_recovery_source_path,
+                               companion.metadata,
+                               nullptr,
+                               &companion_render,
+                               &companion_error)) {
+    if (error_message != nullptr) {
+      *error_message = "Failed to render highlight recovery companion: " + companion_error;
+    }
+    return false;
+  }
 
-std::array<double, 3> MultiplyMatrix3x3Vector(const std::array<double, 9>& matrix,
-                                              const std::array<double, 3>& vector) {
-  return {
-      matrix[0] * vector[0] + matrix[1] * vector[1] + matrix[2] * vector[2],
-      matrix[3] * vector[0] + matrix[4] * vector[1] + matrix[5] * vector[2],
-      matrix[6] * vector[0] + matrix[7] * vector[1] + matrix[8] * vector[2],
+  const CropRect target_active = ResolveActiveRect(metadata, full_width, full_height);
+  const CropRect companion_active = ResolveActiveRect(companion.metadata,
+                                                      companion_render.width,
+                                                      companion_render.height);
+  const double pedestal = metadata.black_level;
+  const double companion_pedestal = companion.metadata.has_black_level ? companion.metadata.black_level : 0.0;
+  const double signal_range = std::max(65535.0 - pedestal, 1.0);
+  const double companion_signal_range = std::max(65535.0 - companion_pedestal, 1.0);
+  const uint32_t region_origin_x = region != nullptr ? region->x : 0;
+  const uint32_t region_origin_y = region != nullptr ? region->y : 0;
+  const bool debug_recovery = std::getenv("HIRACO_DEBUG_HL_RECOVERY") != nullptr;
+  std::atomic<uint64_t> candidate_pixels = 0;
+  std::atomic<uint64_t> changed_pixels = 0;
+
+  int best_dx = 0;
+  int best_dy = 0;
+  double best_error = std::numeric_limits<double>::infinity();
+  const int max_offset = 2;
+  const uint32_t step = 64;
+  for (int dy = -max_offset; dy <= max_offset; ++dy) {
+    for (int dx = -max_offset; dx <= max_offset; ++dx) {
+      double total_error = 0.0;
+      uint64_t sample_count = 0;
+      for (uint32_t sample_row = 0; sample_row < companion_active.height; sample_row += step) {
+        for (uint32_t sample_col = 0; sample_col < companion_active.width; sample_col += step) {
+          const double companion_row = static_cast<double>(companion_active.y + sample_row + dy);
+          const double companion_col = static_cast<double>(companion_active.x + sample_col + dx);
+          const double companion_green = std::max(
+              BilinearSampleChannel(companion_render, companion_row, companion_col, 1) - companion_pedestal,
+              0.0);
+
+          const double u = (static_cast<double>(sample_col) + 0.5) /
+                           static_cast<double>(std::max(companion_active.width, 1u));
+          const double v = (static_cast<double>(sample_row) + 0.5) /
+                           static_cast<double>(std::max(companion_active.height, 1u));
+          const double full_row = static_cast<double>(target_active.y) +
+                                  v * static_cast<double>(target_active.height) - 0.5;
+          const double full_col = static_cast<double>(target_active.x) +
+                                  u * static_cast<double>(target_active.width) - 0.5;
+          const double target_row = full_row - static_cast<double>(region_origin_y);
+          const double target_col = full_col - static_cast<double>(region_origin_x);
+          const double target_green = std::max(
+              BilinearSampleChannel(*image, target_row, target_col, 1),
+              0.0);
+          total_error += std::abs(target_green - companion_green);
+          ++sample_count;
+        }
+      }
+
+      const double mean_error = total_error / std::max<uint64_t>(sample_count, 1u);
+      if (mean_error < best_error) {
+        best_error = mean_error;
+        best_dx = dx;
+        best_dy = dy;
+      }
+    }
+  }
+
+  constexpr double kHighlightStart = 0.55;
+  constexpr double kHighlightFull = 0.85;
+  constexpr double kMinCompanionGreen = 32.0;
+  constexpr uint32_t kBaseStride = 16;
+  constexpr int kBaseBlurPasses = 2;
+  constexpr double kBaseBlendLumaScale = 0.10;
+  constexpr double kMisalignmentGreenFloor = 0.05;
+  constexpr double kMisalignmentTargetFloor = 0.55;
+  constexpr double kLumaR = 0.2126;
+  constexpr double kLumaG = 0.7152;
+  constexpr double kLumaB = 0.0722;
+
+  const uint32_t grid_width =
+      std::max(1u, (companion_active.width + kBaseStride - 1) / kBaseStride);
+  const uint32_t grid_height =
+      std::max(1u, (companion_active.height + kBaseStride - 1) / kBaseStride);
+  std::vector<double> target_base_grid(static_cast<size_t>(grid_width) * grid_height * 3, 0.0);
+  std::vector<double> companion_base_grid(static_cast<size_t>(grid_width) * grid_height * 3, 0.0);
+
+  auto sample_signal = [&](const RasterImage& source,
+                           double row,
+                           double col,
+                           double source_pedestal) {
+    return std::array<double, 3>{
+        std::max(BilinearSampleChannel(source, row, col, 0) - source_pedestal, 0.0),
+        std::max(BilinearSampleChannel(source, row, col, 1) - source_pedestal, 0.0),
+        std::max(BilinearSampleChannel(source, row, col, 2) - source_pedestal, 0.0),
+    };
   };
+
+  for (uint32_t grid_row = 0; grid_row < grid_height; ++grid_row) {
+    for (uint32_t grid_col = 0; grid_col < grid_width; ++grid_col) {
+      const double u = (static_cast<double>(grid_col) + 0.5) /
+                       static_cast<double>(grid_width);
+      const double v = (static_cast<double>(grid_row) + 0.5) /
+                       static_cast<double>(grid_height);
+      const double full_row = static_cast<double>(target_active.y) +
+                              v * static_cast<double>(target_active.height) - 0.5;
+      const double full_col = static_cast<double>(target_active.x) +
+                              u * static_cast<double>(target_active.width) - 0.5;
+      const double target_row = full_row - static_cast<double>(region_origin_y);
+      const double target_col = full_col - static_cast<double>(region_origin_x);
+      const double companion_row = static_cast<double>(companion_active.y) +
+                                   v * static_cast<double>(companion_active.height) - 0.5 + best_dy;
+      const double companion_col = static_cast<double>(companion_active.x) +
+                                   u * static_cast<double>(companion_active.width) - 0.5 + best_dx;
+
+      const std::array<double, 3> target_sample = sample_signal(*image,
+                                                                 target_row,
+                                                                 target_col,
+                                                                 0.0);
+      const std::array<double, 3> companion_sample = sample_signal(companion_render,
+                                                                    companion_row,
+                                                                    companion_col,
+                                                                    companion_pedestal);
+      const size_t base_index = (static_cast<size_t>(grid_row) * grid_width + grid_col) * 3;
+      for (int ch = 0; ch < 3; ++ch) {
+        target_base_grid[base_index + ch] = target_sample[ch];
+        companion_base_grid[base_index + ch] = companion_sample[ch];
+      }
+    }
+  }
+
+  auto blur_grid = [&](std::vector<double>* grid) {
+    if (grid == nullptr || grid->empty()) {
+      return;
+    }
+    std::vector<double> temp(grid->size(), 0.0);
+    auto sample_grid_channel = [&](const std::vector<double>& data,
+                                   int row,
+                                   int col,
+                                   int ch) {
+      const uint32_t rr = static_cast<uint32_t>(std::clamp(row, 0, static_cast<int>(grid_height) - 1));
+      const uint32_t cc = static_cast<uint32_t>(std::clamp(col, 0, static_cast<int>(grid_width) - 1));
+      return data[(static_cast<size_t>(rr) * grid_width + cc) * 3 + ch];
+    };
+
+    for (int pass = 0; pass < kBaseBlurPasses; ++pass) {
+      for (uint32_t row = 0; row < grid_height; ++row) {
+        for (uint32_t col = 0; col < grid_width; ++col) {
+          const size_t index = (static_cast<size_t>(row) * grid_width + col) * 3;
+          for (int ch = 0; ch < 3; ++ch) {
+            temp[index + ch] =
+                (sample_grid_channel(*grid, static_cast<int>(row), static_cast<int>(col) - 2, ch) +
+                 4.0 * sample_grid_channel(*grid, static_cast<int>(row), static_cast<int>(col) - 1, ch) +
+                 6.0 * sample_grid_channel(*grid, static_cast<int>(row), static_cast<int>(col), ch) +
+                 4.0 * sample_grid_channel(*grid, static_cast<int>(row), static_cast<int>(col) + 1, ch) +
+                 sample_grid_channel(*grid, static_cast<int>(row), static_cast<int>(col) + 2, ch)) / 16.0;
+          }
+        }
+      }
+
+      for (uint32_t row = 0; row < grid_height; ++row) {
+        for (uint32_t col = 0; col < grid_width; ++col) {
+          const size_t index = (static_cast<size_t>(row) * grid_width + col) * 3;
+          for (int ch = 0; ch < 3; ++ch) {
+            (*grid)[index + ch] =
+                (sample_grid_channel(temp, static_cast<int>(row) - 2, static_cast<int>(col), ch) +
+                 4.0 * sample_grid_channel(temp, static_cast<int>(row) - 1, static_cast<int>(col), ch) +
+                 6.0 * sample_grid_channel(temp, static_cast<int>(row), static_cast<int>(col), ch) +
+                 4.0 * sample_grid_channel(temp, static_cast<int>(row) + 1, static_cast<int>(col), ch) +
+                 sample_grid_channel(temp, static_cast<int>(row) + 2, static_cast<int>(col), ch)) / 16.0;
+          }
+        }
+      }
+    }
+  };
+
+  blur_grid(&target_base_grid);
+  blur_grid(&companion_base_grid);
+
+  auto sample_base_grid = [&](const std::vector<double>& grid,
+                              double u,
+                              double v) {
+    const double grid_row = v * static_cast<double>(grid_height) - 0.5;
+    const double grid_col = u * static_cast<double>(grid_width) - 0.5;
+    const int y0 = static_cast<int>(std::floor(grid_row));
+    const int x0 = static_cast<int>(std::floor(grid_col));
+    const int y1 = y0 + 1;
+    const int x1 = x0 + 1;
+    const double wy = grid_row - std::floor(grid_row);
+    const double wx = grid_col - std::floor(grid_col);
+    auto fetch = [&](int row, int col, int ch) {
+      const uint32_t rr = static_cast<uint32_t>(std::clamp(row, 0, static_cast<int>(grid_height) - 1));
+      const uint32_t cc = static_cast<uint32_t>(std::clamp(col, 0, static_cast<int>(grid_width) - 1));
+      return grid[(static_cast<size_t>(rr) * grid_width + cc) * 3 + ch];
+    };
+    std::array<double, 3> sample = {0.0, 0.0, 0.0};
+    for (int ch = 0; ch < 3; ++ch) {
+      const double v00 = fetch(y0, x0, ch);
+      const double v01 = fetch(y0, x1, ch);
+      const double v10 = fetch(y1, x0, ch);
+      const double v11 = fetch(y1, x1, ch);
+      const double top = (1.0 - wx) * v00 + wx * v01;
+      const double bottom = (1.0 - wx) * v10 + wx * v11;
+      sample[ch] = (1.0 - wy) * top + wy * bottom;
+    }
+    return sample;
+  };
+
+  #pragma omp parallel for schedule(static) if(image->height > 100)
+  for (uint32_t row = 0; row < image->height; ++row) {
+    for (uint32_t col = 0; col < image->width; ++col) {
+      const uint32_t full_row = region_origin_y + row;
+      const uint32_t full_col = region_origin_x + col;
+      if (full_row < target_active.y ||
+          full_row >= target_active.y + target_active.height ||
+          full_col < target_active.x ||
+          full_col >= target_active.x + target_active.width) {
+        continue;
+      }
+
+      const double u = (static_cast<double>(full_col - target_active.x) + 0.5) /
+                       static_cast<double>(target_active.width);
+      const double v = (static_cast<double>(full_row - target_active.y) + 0.5) /
+                       static_cast<double>(target_active.height);
+      const size_t px = (static_cast<size_t>(row) * image->width + col) * image->colors;
+      std::array<double, 3> signal = {
+          static_cast<double>(image->pixels[px + 0]),
+          static_cast<double>(image->pixels[px + 1]),
+          static_cast<double>(image->pixels[px + 2]),
+      };
+      const std::array<double, 3> target_base = sample_base_grid(target_base_grid, u, v);
+      const std::array<double, 3> companion_base = sample_base_grid(companion_base_grid, u, v);
+      const double source_peak = std::max({signal[0], signal[1], signal[2]}) / signal_range;
+      const double highlight_weight = std::clamp(
+          (source_peak - kHighlightStart) / std::max(kHighlightFull - kHighlightStart, 1e-6),
+          0.0,
+          1.0);
+      if (highlight_weight <= 0.0) {
+        continue;
+      }
+      candidate_pixels.fetch_add(1, std::memory_order_relaxed);
+
+      if (companion_base[1] < kMinCompanionGreen) {
+        continue;
+      }
+
+      const double target_base_green_norm = target_base[1] / signal_range;
+      const double companion_base_green_norm = companion_base[1] / companion_signal_range;
+      if (companion_base_green_norm < kMisalignmentGreenFloor &&
+          target_base_green_norm > kMisalignmentTargetFloor) {
+        continue;
+      }
+
+      const double target_base_luma =
+          kLumaR * target_base[0] + kLumaG * target_base[1] + kLumaB * target_base[2];
+      const double companion_base_luma =
+          kLumaR * companion_base[0] + kLumaG * companion_base[1] + kLumaB * companion_base[2];
+      const double luma_deficit = (target_base_luma - companion_base_luma) / signal_range;
+      if (luma_deficit <= 0.0) {
+        continue;
+      }
+      const double blend = highlight_weight * std::clamp(
+          luma_deficit / kBaseBlendLumaScale,
+          0.0,
+          1.0);
+      if (blend <= 1e-6) {
+        continue;
+      }
+
+      const double before_r = signal[0];
+      const double before_g = signal[1];
+      const double before_b = signal[2];
+      for (size_t channel = 0; channel < signal.size(); ++channel) {
+        const double base_ratio = companion_base[channel] /
+            std::max(target_base[channel], 16.0);
+        const double channel_scale = 1.0 + blend * (std::min(base_ratio, 1.0) - 1.0);
+        // ORI recovery is intentionally subtractive.  It can restore the
+        // companion's unclipped local base, but cannot invent signal or turn
+        // an originally safe high-res value into a new clipped value.
+        signal[channel] *= std::clamp(channel_scale, 0.0, 1.0);
+      }
+
+      if (std::abs(signal[0] - before_r) > 1e-6 ||
+          std::abs(signal[1] - before_g) > 1e-6 ||
+          std::abs(signal[2] - before_b) > 1e-6) {
+        changed_pixels.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      image->pixels[px + 0] = static_cast<uint16_t>(
+          std::clamp(signal[0], 0.0, 65535.0));
+      image->pixels[px + 1] = static_cast<uint16_t>(
+          std::clamp(signal[1], 0.0, 65535.0));
+      image->pixels[px + 2] = static_cast<uint16_t>(
+          std::clamp(signal[2], 0.0, 65535.0));
+    }
+  }
+
+  if (debug_recovery) {
+    std::cerr << "[hiraco] highlight recovery companion=" << highlight_recovery_source_path
+              << " offset=(" << best_dx << "," << best_dy << ")"
+              << " align_mae=" << best_error
+              << " candidates=" << candidate_pixels.load(std::memory_order_relaxed)
+              << " changed=" << changed_pixels.load(std::memory_order_relaxed)
+              << " region=" << (region != nullptr ? "crop" : "full")
+              << "\n";
+  }
+
+  return true;
 }
 
 bool RenderOm3RawDomainImage(const std::string& source_path,
@@ -2900,10 +3210,14 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
 
 bool BuildLinearDngPayload(const std::string& source_path,
                            const SourceLinearDngMetadata& metadata,
+                           const std::string& highlight_recovery_source_path,
+                           bool enable_highlight_recovery,
                            const LibRawOverrideSet& libraw_overrides,
                            LinearDngPayload* payload,
                            std::string* error_message) {
   const hiraco::ScopedTimingLog payload_timer("convert", "Build linear DNG payload");
+  (void) highlight_recovery_source_path;
+  (void) enable_highlight_recovery;
   const RenderSettings raw_settings = BuildRawRenderSettings(metadata, libraw_overrides);
   const bool needs_cfa_guide = metadata.has_predicted_detail_gain &&
                                metadata.predicted_detail_gain > 1.0001 &&
@@ -3542,6 +3856,8 @@ bool EstimatePreviewAutoBrightGainFromRaw(const std::string& source_path,
 
 bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                  const SourceLinearDngMetadata& metadata,
+                                 const std::string& highlight_recovery_source_path,
+                                 bool enable_highlight_recovery,
                                  uint32_t source_width,
                                  uint32_t source_height,
                                  const CropRect& crop_rect,
@@ -3551,6 +3867,8 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                  CancelCheck cancel,
                                  std::string* error_message) {
   const hiraco::ScopedTimingLog cache_timer("cache", "Build processing cache");
+  (void) highlight_recovery_source_path;
+  (void) enable_highlight_recovery;
   if (cache == nullptr) {
     if (error_message != nullptr) {
       *error_message = "missing processing cache";
@@ -3561,6 +3879,7 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
   cache->raw_image = RasterImage();
   cache->cfa_guide_image = RasterImage();
   cache->raw_image_is_camera_space = false;
+  cache->highlight_recovery_enabled = false;
   cache->preview_auto_bright_gain = 1.0;
   EstimatePreviewAutoBrightGainFromRaw(source_path, metadata, libraw_overrides, &cache->preview_auto_bright_gain, nullptr);
   cache->source_width = source_width;
@@ -3645,6 +3964,8 @@ bool ApplyResolvedStageSettingsForTesting(const SourceLinearDngMetadata& metadat
 bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                 const ProcessingCache& cache,
                                 const CropRect& crop_rect,
+                                const std::string& highlight_recovery_source_path,
+                                bool enable_highlight_recovery,
                                 const StageOverrideSet& stage_overrides,
                                 std::shared_ptr<PreviewImage> preview,
                                 ProgressCallback progress,
@@ -3743,6 +4064,15 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
     ApplyLinearDngRasterTransform(metadata, &crop_image);
   } else {
     const double pedestal = metadata.has_black_level ? metadata.black_level : 0.0;
+    CropRect recovery_region;
+    const CropRect* recovery_region_ptr = nullptr;
+    if (cache.has_cached_crop) {
+      recovery_region.x = cache.region_origin_x;
+      recovery_region.y = cache.region_origin_y;
+      recovery_region.width = cache.raw_image.width;
+      recovery_region.height = cache.raw_image.height;
+      recovery_region_ptr = &recovery_region;
+    }
     if (pedestal > 0.0) {
       for (uint16_t& sample : crop_image.pixels) {
         const double value = static_cast<double>(sample) - pedestal;
@@ -3761,7 +4091,17 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
       return false;
     }
 
-    ReapplyCameraSpacePedestalWithHighlightShoulder(metadata, pedestal, &crop_image);
+    if (enable_highlight_recovery &&
+        !ApplyOriAssistedHighlightRecovery(highlight_recovery_source_path,
+                                           metadata,
+                                           source_width,
+                                           source_height,
+                                           recovery_region_ptr,
+                                           &crop_image,
+                                           error_message)) {
+      return false;
+    }
+    ReapplyCameraSpacePedestal(pedestal, &crop_image);
   }
 
   if (CheckCancelled(cancel, error_message)) {
@@ -3807,6 +4147,8 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const std::string& output_path,
                                      const std::string& compression,
                                      const SourceLinearDngMetadata& metadata,
+                                     const std::string& highlight_recovery_source_path,
+                                     bool enable_highlight_recovery,
                                      const StageOverrideSet& stage_overrides,
                                      const LibRawOverrideSet& libraw_overrides,
                                      std::shared_ptr<const PreviewImage> preview_override,
@@ -3874,6 +4216,8 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       const hiraco::ScopedTimingLog timer("convert", "Prepare source payload");
       if (!BuildLinearDngPayload(source_path,
                                  metadata,
+                                 highlight_recovery_source_path,
+                                 enable_highlight_recovery,
                                  libraw_overrides,
                                  &payload,
                                  &render_error)) {
@@ -3917,8 +4261,18 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                     &result.message)) {
         return result;
       }
-      
-      ReapplyCameraSpacePedestalWithHighlightShoulder(metadata, pedestal, &payload.raw_image);
+
+      if (enable_highlight_recovery &&
+          !ApplyOriAssistedHighlightRecovery(highlight_recovery_source_path,
+                                             metadata,
+                                             payload.raw_image.width,
+                                             payload.raw_image.height,
+                                             nullptr,
+                                             &payload.raw_image,
+                                             &result.message)) {
+        return result;
+      }
+      ReapplyCameraSpacePedestal(pedestal, &payload.raw_image);
     }
 
     CallbackAbortSniffer sniffer(progress, cancel);
@@ -4065,6 +4419,8 @@ bool EstimatePreviewAutoBrightGainFromRaw(const std::string&,
 
 bool BuildProcessingCacheFromRaw(const std::string&,
                                  const SourceLinearDngMetadata&,
+                                 const std::string&,
+                                 bool,
                                  uint32_t,
                                  uint32_t,
                                  const CropRect&,
@@ -4110,6 +4466,8 @@ DngWriteResult WriteLinearDngFromRaw(const std::string&,
                                      const std::string&,
                                      const std::string&,
                                      const SourceLinearDngMetadata&,
+                                     const std::string&,
+                                     bool,
                                      const StageOverrideSet&,
                                      const LibRawOverrideSet&,
                                      std::shared_ptr<const PreviewImage>,

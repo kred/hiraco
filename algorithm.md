@@ -32,6 +32,8 @@ They all operate on `PreparedSource`, which holds:
 - base metadata extracted from LibRaw
 - image dimensions
 - shared cached state for original preview, enhancement metadata, preview brightness, and crop-processing cache
+- an optional highlight-recovery companion path detected beside a supported
+  high-resolution ORF
 
 This is important for the GUI: opening a file, moving the crop box, and running a conversion all reuse the same core data rather than rebuilding everything from scratch.
 
@@ -101,6 +103,9 @@ Current behavior:
 - a `ProcessingCache` is reused when the current crop stays inside the already prepared region
 - if necessary, the cache is rebuilt for an expanded region around the requested crop
 - the crop preview then runs through the same enhancement logic used by the full conversion path
+- when `HL Rec` is enabled, the recovery pass is also applied to the crop after
+  enhancement.  Its companion render is not currently cached, so this option
+  can make a cold crop preview substantially slower.
 
 This is why crop inspection is much faster after the first cache build than it is from a cold start.
 
@@ -112,7 +117,9 @@ This is why crop inspection is much faster after the first cache build than it i
 2. Reuse the cached original preview if one is already available.
 3. Build the rendered Linear DNG payload.
 4. Apply enhancement when the metadata requests predicted detail gain.
-5. Write the final DNG with the Adobe DNG SDK.
+5. Optionally apply ORI-assisted highlight recovery.
+6. Restore the camera-space black-level pedestal and write the final DNG with
+   the Adobe DNG SDK.
 
 Compression modes currently exposed by the CLI and GUI are:
 
@@ -138,9 +145,50 @@ At a high level it performs:
    clipped source samples remain identifiable as such rather than being expanded
    into a larger clipped area.
 9. Reconstruct final RGB output from the green plane plus red/blue difference interpolation.
-10. Before crop-preview display or DNG write, reapply the camera-space pedestal
-  and a white-balance-aware highlight shoulder so recoverable highlights roll
-  off smoothly instead of being hard-clamped onto a flat ceiling.
+10. Preserve the linear camera-space signal through the reconstruction and
+   enhancement stages.  Do not apply a pixel-domain highlight shoulder.  The
+   DNG's Camera Neutral metadata carries white-balance information; it is not a
+   raw per-channel highlight limit.
+11. When `HL Rec` is enabled and an eligible companion has been detected, render
+   the companion in the same camera-space domain.  The recovery pass:
+   - searches a global integer offset from -2 to +2 companion pixels using
+     green-channel mean absolute error;
+   - builds a low-frequency RGB base by sampling at a 16-pixel stride and
+     applying two separable 5-tap blur passes;
+   - considers pixels whose brightest high-resolution channel is above 55% of
+     its signal range, with full strength at 85%; and
+   - only reduces a candidate when the companion's blurred luma is lower.  It
+     multiplies each high-resolution channel by a capped companion/high-resolution
+     base ratio, thereby retaining high-resolution local detail.
+
+   Recovery runs after the main detail pipeline but before the camera black
+   pedestal is restored.  It is strictly subtractive: it can retain a lower,
+   unclipped companion base but cannot invent signal, brighten a sample, or turn
+   an originally safe sample into a new clipped one.
+
+### 6.1 Highlight-Recovery Companion Detection
+
+This feature is available only when the input is recognized as a supported
+high-resolution `.ORF`.  During preparation, `hiraco` looks in the same directory
+for the first existing filename in this order:
+
+1. `<stem>.ORI`
+2. `<stem>.ori`
+3. `<stem>_.ORI`
+4. `<stem>_.ori`
+5. `<stem>_<source extension>` (for example, `<stem>_.ORF`)
+6. `<stem>_.<opposite-case extension>` (the current fallback contains two dots;
+   for example, `<stem>_..orf`)
+
+The GUI exposes this as a per-file `HL Rec` switch, which is **off by default**.
+The label is `n/a` if no candidate file was found.  The CLI does not currently
+expose a switch for this feature.
+
+Detection is intentionally only a same-directory filename lookup today.  It does
+not yet validate capture time, exposure, ISO, camera identity, dimensions, or
+other metadata.  A detected file is therefore a *candidate*, not proof that it is
+the matching lower-resolution exposure; users should enable the option only when
+the companion is known to belong to the same capture.
 
 This path is where most high-res specific image recovery happens before the later enhancement stages.
 
@@ -230,11 +278,27 @@ The current implementation includes several performance-focused design choices:
 - cached crop-processing reuse for crop preview
 - optional timing logs through `HIRACO_TIMING=1` or CLI `--debug`
 
+ORI-assisted highlight recovery is deliberately applied outside the high-resolution
+processing cache so that the per-file switch takes effect immediately.  The tradeoff
+is that the companion is prepared and rendered again for each recovery-enabled crop
+preview or conversion; it is not yet cached.
+
 Recent raw-domain optimizations also removed several large full-frame temporary map upsample buffers and replaced them with on-demand bilinear sampling from the original low-resolution guidance maps.
 
 ## 10. Current Limits And Assumptions
 
 - The strongest custom path is the high-resolution workflow.
+- ORI-assisted highlight recovery is an opt-in, subtractive correction, not a
+  replacement for a matched HDR merge.  Its companion is found by filename only
+  and is not metadata-validated.
+- Recovery registration is a global integer offset of at most two companion
+  pixels.  It does not compensate for sub-pixel displacement, local motion,
+  rotation, or scale differences.  A poor match can produce a locally inaccurate
+  highlight base even though the pass cannot brighten or clip the output.
+- Crop previews use a padded high-resolution cache, but recovery is recomputed
+  for the preview region.  Full-conversion and crop-preview recovery should be
+  considered visually comparable rather than bit-identical until a
+  recovery-enabled crop/full regression test exists.
 - The Adobe DNG SDK bundle must exist locally under `dng_sdk_1_7_1/` or be provided through `HIRACO_DNG_SDK_ROOT`.
 - The GUI controls are live processing overrides for inspection and conversion, not a non-destructive editing history system.
 - Linux and Windows build paths exist, but the most frequently exercised environment in this repository is macOS.
