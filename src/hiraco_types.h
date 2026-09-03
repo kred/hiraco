@@ -155,6 +155,15 @@ struct CropRect {
   uint32_t height = 0;
 };
 
+// Describes which full-resolution source rectangle is represented by a
+// processing image. It lets display-sized preview work sample auxiliary raw
+// data (such as an ORI highlight-recovery companion) in source coordinates.
+struct RecoveryImageCoordinates {
+  uint32_t full_width = 0;
+  uint32_t full_height = 0;
+  CropRect represented_region;
+};
+
 inline int NormalizeLibRawFlip(int flip) {
   const int normalized = flip % 8;
   return normalized < 0 ? normalized + 8 : normalized;

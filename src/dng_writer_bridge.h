@@ -47,6 +47,14 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                  CancelCheck cancel = {},
                                  std::string* error_message = nullptr);
 
+// Builds a display-resolution derivative of an immutable full-resolution
+// processing cache. It is intended for responsive whole-image previews;
+// export and future 100% tiles continue to use the source cache.
+bool BuildDisplayProcessingCache(const ProcessingCache& source,
+                                 uint32_t max_dimension,
+                                 ProcessingCache* display_cache,
+                                 std::string* error_message = nullptr);
+
 bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                 const ProcessingCache& cache,
                                 const CropRect& crop_rect,
@@ -56,7 +64,9 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                 std::shared_ptr<PreviewImage> preview,
                                 ProgressCallback progress = {},
                                 CancelCheck cancel = {},
-                                std::string* error_message = nullptr);
+                                std::string* error_message = nullptr,
+                                uint32_t max_dimension = 0,
+                                const RecoveryImageCoordinates* recovery_coordinates = nullptr);
 
 bool ApplyResolvedStageSettingsForTesting(const SourceLinearDngMetadata& metadata,
                                           const ResolvedStageSettings& settings,

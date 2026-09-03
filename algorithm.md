@@ -7,7 +7,7 @@ This document describes the current implementation in the repository. It is not 
 `hiraco` is a shared C++ processing core with two frontends:
 
 - `hiraco-cli` for direct conversion
-- `hiraco-gui` for preview, crop inspection, parameter tuning, and batch conversion
+- `hiraco-gui` for full-frame preview, parameter tuning, and batch conversion
 
 Current inputs are selected Olympus / OM SYSTEM `.ORF` and `.ORI` files. The output is a rendered Linear DNG written through the Adobe DNG SDK.
 
@@ -15,7 +15,7 @@ The project currently contains:
 
 - a custom high-resolution raw-domain reconstruction path
 - a LibRaw-based render path for sources that do not go through the custom reconstruction
-- shared preview, crop-preview, enhancement, and DNG writing logic used by both frontends
+- shared preview, internal processing-region, enhancement, and DNG writing logic used by both frontends
 
 ## 2. High-Level Architecture
 
@@ -23,7 +23,7 @@ The main core entry points are:
 
 1. `PrepareSource`
 2. `RenderOriginalPreview`
-3. `RenderConvertedCrop`
+3. `RenderConvertedFullPreview`
 4. `ConvertToDng`
 
 They all operate on `PreparedSource`, which holds:
@@ -31,11 +31,11 @@ They all operate on `PreparedSource`, which holds:
 - the source path and source name
 - base metadata extracted from LibRaw
 - image dimensions
-- shared cached state for original preview, enhancement metadata, preview brightness, and crop-processing cache
+- shared cached state for original preview, enhancement metadata, preview brightness, a full-resolution processing cache, and a display-resolution derivative
 - an optional highlight-recovery companion path detected beside a supported
   high-resolution ORF
 
-This is important for the GUI: opening a file, moving the crop box, and running a conversion all reuse the same core data rather than rebuilding everything from scratch.
+This is important for the GUI: opening a file, changing settings, and running a conversion reuse the same core data rather than rebuilding everything from scratch.
 
 ## 3. Preparation And Metadata
 
@@ -57,7 +57,7 @@ This step intentionally does not do the heavier vendor-specific enhancement work
 
 ### 3.2 Lazy Enhancement Metadata
 
-Enhancement metadata is built only when a converted crop or full conversion needs it.
+Enhancement metadata is built only when a converted preview or full conversion needs it.
 
 `BuildEnhancementMetadata` currently performs:
 
@@ -80,7 +80,7 @@ For supported high-resolution captures, MakerNote data is unpacked into low-reso
 
 These maps are later sampled inside the raw-domain reconstruction path to modulate sharpening, motion sensitivity, directionality, and alias handling.
 
-## 4. Preview And Crop Workflow
+## 4. Preview Workflow
 
 ### 4.1 Original Preview
 
@@ -92,22 +92,26 @@ Current behavior:
 - the result is cached in `PreparedSourceData`
 - the GUI can restore a cached original preview immediately when the user revisits an already loaded file
 
-### 4.2 Converted Crop Preview
+### 4.2 Converted Preview
 
-`RenderConvertedCrop` drives the live crop-preview panel in the GUI.
+`RenderConvertedFullPreview` drives the GUI's full-frame converted preview.
 
 Current behavior:
 
 - enhancement metadata is ensured lazily
 - preview auto-bright gain is estimated once and cached
-- a `ProcessingCache` is reused when the current crop stays inside the already prepared region
-- if necessary, the cache is rebuilt for an expanded region around the requested crop
-- the crop preview then runs through the same enhancement logic used by the full conversion path
-- when `HL Rec` is enabled, the recovery pass is also applied to the crop after
-  enhancement.  Its companion render is not currently cached, so this option
-  can make a cold crop preview substantially slower.
+- a full-resolution `ProcessingCache` is retained as immutable source data
+- for normal full-frame viewing, a display-resolution derivative is built once
+  and reused while settings change, so expensive enhancement work is bounded
+  by the canvas rather than the 50/80 MP source
+- the converted preview then runs through the same enhancement stages as the
+  full conversion path, at display resolution
+- when `HL Rec` is enabled, the preview enhancement and recovery pass run at
+  display resolution while sampling the cached full-resolution companion in
+  source coordinates; full conversion remains full-resolution
 
-This is why crop inspection is much faster after the first cache build than it is from a cold start.
+The internal `RenderConvertedCrop` entry point remains for regression tests and
+future 100% tile rendering; it is no longer a GUI crop tool.
 
 ## 5. Full Conversion Flow
 
@@ -275,13 +279,24 @@ The current implementation includes several performance-focused design choices:
 - Halide AOT kernels for wavelet and guided-filter work
 - lazy enhancement metadata generation
 - cached original preview reuse
-- cached crop-processing reuse for crop preview
+- immutable full-resolution processing-cache reuse plus a display-resolution derivative for the converted preview
+- one bounded GUI processing dispatcher: interactive preview work takes priority over queued metadata work, preventing OpenMP/FFTW/Halide oversubscription
+- a slider drag is visual-only; its final value queues one latest-wins preview on release
+- a 2 GB LRU budget for retained GUI preview caches, leaving headroom within a
+  10 GB working-set allowance for full-frame enhancement scratch buffers
+- GUI batch export releases recomputable preview-processing caches before it
+  starts, while leaving the displayed bitmap and original thumbnail available
+  so export has the largest practical memory headroom
+- one immutable full-resolution ORI companion cache for highlight recovery, so
+  repeated recovery-enabled previews and a following conversion do not rebuild
+  the same companion raster
 - optional timing logs through `HIRACO_TIMING=1` or CLI `--debug`
 
-ORI-assisted highlight recovery is deliberately applied outside the high-resolution
-processing cache so that the per-file switch takes effect immediately.  The tradeoff
-is that the companion is prepared and rendered again for each recovery-enabled crop
-preview or conversion; it is not yet cached.
+ORI-assisted highlight recovery is deliberately applied outside the processing
+cache so that the per-file switch takes effect immediately. Its most recently
+used full-resolution companion is retained separately, avoiding repeated raw
+unpack and reconstruction while bounding the additional residency to one
+companion raster.
 
 Recent raw-domain optimizations also removed several large full-frame temporary map upsample buffers and replaced them with on-demand bilinear sampling from the original low-resolution guidance maps.
 
@@ -295,15 +310,77 @@ Recent raw-domain optimizations also removed several large full-frame temporary 
   pixels.  It does not compensate for sub-pixel displacement, local motion,
   rotation, or scale differences.  A poor match can produce a locally inaccurate
   highlight base even though the pass cannot brighten or clip the output.
-- Crop previews use a padded high-resolution cache, but recovery is recomputed
-  for the preview region.  Full-conversion and crop-preview recovery should be
-  considered visually comparable rather than bit-identical until a
-  recovery-enabled crop/full regression test exists.
+- Converted previews, including recovery-enabled previews, use a
+  display-resolution cache. Full conversion remains full-resolution.
 - The Adobe DNG SDK bundle must exist locally under `dng_sdk_1_7_1/` or be provided through `HIRACO_DNG_SDK_ROOT`.
 - The GUI controls are live processing overrides for inspection and conversion, not a non-destructive editing history system.
 - Linux and Windows build paths exist, but the most frequently exercised environment in this repository is macOS.
 
-## 11. Related Files
+## 11. Approved GUI Redesign Implementation Plan
+
+This section records the approved direction for the next GUI iteration.  It is
+intentionally a target design rather than a description of the current GUI.
+
+### 11.1 Product Direction
+
+- Keep wxWidgets as the desktop UI foundation.
+- Replace the separate converted-crop panel and movable crop workflow with a
+  full-image converted preview.
+- Make the photo the primary workspace.  Queue management and controls should
+  remain available without competing with the image.
+
+### 11.2 Workspace
+
+- **Left input strip:** show source-image thumbnails, filename and processing
+  state.  Each thumbnail has its own remove/trash action.
+- **Central canvas:** show aligned original and converted full-image previews.
+  It provides three visible comparison modes:
+  - Original
+  - Converted
+  - Side by side
+- **Navigation:** provide `Fit`, `50%`, and `100%` zoom controls.  When the
+  image is larger than the canvas, the user can pan it directly.
+- **Right inspector:** keep the existing processing controls directly visible;
+  there are too few of them to require a menu or collapsed sections.
+
+### 11.3 Processing Presets
+
+- Add visible `Small`, `Medium`, and `Strong` presets as quick starting points
+  for the processing controls.
+- Presets apply resolved per-file processing settings.  The detailed controls
+  remain editable afterwards and a manual edit marks the file as custom.
+- The final numeric values must be validated against representative 20 MP,
+  50 MP, and 80 MP sources before they become user-facing defaults.
+
+### 11.4 Output
+
+The Output card keeps compression visible and has an expandable **Output
+Options** group.  When expanded it offers three mutually exclusive destinations:
+
+1. **Specific folder** — choose an absolute directory with a folder picker.
+2. **Next to original ORF** — write beside the source file.
+3. **Subfolder under original ORF** — supply a relative child-folder name,
+   such as `converted`.
+
+The current output behavior is retained; the redesign makes its three
+destinations explicit rather than representing the latter two through an empty
+or non-empty text field.
+
+### 11.5 Implementation Order
+
+1. Add a cancelable, cached converted full-preview API to the core.  It must
+   render at a bounded display resolution rather than materializing an
+   unbounded 50/80 MP GUI bitmap.
+2. Replace the crop canvas with a full-image comparison canvas, preserving
+   orientation correctness and synchronized zoom/pan for side-by-side viewing.
+3. Replace the `wxListCtrl` queue with thumbnail rows that can contain a
+   per-image remove button.
+4. Rebuild the inspector around direct settings, presets, and the expandable
+   output options.
+5. Benchmark full-preview refresh on the M4 Pro and add core regression tests
+   for full-preview dimensions, orientation, cancellation, and cache reuse.
+
+## 12. Related Files
 
 - `README.md` for build and usage instructions
 - `src/hiraco_core.cpp` for shared preparation, preview, crop, and conversion orchestration

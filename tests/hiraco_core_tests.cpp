@@ -402,6 +402,55 @@ void TestRealOrfPreviewAutoBrightGainEstimate() {
              std::to_string(gain) + ")");
 }
 
+void TestLocalOm3RecoveryFullPreviewSmoke() {
+  // The sample directory is intentionally untracked. Exercise the
+  // display-resolution recovery mapping when a local OM-3 ORF/ORI pair is
+  // available, without making the portable test suite depend on that fixture.
+  const std::filesystem::path source_path =
+      std::filesystem::path(__FILE__).parent_path().parent_path() / "sample" / "_8142491.ORF";
+  if (!std::filesystem::exists(source_path)) {
+    return;
+  }
+
+  PreparedSource prepared;
+  std::string error_message;
+  const bool prepare_ok = PrepareSource(source_path.string(), &prepared, &error_message);
+  Expect(prepare_ok, "local OM-3 source preparation should succeed: " + error_message);
+  if (!prepared.HasHighlightRecoverySource()) {
+    return;
+  }
+
+  auto normal_preview = std::make_shared<PreviewImage>();
+  const bool normal_ok = RenderConvertedFullPreview(&prepared,
+                                                     {},
+                                                     512,
+                                                     normal_preview,
+                                                     {},
+                                                     {},
+                                                     {},
+                                                     &error_message);
+  Expect(normal_ok, "local OM-3 full preview should succeed: " + error_message);
+  Expect(normal_preview->width > 0 && normal_preview->height > 0 &&
+             std::max(normal_preview->width, normal_preview->height) <= 512,
+         "local OM-3 full preview should obey its display-size limit");
+
+  prepared.enable_highlight_recovery = true;
+  auto recovery_preview = std::make_shared<PreviewImage>();
+  const bool recovery_ok = RenderConvertedFullPreview(&prepared,
+                                                       {},
+                                                       512,
+                                                       recovery_preview,
+                                                       {},
+                                                       {},
+                                                       {},
+                                                       &error_message);
+  Expect(recovery_ok,
+         "local OM-3 recovery-enabled full preview should succeed: " + error_message);
+  Expect(recovery_preview->width == normal_preview->width &&
+             recovery_preview->height == normal_preview->height,
+         "recovery-enabled full preview should retain the normal preview dimensions");
+}
+
 void TestCropPreviewMatchesFullImageCrop() {
   const SourceLinearDngMetadata metadata = MakeHighResMetadata();
   ProcessingCache cache;
@@ -456,6 +505,48 @@ void TestCropPreviewMatchesFullImageCrop() {
   Expect(max_abs_diff <= 150,
          "ROI crop preview should stay close to full-image crop output (max diff=" +
              std::to_string(max_abs_diff) + ")");
+
+  auto scaled = std::make_shared<PreviewImage>();
+  const bool scaled_ok = RenderConvertedCropPreview(metadata,
+                                                    cache,
+                                                    crop,
+                                                    "",
+                                                    false,
+                                                    {},
+                                                    scaled,
+                                                    {},
+                                                    {},
+                                                    &error_message,
+                                                    128);
+  Expect(scaled_ok, "scaled converted preview should succeed");
+  Expect(std::max(scaled->width, scaled->height) <= 128,
+         "scaled converted preview should respect its longest-edge limit");
+}
+
+void TestDisplayProcessingCacheScalesBothInputs() {
+  ProcessingCache source;
+  source.raw_image = MakeSyntheticRgb(900, 600);
+  source.cfa_guide_image = MakeSyntheticGuide(900, 600);
+  source.raw_image_is_camera_space = true;
+  source.highlight_recovery_enabled = false;
+  source.preview_auto_bright_gain = 1.75;
+  source.source_width = 900;
+  source.source_height = 600;
+
+  ProcessingCache display;
+  std::string error_message;
+  const bool ok = BuildDisplayProcessingCache(source, 300, &display, &error_message);
+  Expect(ok, "display processing cache should build: " + error_message);
+  Expect(display.raw_image.width == 300 && display.raw_image.height == 200,
+         "display processing cache should preserve aspect ratio at its longest edge");
+  Expect(display.cfa_guide_image.width == 300 && display.cfa_guide_image.height == 200 &&
+             display.cfa_guide_image.colors == 4,
+         "display processing cache should scale the matching CFA guide");
+  Expect(display.source_width == 300 && display.source_height == 200,
+         "display processing cache coordinates should use display resolution");
+  Expect(display.raw_image_is_camera_space &&
+             std::abs(display.preview_auto_bright_gain - 1.75) < 1e-9,
+         "display processing cache should preserve render properties");
 }
 
   void TestStage2SmallMediumLargeGainResponse() {
@@ -543,7 +634,9 @@ int main() {
     TestRealOrfPreviewSmoke();
     TestRealOrfCropPreviewFollowsCropRect();
     TestRealOrfPreviewAutoBrightGainEstimate();
+    TestLocalOm3RecoveryFullPreviewSmoke();
     TestCropPreviewMatchesFullImageCrop();
+    TestDisplayProcessingCacheScalesBothInputs();
     TestStage2SmallMediumLargeGainResponse();
   } catch (const std::exception& exception) {
     std::cerr << "Test failure: " << exception.what() << "\n";

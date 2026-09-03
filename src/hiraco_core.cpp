@@ -214,81 +214,83 @@ bool DecodeWithLibRaw(const std::string& source_path,
     return false;
   }
 
-  summary->camera_make = processor->imgdata.idata.make;
-  summary->camera_model = processor->imgdata.idata.model;
-  summary->libraw_flip = processor->imgdata.sizes.flip;
-  summary->raw_width = processor->imgdata.sizes.raw_width;
-  summary->raw_height = processor->imgdata.sizes.raw_height;
-  summary->image_width = processor->imgdata.sizes.width;
-  summary->image_height = processor->imgdata.sizes.height;
-  summary->black_level = processor->imgdata.color.black;
-  summary->white_level = processor->imgdata.color.maximum;
+  const auto populate_summary = [&]() {
+    summary->camera_make = processor->imgdata.idata.make;
+    summary->camera_model = processor->imgdata.idata.model;
+    summary->libraw_flip = processor->imgdata.sizes.flip;
+    summary->raw_width = processor->imgdata.sizes.raw_width;
+    summary->raw_height = processor->imgdata.sizes.raw_height;
+    summary->image_width = processor->imgdata.sizes.width;
+    summary->image_height = processor->imgdata.sizes.height;
+    summary->black_level = processor->imgdata.color.black;
+    summary->white_level = processor->imgdata.color.maximum;
 
-  result = processor->unpack();
-  if (result != LIBRAW_SUCCESS) {
-    *error_message = std::string("LibRaw unpack failed: ") + libraw_strerror(result);
-    processor->recycle();
-    return false;
-  }
-
-  summary->black_level = processor->imgdata.color.black;
-  summary->white_level = processor->imgdata.color.maximum;
-  summary->libraw_flip = processor->imgdata.sizes.flip;
-
-  bool all_zero = true;
-  for (int row = 0; row < 3; ++row) {
-    for (int col = 0; col < 3; ++col) {
-      const double value = processor->imgdata.color.cmatrix[row][col];
-      summary->color_matrix1[row * 3 + col] = value;
-      if (value != 0.0) {
-        all_zero = false;
+    bool all_zero = true;
+    for (int row = 0; row < 3; ++row) {
+      for (int col = 0; col < 3; ++col) {
+        const double value = processor->imgdata.color.cmatrix[row][col];
+        summary->color_matrix1[row * 3 + col] = value;
+        if (value != 0.0) {
+          all_zero = false;
+        }
       }
     }
-  }
-  summary->has_color_matrix1 = !all_zero;
+    summary->has_color_matrix1 = !all_zero;
 
-  bool rgb_cam_all_zero = true;
-  for (int row = 0; row < 3; ++row) {
-    for (int col = 0; col < 3; ++col) {
-      const double value = processor->imgdata.color.rgb_cam[row][col];
-      summary->rgb_cam[row * 3 + col] = value;
-      if (value != 0.0) {
-        rgb_cam_all_zero = false;
+    bool rgb_cam_all_zero = true;
+    for (int row = 0; row < 3; ++row) {
+      for (int col = 0; col < 3; ++col) {
+        const double value = processor->imgdata.color.rgb_cam[row][col];
+        summary->rgb_cam[row * 3 + col] = value;
+        if (value != 0.0) {
+          rgb_cam_all_zero = false;
+        }
       }
     }
-  }
-  summary->has_rgb_cam = !rgb_cam_all_zero;
+    summary->has_rgb_cam = !rgb_cam_all_zero;
 
-  if (processor->imgdata.color.cam_mul[0] > 0.0f &&
-      processor->imgdata.color.cam_mul[1] > 0.0f &&
-      processor->imgdata.color.cam_mul[2] > 0.0f) {
-    summary->has_as_shot_neutral = true;
-    const double green = processor->imgdata.color.cam_mul[1];
-    summary->as_shot_neutral[0] = static_cast<double>(green / processor->imgdata.color.cam_mul[0]);
-    summary->as_shot_neutral[1] = 1.0;
-    summary->as_shot_neutral[2] = static_cast<double>(green / processor->imgdata.color.cam_mul[2]);
-  }
+    summary->has_as_shot_neutral =
+        processor->imgdata.color.cam_mul[0] > 0.0f &&
+        processor->imgdata.color.cam_mul[1] > 0.0f &&
+        processor->imgdata.color.cam_mul[2] > 0.0f;
+    if (summary->has_as_shot_neutral) {
+      const double green = processor->imgdata.color.cam_mul[1];
+      summary->as_shot_neutral[0] = static_cast<double>(green / processor->imgdata.color.cam_mul[0]);
+      summary->as_shot_neutral[1] = 1.0;
+      summary->as_shot_neutral[2] = static_cast<double>(green / processor->imgdata.color.cam_mul[2]);
+    }
 
-  const libraw_image_sizes_t& sizes = processor->imgdata.sizes;
-  if (sizes.raw_inset_crops[0].cwidth > 0 && sizes.raw_inset_crops[0].cheight > 0) {
-    summary->has_default_crop = true;
-    summary->default_crop_origin_h = sizes.raw_inset_crops[0].cleft;
-    summary->default_crop_origin_v = sizes.raw_inset_crops[0].ctop;
-    summary->default_crop_width = sizes.raw_inset_crops[0].cwidth;
-    summary->default_crop_height = sizes.raw_inset_crops[0].cheight;
-  }
+    const libraw_image_sizes_t& sizes = processor->imgdata.sizes;
+    summary->has_default_crop =
+        sizes.raw_inset_crops[0].cwidth > 0 && sizes.raw_inset_crops[0].cheight > 0;
+    if (summary->has_default_crop) {
+      summary->default_crop_origin_h = sizes.raw_inset_crops[0].cleft;
+      summary->default_crop_origin_v = sizes.raw_inset_crops[0].ctop;
+      summary->default_crop_width = sizes.raw_inset_crops[0].cwidth;
+      summary->default_crop_height = sizes.raw_inset_crops[0].cheight;
+    }
 
-  if (processor->imgdata.other.iso_speed > 0.0f) {
-    summary->has_exif_iso = true;
-    summary->exif_iso = processor->imgdata.other.iso_speed;
-  }
-  if (processor->imgdata.other.shutter > 0.0f) {
-    summary->has_exif_shutter_speed = true;
-    summary->exif_shutter_speed = processor->imgdata.other.shutter;
-  }
-  if (processor->imgdata.other.aperture > 0.0f) {
-    summary->has_exif_aperture = true;
-    summary->exif_aperture = processor->imgdata.other.aperture;
+    summary->has_exif_iso = processor->imgdata.other.iso_speed > 0.0f;
+    summary->exif_iso = summary->has_exif_iso ? processor->imgdata.other.iso_speed : 0.0f;
+    summary->has_exif_shutter_speed = processor->imgdata.other.shutter > 0.0f;
+    summary->exif_shutter_speed =
+        summary->has_exif_shutter_speed ? processor->imgdata.other.shutter : 0.0f;
+    summary->has_exif_aperture = processor->imgdata.other.aperture > 0.0f;
+    summary->exif_aperture = summary->has_exif_aperture ? processor->imgdata.other.aperture : 0.0f;
+  };
+
+  populate_summary();
+  const bool has_required_header_metadata =
+      summary->raw_width > 0 && summary->raw_height > 0 && summary->white_level > 0 &&
+      (summary->has_color_matrix1 || summary->has_rgb_cam) && summary->has_as_shot_neutral;
+  if (!has_required_header_metadata) {
+    result = processor->unpack();
+    if (result != LIBRAW_SUCCESS) {
+      *error_message = std::string("LibRaw unpack failed: ") + libraw_strerror(result);
+      processor->recycle();
+      return false;
+    }
+    populate_summary();
   }
 
   processor->recycle();
@@ -472,15 +474,36 @@ bool LibRawOverridesEqual(const LibRawOverrideSet& lhs, const LibRawOverrideSet&
          lhs.adjust_maximum_thr == rhs.adjust_maximum_thr;
 }
 
+bool StageOverridesEqual(const StageOverrideSet& lhs, const StageOverrideSet& rhs) {
+  return lhs.stage1_psf_sigma == rhs.stage1_psf_sigma &&
+         lhs.stage1_nsr == rhs.stage1_nsr &&
+         lhs.stage2_denoise == rhs.stage2_denoise &&
+         lhs.stage2_gain1 == rhs.stage2_gain1 &&
+         lhs.stage2_gain2 == rhs.stage2_gain2 &&
+         lhs.stage2_gain3 == rhs.stage2_gain3 &&
+         lhs.stage3_radius == rhs.stage3_radius &&
+         lhs.stage3_gain == rhs.stage3_gain;
+}
+
 }  // namespace
 
 struct PreparedSourceData {
   std::mutex mutex;
   bool has_original_preview = false;
-  PreviewImage original_preview;
+  std::shared_ptr<const PreviewImage> original_preview;
+  bool has_converted_full_preview = false;
+  PreviewImage converted_full_preview;
+  StageOverrideSet converted_full_preview_stage_overrides;
+  LibRawOverrideSet converted_full_preview_libraw_overrides;
+  uint32_t converted_full_preview_max_dimension = 0;
+  bool converted_full_preview_highlight_recovery = false;
   bool has_processing_cache = false;
-  ProcessingCache processing_cache;
+  std::shared_ptr<const ProcessingCache> processing_cache;
   LibRawOverrideSet cached_libraw_overrides;
+  bool has_display_processing_cache = false;
+  std::shared_ptr<const ProcessingCache> display_processing_cache;
+  uint32_t display_processing_cache_max_dimension = 0;
+  LibRawOverrideSet display_processing_cache_libraw_overrides;
   bool has_preview_auto_bright_gain = false;
   double preview_auto_bright_gain = 1.0;
   LibRawOverrideSet preview_auto_bright_libraw_overrides;
@@ -670,8 +693,9 @@ bool RenderOriginalPreview(PreparedSource* prepared,
   {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
     if (prepared->data->has_original_preview &&
+        prepared->data->original_preview &&
         LibRawOverridesEqual(prepared->data->cached_libraw_overrides, libraw_overrides)) {
-      *preview = prepared->data->original_preview;
+      *preview = *prepared->data->original_preview;
       return true;
     }
   }
@@ -689,25 +713,69 @@ bool RenderOriginalPreview(PreparedSource* prepared,
   std::lock_guard<std::mutex> lock(prepared->data->mutex);
   prepared->data->has_original_preview = true;
   prepared->data->cached_libraw_overrides = libraw_overrides;
-  prepared->data->original_preview = *preview;
+  prepared->data->original_preview = preview;
   return true;
 }
 
 bool TryGetCachedOriginalPreview(const PreparedSource& prepared,
                                  const LibRawOverrideSet& libraw_overrides,
-                                 std::shared_ptr<PreviewImage> preview) {
+                                 std::shared_ptr<const PreviewImage>* preview) {
   if (!preview || !prepared.data) {
     return false;
   }
 
   std::lock_guard<std::mutex> lock(prepared.data->mutex);
   if (!prepared.data->has_original_preview ||
+      !prepared.data->original_preview ||
       !LibRawOverridesEqual(prepared.data->cached_libraw_overrides, libraw_overrides)) {
     return false;
   }
 
   *preview = prepared.data->original_preview;
   return true;
+}
+
+void ReleasePreviewProcessingCache(PreparedSource* prepared) {
+  if (prepared == nullptr || !prepared->data) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(prepared->data->mutex);
+  prepared->data->has_converted_full_preview = false;
+  prepared->data->converted_full_preview = PreviewImage();
+  prepared->data->has_processing_cache = false;
+  prepared->data->processing_cache.reset();
+  prepared->data->has_display_processing_cache = false;
+  prepared->data->display_processing_cache.reset();
+}
+
+size_t GetPreviewCacheBytes(const PreparedSource& prepared) {
+  if (!prepared.data) {
+    return 0;
+  }
+
+  const auto raster_bytes = [](const RasterImage& image) {
+    return image.pixels.size() * sizeof(uint16_t);
+  };
+  const auto preview_bytes = [](const PreviewImage& image) {
+    return image.pixels.size() * sizeof(uint8_t);
+  };
+
+  std::lock_guard<std::mutex> lock(prepared.data->mutex);
+  size_t total = 0;
+  if (prepared.data->original_preview) {
+    total += preview_bytes(*prepared.data->original_preview);
+  }
+  total += preview_bytes(prepared.data->converted_full_preview);
+  if (prepared.data->processing_cache) {
+    total += raster_bytes(prepared.data->processing_cache->raw_image);
+    total += raster_bytes(prepared.data->processing_cache->cfa_guide_image);
+  }
+  if (prepared.data->display_processing_cache) {
+    total += raster_bytes(prepared.data->display_processing_cache->raw_image);
+    total += raster_bytes(prepared.data->display_processing_cache->cfa_guide_image);
+  }
+  return total;
 }
 
 bool RenderConvertedCrop(PreparedSource* prepared,
@@ -742,27 +810,30 @@ bool RenderConvertedCrop(PreparedSource* prepared,
     return false;
   }
 
+  std::shared_ptr<const ProcessingCache> cached_processing_cache;
   {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
     if (prepared->data->has_processing_cache &&
+        prepared->data->processing_cache &&
         LibRawOverridesEqual(prepared->data->cached_libraw_overrides, libraw_overrides) &&
-        ProcessingCacheCoversCrop(prepared->data->processing_cache, crop_rect)) {
-      prepared->data->processing_cache.preview_auto_bright_gain =
-          prepared->data->preview_auto_bright_gain;
-        return RenderConvertedCropPreview(*enhancement_metadata,
-                                        prepared->data->processing_cache,
-                                        crop_rect,
-                                        prepared->highlight_recovery_source_path,
-                                        prepared->ShouldUseHighlightRecovery(),
-                                        stage_overrides,
-                                        preview,
-                                        progress,
-                                        cancel,
-                                        error_message);
+        ProcessingCacheCoversCrop(*prepared->data->processing_cache, crop_rect)) {
+      cached_processing_cache = prepared->data->processing_cache;
     }
   }
+  if (cached_processing_cache) {
+    return RenderConvertedCropPreview(*enhancement_metadata,
+                                      *cached_processing_cache,
+                                      crop_rect,
+                                      prepared->highlight_recovery_source_path,
+                                      prepared->ShouldUseHighlightRecovery(),
+                                      stage_overrides,
+                                      preview,
+                                      progress,
+                                      cancel,
+                                      error_message);
+  }
 
-  ProcessingCache cache;
+  auto cache = std::make_shared<ProcessingCache>();
   if (!BuildProcessingCacheFromRaw(prepared->source_path,
                                    *enhancement_metadata,
                                    prepared->highlight_recovery_source_path,
@@ -771,7 +842,7 @@ bool RenderConvertedCrop(PreparedSource* prepared,
                                    prepared->image_height,
                                    crop_rect,
                                    libraw_overrides,
-                                   &cache,
+                                   cache.get(),
                                    progress,
                                    cancel,
                                    error_message)) {
@@ -780,7 +851,7 @@ bool RenderConvertedCrop(PreparedSource* prepared,
 
   {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
-    cache.preview_auto_bright_gain = prepared->data->preview_auto_bright_gain;
+    cache->preview_auto_bright_gain = prepared->data->preview_auto_bright_gain;
   }
 
   {
@@ -788,11 +859,12 @@ bool RenderConvertedCrop(PreparedSource* prepared,
     prepared->data->has_processing_cache = true;
     prepared->data->cached_libraw_overrides = libraw_overrides;
     prepared->data->processing_cache = cache;
+    prepared->data->has_display_processing_cache = false;
+    prepared->data->display_processing_cache.reset();
   }
 
-  std::lock_guard<std::mutex> lock(prepared->data->mutex);
   return RenderConvertedCropPreview(*enhancement_metadata,
-                                    prepared->data->processing_cache,
+                                    *cache,
                                     crop_rect,
                                     prepared->highlight_recovery_source_path,
                                     prepared->ShouldUseHighlightRecovery(),
@@ -801,6 +873,240 @@ bool RenderConvertedCrop(PreparedSource* prepared,
                                     progress,
                                     cancel,
                                     error_message);
+}
+
+bool RenderConvertedFullPreview(PreparedSource* prepared,
+                                const StageOverrideSet& stage_overrides,
+                                uint32_t max_dimension,
+                                std::shared_ptr<PreviewImage> preview,
+                                const LibRawOverrideSet& libraw_overrides,
+                                ProgressCallback progress,
+                                CancelCheck cancel,
+                                std::string* error_message) {
+  const hiraco::ScopedTimingLog preview_timer("preview", "Render converted full preview");
+  if (prepared == nullptr || !preview || max_dimension == 0) {
+    if (error_message != nullptr) {
+      *error_message = "invalid converted full preview request";
+    }
+    return false;
+  }
+
+  if (!prepared->data || prepared->image_width == 0 || prepared->image_height == 0) {
+    if (error_message != nullptr) {
+      *error_message = "prepared source is missing full preview state";
+    }
+    return false;
+  }
+
+  const bool highlight_recovery_enabled = prepared->ShouldUseHighlightRecovery();
+  {
+    std::lock_guard<std::mutex> lock(prepared->data->mutex);
+    if (prepared->data->has_converted_full_preview &&
+        prepared->data->converted_full_preview_max_dimension == max_dimension &&
+        prepared->data->converted_full_preview_highlight_recovery == highlight_recovery_enabled &&
+        StageOverridesEqual(prepared->data->converted_full_preview_stage_overrides, stage_overrides) &&
+        LibRawOverridesEqual(prepared->data->converted_full_preview_libraw_overrides,
+                             libraw_overrides)) {
+      *preview = prepared->data->converted_full_preview;
+      return true;
+    }
+  }
+
+  std::shared_ptr<const SourceLinearDngMetadata> enhancement_metadata;
+  if (!EnsureEnhancementMetadata(*prepared, &enhancement_metadata, error_message)) {
+    return false;
+  }
+
+  if (!EnsurePreviewAutoBrightGain(prepared, libraw_overrides, error_message)) {
+    return false;
+  }
+
+  CropRect preview_crop;
+  preview_crop.width = prepared->image_width;
+  preview_crop.height = prepared->image_height;
+  if (prepared->metadata.has_default_crop &&
+      prepared->metadata.default_crop_width > 0 &&
+      prepared->metadata.default_crop_height > 0 &&
+      prepared->metadata.default_crop_origin_h < prepared->image_width &&
+      prepared->metadata.default_crop_origin_v < prepared->image_height) {
+    preview_crop.x = prepared->metadata.default_crop_origin_h;
+    preview_crop.y = prepared->metadata.default_crop_origin_v;
+    preview_crop.width = std::min(prepared->metadata.default_crop_width,
+                                  prepared->image_width - preview_crop.x);
+    preview_crop.height = std::min(prepared->metadata.default_crop_height,
+                                   prepared->image_height - preview_crop.y);
+  }
+
+  auto store_rendered_preview = [&]() {
+    std::lock_guard<std::mutex> lock(prepared->data->mutex);
+    prepared->data->has_converted_full_preview = true;
+    prepared->data->converted_full_preview = *preview;
+    prepared->data->converted_full_preview_stage_overrides = stage_overrides;
+    prepared->data->converted_full_preview_libraw_overrides = libraw_overrides;
+    prepared->data->converted_full_preview_max_dimension = max_dimension;
+    prepared->data->converted_full_preview_highlight_recovery = highlight_recovery_enabled;
+  };
+
+  std::shared_ptr<const ProcessingCache> source_cache;
+  {
+    std::lock_guard<std::mutex> lock(prepared->data->mutex);
+    if (prepared->data->has_processing_cache && prepared->data->processing_cache &&
+        LibRawOverridesEqual(prepared->data->cached_libraw_overrides, libraw_overrides) &&
+        ProcessingCacheCoversCrop(*prepared->data->processing_cache, preview_crop)) {
+      source_cache = prepared->data->processing_cache;
+    }
+  }
+
+  if (!source_cache) {
+    if (IsCancelled(cancel)) {
+      if (error_message != nullptr) {
+        *error_message = "operation canceled";
+      }
+      return false;
+    }
+
+    auto built_cache = std::make_shared<ProcessingCache>();
+    if (!BuildProcessingCacheFromRaw(prepared->source_path,
+                                     *enhancement_metadata,
+                                     prepared->highlight_recovery_source_path,
+                                     highlight_recovery_enabled,
+                                     prepared->image_width,
+                                     prepared->image_height,
+                                     preview_crop,
+                                     libraw_overrides,
+                                     built_cache.get(),
+                                     progress,
+                                     cancel,
+                                     error_message)) {
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(prepared->data->mutex);
+      built_cache->preview_auto_bright_gain = prepared->data->preview_auto_bright_gain;
+      prepared->data->has_processing_cache = true;
+      prepared->data->cached_libraw_overrides = libraw_overrides;
+      prepared->data->processing_cache = built_cache;
+      prepared->data->has_display_processing_cache = false;
+      prepared->data->display_processing_cache.reset();
+    }
+    source_cache = std::move(built_cache);
+  }
+
+  std::shared_ptr<const ProcessingCache> display_cache;
+  {
+    std::lock_guard<std::mutex> lock(prepared->data->mutex);
+    if (prepared->data->has_display_processing_cache &&
+        prepared->data->display_processing_cache &&
+        prepared->data->display_processing_cache_max_dimension == max_dimension &&
+        LibRawOverridesEqual(prepared->data->display_processing_cache_libraw_overrides,
+                             libraw_overrides)) {
+      display_cache = prepared->data->display_processing_cache;
+    }
+  }
+
+  if (!display_cache) {
+    auto built_display_cache = std::make_shared<ProcessingCache>();
+    if (!BuildDisplayProcessingCache(*source_cache,
+                                     max_dimension,
+                                     built_display_cache.get(),
+                                     error_message)) {
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(prepared->data->mutex);
+      prepared->data->has_display_processing_cache = true;
+      prepared->data->display_processing_cache = built_display_cache;
+      prepared->data->display_processing_cache_max_dimension = max_dimension;
+      prepared->data->display_processing_cache_libraw_overrides = libraw_overrides;
+    }
+    display_cache = std::move(built_display_cache);
+  }
+
+  const CropRect source_cache_region = source_cache->has_cached_crop
+      ? CropRect{source_cache->region_origin_x,
+                 source_cache->region_origin_y,
+                 source_cache->raw_image.width,
+                 source_cache->raw_image.height}
+      : CropRect{0, 0, source_cache->raw_image.width, source_cache->raw_image.height};
+  CropRect preview_crop_in_cache = preview_crop;
+  if (source_cache->has_cached_crop) {
+    preview_crop_in_cache.x -= source_cache_region.x;
+    preview_crop_in_cache.y -= source_cache_region.y;
+  }
+  preview_crop_in_cache = ClampCropRect(preview_crop_in_cache,
+                                        source_cache->raw_image.width,
+                                        source_cache->raw_image.height);
+
+  const auto scale_coordinate = [](uint32_t value, uint32_t source_extent, uint32_t display_extent) {
+    if (source_extent == 0) {
+      return 0u;
+    }
+    return static_cast<uint32_t>((static_cast<uint64_t>(value) * display_extent) / source_extent);
+  };
+  CropRect display_crop;
+  display_crop.x = scale_coordinate(preview_crop_in_cache.x,
+                                    source_cache->raw_image.width,
+                                    display_cache->raw_image.width);
+  display_crop.y = scale_coordinate(preview_crop_in_cache.y,
+                                    source_cache->raw_image.height,
+                                    display_cache->raw_image.height);
+  const uint32_t display_right = scale_coordinate(preview_crop_in_cache.x + preview_crop_in_cache.width,
+                                                  source_cache->raw_image.width,
+                                                  display_cache->raw_image.width);
+  const uint32_t display_bottom = scale_coordinate(preview_crop_in_cache.y + preview_crop_in_cache.height,
+                                                   source_cache->raw_image.height,
+                                                   display_cache->raw_image.height);
+  display_crop.width = std::max(1u, display_right - std::min(display_crop.x, display_right));
+  display_crop.height = std::max(1u, display_bottom - std::min(display_crop.y, display_bottom));
+  display_crop = ClampCropRect(display_crop,
+                               display_cache->raw_image.width,
+                               display_cache->raw_image.height);
+
+  const auto scale_coordinate_ceil = [](uint32_t value,
+                                        uint32_t source_extent,
+                                        uint32_t display_extent) {
+    if (display_extent == 0) {
+      return 0u;
+    }
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(value) * source_extent + display_extent - 1) / display_extent);
+  };
+  RecoveryImageCoordinates recovery_coordinates;
+  recovery_coordinates.full_width = source_cache->source_width;
+  recovery_coordinates.full_height = source_cache->source_height;
+  recovery_coordinates.represented_region.x = source_cache_region.x +
+      scale_coordinate(display_crop.x, source_cache_region.width, display_cache->raw_image.width);
+  recovery_coordinates.represented_region.y = source_cache_region.y +
+      scale_coordinate(display_crop.y, source_cache_region.height, display_cache->raw_image.height);
+  const uint32_t recovery_right = source_cache_region.x + scale_coordinate_ceil(
+      display_crop.x + display_crop.width,
+      source_cache_region.width,
+      display_cache->raw_image.width);
+  const uint32_t recovery_bottom = source_cache_region.y + scale_coordinate_ceil(
+      display_crop.y + display_crop.height,
+      source_cache_region.height,
+      display_cache->raw_image.height);
+  recovery_coordinates.represented_region.width = std::max(
+      1u, recovery_right - std::min(recovery_coordinates.represented_region.x, recovery_right));
+  recovery_coordinates.represented_region.height = std::max(
+      1u, recovery_bottom - std::min(recovery_coordinates.represented_region.y, recovery_bottom));
+
+  if (!RenderConvertedCropPreview(*enhancement_metadata,
+                                  *display_cache,
+                                  display_crop,
+                                  prepared->highlight_recovery_source_path,
+                                  highlight_recovery_enabled,
+                                  stage_overrides,
+                                  preview,
+                                  progress,
+                                  cancel,
+                                  error_message,
+                                  0,
+                                  highlight_recovery_enabled ? &recovery_coordinates : nullptr)) {
+    return false;
+  }
+  store_rendered_preview();
+  return true;
 }
 
 DngWriteResult ConvertToDng(const PreparedSource& prepared,
@@ -820,17 +1126,15 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
   double preview_gain = 1.0;
   if (prepared.data) {
     std::lock_guard<std::mutex> lock(prepared.data->mutex);
-    if (prepared.data->has_original_preview) {
-      preview_override = std::make_shared<PreviewImage>(prepared.data->original_preview);
+    if (prepared.data->has_original_preview && prepared.data->original_preview) {
+      preview_override = prepared.data->original_preview;
     }
-    if (prepared.data->has_processing_cache) {
-      preview_gain = prepared.data->processing_cache.preview_auto_bright_gain;
-    } else {
-      EstimatePreviewAutoBrightGainFromRaw(prepared.source_path,
-                                           *enhancement_metadata,
-                                           libraw_overrides,
-                                           &preview_gain,
-                                           nullptr);
+    if (prepared.data->has_processing_cache && prepared.data->processing_cache) {
+      preview_gain = prepared.data->processing_cache->preview_auto_bright_gain;
+    } else if (prepared.data->has_preview_auto_bright_gain &&
+               LibRawOverridesEqual(prepared.data->preview_auto_bright_libraw_overrides,
+                                    libraw_overrides)) {
+      preview_gain = prepared.data->preview_auto_bright_gain;
     }
   }
 

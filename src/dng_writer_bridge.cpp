@@ -33,8 +33,11 @@
 #include <future>
 #include <libraw/libraw.h>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "HalideBuffer.h"
@@ -179,6 +182,37 @@ ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMeta
 
 std::once_flag g_fftw_init_flag;
 std::mutex g_fftw_wisdom_mutex;
+std::mutex g_fftw_plan_mutex;
+std::mutex g_fftw_execute_mutex;
+
+struct FftwPlanPair {
+  fftw_plan forward = nullptr;
+  fftw_plan inverse = nullptr;
+
+  ~FftwPlanPair() {
+    if (forward != nullptr) {
+      fftw_destroy_plan(forward);
+    }
+    if (inverse != nullptr) {
+      fftw_destroy_plan(inverse);
+    }
+  }
+};
+
+std::unordered_map<uint64_t, std::shared_ptr<FftwPlanPair>> g_fftw_plan_cache;
+
+// Highlight recovery uses a separate full-resolution ORI. Keep one immutable
+// companion raster for the process so repeated preview changes and a following
+// conversion do not repeatedly unpack and reconstruct the same large file.
+// A single entry bounds its residency to one extra full-resolution raster.
+struct HighlightRecoveryCompanionCacheEntry {
+  std::string source_path;
+  SourceLinearDngMetadata metadata;
+  std::shared_ptr<const RasterImage> rendered_image;
+};
+
+std::mutex g_highlight_recovery_companion_cache_mutex;
+std::optional<HighlightRecoveryCompanionCacheEntry> g_highlight_recovery_companion_cache;
 
 void InitFftwThreads() {
   std::call_once(g_fftw_init_flag, [] {
@@ -211,6 +245,52 @@ void SaveFftwWisdom() {
     std::lock_guard<std::mutex> lock(g_fftw_wisdom_mutex);
     fftw_export_wisdom_to_filename(path.c_str());
   }
+}
+
+std::shared_ptr<const FftwPlanPair> GetFftwPlanPair(uint32_t width, uint32_t height) {
+  const uint64_t key = (static_cast<uint64_t>(height) << 32) | width;
+  std::lock_guard<std::mutex> lock(g_fftw_plan_mutex);
+  const auto cached = g_fftw_plan_cache.find(key);
+  if (cached != g_fftw_plan_cache.end()) {
+    return cached->second;
+  }
+
+  InitFftwThreads();
+  LoadFftwWisdom();
+  const size_t real_count = static_cast<size_t>(width) * height;
+  const size_t complex_count = static_cast<size_t>(height) * (width / 2 + 1);
+  double* planning_input = fftw_alloc_real(real_count);
+  fftw_complex* planning_output = fftw_alloc_complex(complex_count);
+  if (planning_input == nullptr || planning_output == nullptr) {
+    if (planning_input != nullptr) {
+      fftw_free(planning_input);
+    }
+    if (planning_output != nullptr) {
+      fftw_free(planning_output);
+    }
+    return nullptr;
+  }
+
+  auto plans = std::make_shared<FftwPlanPair>();
+  plans->forward = fftw_plan_dft_r2c_2d(static_cast<int>(height),
+                                         static_cast<int>(width),
+                                         planning_input,
+                                         planning_output,
+                                         FFTW_MEASURE);
+  plans->inverse = fftw_plan_dft_c2r_2d(static_cast<int>(height),
+                                         static_cast<int>(width),
+                                         planning_output,
+                                         planning_input,
+                                         FFTW_MEASURE);
+  fftw_free(planning_output);
+  fftw_free(planning_input);
+  if (plans->forward == nullptr || plans->inverse == nullptr) {
+    return nullptr;
+  }
+
+  SaveFftwWisdom();
+  g_fftw_plan_cache.emplace(key, plans);
+  return plans;
 }
 
 double RawDomainBlackLevel(const LibRaw& processor) {
@@ -1344,9 +1424,9 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
     fftw_complex* fft_out = fftw_alloc_complex(complex_n);
 
     if (fft_in && fft_out) {
-      // Ensure FFTW threading is initialized and load cached wisdom.
-      InitFftwThreads();
-      LoadFftwWisdom();
+      // Plans are cached by padded dimensions. Dedicated planning buffers keep
+      // FFTW_MEASURE from touching the image being filtered.
+      const std::shared_ptr<const FftwPlanPair> plans = GetFftwPlanPair(fft_w, fft_h);
 
       auto reflect_index = [](int index, int limit) {
         if (index < 0) index = -index;
@@ -1379,17 +1459,12 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
         }
       };
 
-      fill_fft_input();
-
-      fftw_plan plan_fwd = fftw_plan_dft_r2c_2d(
-          static_cast<int>(fft_h), static_cast<int>(fft_w),
-          fft_in, fft_out, FFTW_MEASURE);
-
-      if (plan_fwd) {
-        // Re-fill the buffer after FFTW_MEASURE (planning may clobber it).
+      if (plans) {
         fill_fft_input();
-        fftw_execute(plan_fwd);
-        fftw_destroy_plan(plan_fwd);
+        {
+          std::lock_guard<std::mutex> execute_lock(g_fftw_execute_mutex);
+          fftw_execute_dft_r2c(plans->forward, fft_in, fft_out);
+        }
 
 // Apply Wiener filter in frequency domain.
           //
@@ -1431,16 +1506,11 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
           }
         }
 
-        fftw_plan plan_inv = fftw_plan_dft_c2r_2d(
-            static_cast<int>(fft_h), static_cast<int>(fft_w),
-            fft_out, fft_in, FFTW_MEASURE);
-
-        if (plan_inv) {
-          fftw_execute(plan_inv);
-          fftw_destroy_plan(plan_inv);
-
-          // Save FFTW wisdom so subsequent runs skip the planning cost.
-          SaveFftwWisdom();
+        if (plans->inverse) {
+          {
+            std::lock_guard<std::mutex> execute_lock(g_fftw_execute_mutex);
+            fftw_execute_dft_c2r(plans->inverse, fft_out, fft_in);
+          }
 
           // Extract the central (un-padded) region, normalised.
           const double norm = 1.0 / static_cast<double>(fft_n);
@@ -2057,7 +2127,8 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
                              const SourceLinearDngMetadata& metadata,
                              const CropRect* region,
                              RasterImage* output,
-                             std::string* error_message);
+                             std::string* error_message,
+                             CancelCheck cancel = {});
 
 CropRect ResolveActiveRect(const SourceLinearDngMetadata& metadata,
                            uint32_t width,
@@ -2119,6 +2190,7 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
                                        uint32_t full_height,
                                        const CropRect* region,
                                        RasterImage* image,
+                                       CancelCheck cancel,
                                        std::string* error_message) {
   if (image == nullptr ||
       image->colors < 3 ||
@@ -2129,37 +2201,86 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
     return true;
   }
 
-  PreparedSource companion;
-  std::string companion_error;
-  if (!PrepareSource(highlight_recovery_source_path, &companion, &companion_error)) {
-    if (error_message != nullptr) {
-      *error_message = "Failed to prepare highlight recovery companion: " + companion_error;
+  SourceLinearDngMetadata companion_metadata;
+  std::shared_ptr<const RasterImage> companion_render;
+  {
+    std::lock_guard<std::mutex> lock(g_highlight_recovery_companion_cache_mutex);
+    if (g_highlight_recovery_companion_cache.has_value() &&
+        g_highlight_recovery_companion_cache->source_path == highlight_recovery_source_path) {
+      companion_metadata = g_highlight_recovery_companion_cache->metadata;
+      companion_render = g_highlight_recovery_companion_cache->rendered_image;
     }
-    return false;
   }
 
-  RasterImage companion_render;
-  if (!RenderOm3RawDomainImage(highlight_recovery_source_path,
-                               companion.metadata,
-                               nullptr,
-                               &companion_render,
-                               &companion_error)) {
-    if (error_message != nullptr) {
-      *error_message = "Failed to render highlight recovery companion: " + companion_error;
+  if (!companion_render) {
+    PreparedSource companion;
+    std::string companion_error;
+    if (!PrepareSource(highlight_recovery_source_path, &companion, &companion_error)) {
+      if (error_message != nullptr) {
+        *error_message = "Failed to prepare highlight recovery companion: " + companion_error;
+      }
+      return false;
     }
-    return false;
+    if (CheckCancelled(cancel, error_message)) {
+      return false;
+    }
+
+    auto rendered_companion = std::make_shared<RasterImage>();
+    if (!RenderOm3RawDomainImage(highlight_recovery_source_path,
+                                 companion.metadata,
+                                 nullptr,
+                                 rendered_companion.get(),
+                                 &companion_error,
+                                 cancel)) {
+      if (error_message != nullptr) {
+        *error_message = "Failed to render highlight recovery companion: " + companion_error;
+      }
+      return false;
+    }
+
+    companion_metadata = companion.metadata;
+    companion_render = rendered_companion;
+    {
+      std::lock_guard<std::mutex> lock(g_highlight_recovery_companion_cache_mutex);
+      g_highlight_recovery_companion_cache = HighlightRecoveryCompanionCacheEntry{
+          highlight_recovery_source_path,
+          companion_metadata,
+          std::move(rendered_companion),
+      };
+    }
   }
 
   const CropRect target_active = ResolveActiveRect(metadata, full_width, full_height);
-  const CropRect companion_active = ResolveActiveRect(companion.metadata,
-                                                      companion_render.width,
-                                                      companion_render.height);
+  CropRect target_image_region;
+  target_image_region.width = full_width;
+  target_image_region.height = full_height;
+  if (region != nullptr && region->width > 0 && region->height > 0) {
+    target_image_region = *region;
+  }
+  const auto full_to_image_coordinate = [](double full_coordinate,
+                                           uint32_t region_origin,
+                                           uint32_t region_extent,
+                                           uint32_t image_extent) {
+    return ((full_coordinate - static_cast<double>(region_origin) + 0.5) *
+            static_cast<double>(image_extent) / std::max(region_extent, 1u)) - 0.5;
+  };
+  const auto image_to_full_coordinate = [](uint32_t image_coordinate,
+                                           uint32_t image_extent,
+                                           uint32_t region_origin,
+                                           uint32_t region_extent) {
+    return static_cast<double>(region_origin) +
+        (static_cast<double>(image_coordinate) + 0.5) *
+            static_cast<double>(region_extent) / std::max(image_extent, 1u) - 0.5;
+  };
+  const CropRect companion_active = ResolveActiveRect(companion_metadata,
+                                                      companion_render->width,
+                                                      companion_render->height);
   const double pedestal = metadata.black_level;
-  const double companion_pedestal = companion.metadata.has_black_level ? companion.metadata.black_level : 0.0;
+  const double companion_pedestal = companion_metadata.has_black_level
+      ? companion_metadata.black_level
+      : 0.0;
   const double signal_range = std::max(65535.0 - pedestal, 1.0);
   const double companion_signal_range = std::max(65535.0 - companion_pedestal, 1.0);
-  const uint32_t region_origin_x = region != nullptr ? region->x : 0;
-  const uint32_t region_origin_y = region != nullptr ? region->y : 0;
   const bool debug_recovery = std::getenv("HIRACO_DEBUG_HL_RECOVERY") != nullptr;
   std::atomic<uint64_t> candidate_pixels = 0;
   std::atomic<uint64_t> changed_pixels = 0;
@@ -2178,7 +2299,7 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
           const double companion_row = static_cast<double>(companion_active.y + sample_row + dy);
           const double companion_col = static_cast<double>(companion_active.x + sample_col + dx);
           const double companion_green = std::max(
-              BilinearSampleChannel(companion_render, companion_row, companion_col, 1) - companion_pedestal,
+              BilinearSampleChannel(*companion_render, companion_row, companion_col, 1) - companion_pedestal,
               0.0);
 
           const double u = (static_cast<double>(sample_col) + 0.5) /
@@ -2189,8 +2310,14 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
                                   v * static_cast<double>(target_active.height) - 0.5;
           const double full_col = static_cast<double>(target_active.x) +
                                   u * static_cast<double>(target_active.width) - 0.5;
-          const double target_row = full_row - static_cast<double>(region_origin_y);
-          const double target_col = full_col - static_cast<double>(region_origin_x);
+          const double target_row = full_to_image_coordinate(full_row,
+                                                              target_image_region.y,
+                                                              target_image_region.height,
+                                                              image->height);
+          const double target_col = full_to_image_coordinate(full_col,
+                                                              target_image_region.x,
+                                                              target_image_region.width,
+                                                              image->width);
           const double target_green = std::max(
               BilinearSampleChannel(*image, target_row, target_col, 1),
               0.0);
@@ -2248,8 +2375,14 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
                               v * static_cast<double>(target_active.height) - 0.5;
       const double full_col = static_cast<double>(target_active.x) +
                               u * static_cast<double>(target_active.width) - 0.5;
-      const double target_row = full_row - static_cast<double>(region_origin_y);
-      const double target_col = full_col - static_cast<double>(region_origin_x);
+      const double target_row = full_to_image_coordinate(full_row,
+                                                          target_image_region.y,
+                                                          target_image_region.height,
+                                                          image->height);
+      const double target_col = full_to_image_coordinate(full_col,
+                                                          target_image_region.x,
+                                                          target_image_region.width,
+                                                          image->width);
       const double companion_row = static_cast<double>(companion_active.y) +
                                    v * static_cast<double>(companion_active.height) - 0.5 + best_dy;
       const double companion_col = static_cast<double>(companion_active.x) +
@@ -2259,7 +2392,7 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
                                                                  target_row,
                                                                  target_col,
                                                                  0.0);
-      const std::array<double, 3> companion_sample = sample_signal(companion_render,
+      const std::array<double, 3> companion_sample = sample_signal(*companion_render,
                                                                     companion_row,
                                                                     companion_col,
                                                                     companion_pedestal);
@@ -2351,12 +2484,18 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
   #pragma omp parallel for schedule(static) if(image->height > 100)
   for (uint32_t row = 0; row < image->height; ++row) {
     for (uint32_t col = 0; col < image->width; ++col) {
-      const uint32_t full_row = region_origin_y + row;
-      const uint32_t full_col = region_origin_x + col;
+      const double full_row = image_to_full_coordinate(row,
+                                                        image->height,
+                                                        target_image_region.y,
+                                                        target_image_region.height);
+      const double full_col = image_to_full_coordinate(col,
+                                                        image->width,
+                                                        target_image_region.x,
+                                                        target_image_region.width);
       if (full_row < target_active.y ||
-          full_row >= target_active.y + target_active.height ||
+          full_row >= static_cast<double>(target_active.y + target_active.height) ||
           full_col < target_active.x ||
-          full_col >= target_active.x + target_active.width) {
+          full_col >= static_cast<double>(target_active.x + target_active.width)) {
         continue;
       }
 
@@ -2454,7 +2593,8 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
                              const SourceLinearDngMetadata& metadata,
                              const CropRect* region,
                              RasterImage* output,
-                             std::string* error_message) {
+                             std::string* error_message,
+                             CancelCheck cancel) {
   const hiraco::ScopedTimingLog om3_timer("raw", "Render raw domain image");
   using WorkingValue = double;
   if (output == nullptr) {
@@ -2473,6 +2613,10 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
   result = processor->unpack();
   if (result != LIBRAW_SUCCESS) {
     *error_message = std::string("LibRaw unpack failed: ") + libraw_strerror(result);
+    processor->recycle();
+    return false;
+  }
+  if (CheckCancelled(cancel, error_message)) {
     processor->recycle();
     return false;
   }
@@ -2537,6 +2681,9 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
   hiraco::LogTiming("raw", "Load mosaic and CFA", std::chrono::steady_clock::now() - mosaic_start);
 
   processor->recycle();
+  if (CheckCancelled(cancel, error_message)) {
+    return false;
+  }
 
   output->width = width;
   output->height = height;
@@ -2660,6 +2807,9 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
                                                                          render_region);
 
   hiraco::LogTiming("raw", "Load and upsample guide maps", std::chrono::steady_clock::now() - map_start);
+  if (CheckCancelled(cancel, error_message)) {
+    return false;
+  }
 
   const auto green_start = std::chrono::steady_clock::now();
   std::vector<WorkingValue> green(pixel_count, 0.0f);
@@ -2725,6 +2875,9 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
   }
 
   hiraco::LogTiming("raw", "Reconstruct green base plane", std::chrono::steady_clock::now() - green_start);
+  if (CheckCancelled(cancel, error_message)) {
+    return false;
+  }
 
   auto sample_buffer = [&](const std::vector<WorkingValue>& buffer, int row, int col) -> double {
     return static_cast<double>(buffer[static_cast<size_t>(clamp_row(row)) * width + clamp_col(col)]);
@@ -2984,6 +3137,9 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
   }
 
   hiraco::LogTiming("raw", "Guide-aware green refinement", std::chrono::steady_clock::now() - guide_refine_start);
+  if (CheckCancelled(cancel, error_message)) {
+    return false;
+  }
 
   auto blur5 = [&](const std::vector<WorkingValue>& src, std::vector<WorkingValue>* dst) {
     dst->assign(pixel_count, 0.0f);
@@ -3088,6 +3244,9 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
   }
 
   hiraco::LogTiming("raw", "Stability-driven green detail lift", std::chrono::steady_clock::now() - detail_lift_start);
+  if (CheckCancelled(cancel, error_message)) {
+    return false;
+  }
 
   const auto rgb_start = std::chrono::steady_clock::now();
   std::vector<WorkingValue> red_diff(pixel_count, 0.0f);
@@ -3204,6 +3363,9 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
   }
 
   hiraco::LogTiming("raw", "Reconstruct RGB output", std::chrono::steady_clock::now() - rgb_start);
+  if (CheckCancelled(cancel, error_message)) {
+    return false;
+  }
 
   return true;
 }
@@ -3287,6 +3449,7 @@ PreviewImage BuildPreviewImage(const RasterImage& source, uint32_t max_dimension
 
   preview.pixels.resize(static_cast<size_t>(preview.width) * preview.height * preview.colors);
 
+  #pragma omp parallel for schedule(static) if(preview.height > 400)
   for (uint32_t row = 0; row < preview.height; ++row) {
     const uint32_t source_row = std::min<uint32_t>(source.height - 1,
                                                    static_cast<uint32_t>((static_cast<uint64_t>(row) * source.height) / preview.height));
@@ -3327,6 +3490,7 @@ PreviewImage BuildPreviewImage(const PreviewImage& source, uint32_t max_dimensio
 
   preview.pixels.resize(static_cast<size_t>(preview.width) * preview.height * preview.colors);
 
+  #pragma omp parallel for schedule(static) if(preview.height > 400)
   for (uint32_t row = 0; row < preview.height; ++row) {
     const uint32_t source_row = std::min<uint32_t>(source.height - 1,
                                                    static_cast<uint32_t>((static_cast<uint64_t>(row) * source.height) / preview.height));
@@ -3367,6 +3531,7 @@ RasterImage BuildScaledRasterImage(const RasterImage& source, uint32_t max_dimen
 
   scaled.pixels.resize(static_cast<size_t>(scaled.width) * scaled.height * scaled.colors);
 
+  #pragma omp parallel for schedule(static) if(scaled.height > 400)
   for (uint32_t row = 0; row < scaled.height; ++row) {
     const uint32_t source_row = std::min<uint32_t>(source.height - 1,
                                                    static_cast<uint32_t>((static_cast<uint64_t>(row) * source.height) / scaled.height));
@@ -3400,6 +3565,7 @@ void ApplyLibRawOrientationToPreview(int libraw_flip, PreviewImage* preview) {
   const uint32_t target_height = OrientedImageHeight(source_width, source_height, normalized_flip);
   std::vector<uint8_t> rotated(static_cast<size_t>(target_width) * target_height * preview->colors, 0);
 
+  #pragma omp parallel for schedule(static) if(source_height > 400)
   for (uint32_t row = 0; row < source_height; ++row) {
     for (uint32_t col = 0; col < source_width; ++col) {
       uint32_t target_col = col;
@@ -3439,14 +3605,20 @@ int InverseLibRawFlip(int libraw_flip) {
 }
 
 PreviewImage BuildDisplayPreviewFromRaster(const SourceLinearDngMetadata& metadata,
-                                          const RasterImage& source,
+                                          RasterImage source,
                                           bool source_is_camera_space,
                                           uint32_t max_dimension,
                                           double extra_linear_gain = 1.0) {
-  RasterImage preview_raster = BuildScaledRasterImage(source, max_dimension);
+  RasterImage preview_raster;
+  const uint32_t longest_edge = std::max(source.width, source.height);
+  if (max_dimension == 0 || longest_edge <= max_dimension) {
+    preview_raster = std::move(source);
+  } else {
+    preview_raster = BuildScaledRasterImage(source, max_dimension);
+  }
   if (source_is_camera_space) {
     ApplySourceDrivenLinearPreviewTransform(metadata, &preview_raster);
-    ApplyLinearExposureCompensation(SourceDrivenBaselineExposure(metadata, source),
+    ApplyLinearExposureCompensation(SourceDrivenBaselineExposure(metadata, preview_raster),
                                     &preview_raster);
   }
   ApplyLinearGain(extra_linear_gain, &preview_raster);
@@ -3493,6 +3665,7 @@ RasterImage CropRasterImageWithBorder(const RasterImage& source,
   result.bits = source.bits;
   result.pixels.resize(static_cast<size_t>(result.width) * result.height * result.colors, 0);
 
+  #pragma omp parallel for schedule(static) if(result.height > 400)
   for (uint32_t row = 0; row < result.height; ++row) {
     const int source_row = std::clamp(static_cast<int>(crop.y) + static_cast<int>(row) - static_cast<int>(border),
                                       0,
@@ -3881,7 +4054,6 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
   cache->raw_image_is_camera_space = false;
   cache->highlight_recovery_enabled = false;
   cache->preview_auto_bright_gain = 1.0;
-  EstimatePreviewAutoBrightGainFromRaw(source_path, metadata, libraw_overrides, &cache->preview_auto_bright_gain, nullptr);
   cache->source_width = source_width;
   cache->source_height = source_height;
   cache->region_origin_x = 0;
@@ -3889,7 +4061,7 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
   cache->has_cached_crop = false;
   cache->cached_crop_rect = CropRect();
 
-  ReportProgress(progress, "cache", 0.05, "Building crop preview cache");
+  ReportProgress(progress, "cache", 0.05, "Preparing converted preview data");
   if (CheckCancelled(cancel, error_message)) {
     return false;
   }
@@ -3909,7 +4081,12 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
   if (IsOm3HighResMetadata(metadata)) {
     const CropRect* region = cache->has_cached_crop ? &cache_region : nullptr;
     const hiraco::ScopedTimingLog timer("cache", "Render cache region");
-    if (!RenderOm3RawDomainImage(source_path, metadata, region, &cache->raw_image, error_message)) {
+    if (!RenderOm3RawDomainImage(source_path,
+                                 metadata,
+                                 region,
+                                 &cache->raw_image,
+                                 error_message,
+                                 cancel)) {
       return false;
     }
     cache->raw_image_is_camera_space = true;
@@ -3935,12 +4112,55 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
     cache->source_height = cache->raw_image.height;
   }
 
-  if (IsCancelled(cancel)) {
-    ReportProgress(progress, "cache", 1.0, "Crop preview cache ready");
-    return true;
+  if (CheckCancelled(cancel, error_message)) {
+    return false;
   }
 
-  ReportProgress(progress, "cache", 1.0, "Crop preview cache ready");
+  ReportProgress(progress, "cache", 1.0, "Converted preview data ready");
+  return true;
+}
+
+bool BuildDisplayProcessingCache(const ProcessingCache& source,
+                                 uint32_t max_dimension,
+                                 ProcessingCache* display_cache,
+                                 std::string* error_message) {
+  if (display_cache == nullptr) {
+    if (error_message != nullptr) {
+      *error_message = "missing display processing cache";
+    }
+    return false;
+  }
+  if (source.raw_image.width == 0 || source.raw_image.height == 0 ||
+      source.raw_image.colors == 0 || max_dimension == 0) {
+    if (error_message != nullptr) {
+      *error_message = "source processing cache is empty";
+    }
+    return false;
+  }
+
+  display_cache->raw_image = BuildScaledRasterImage(source.raw_image, max_dimension);
+  if (display_cache->raw_image.width == 0 || display_cache->raw_image.height == 0) {
+    if (error_message != nullptr) {
+      *error_message = "could not scale processing cache for display";
+    }
+    return false;
+  }
+  if (source.cfa_guide_image.width == source.raw_image.width &&
+      source.cfa_guide_image.height == source.raw_image.height &&
+      source.cfa_guide_image.colors == 4) {
+    display_cache->cfa_guide_image = BuildScaledRasterImage(source.cfa_guide_image, max_dimension);
+  } else {
+    display_cache->cfa_guide_image = RasterImage();
+  }
+  display_cache->raw_image_is_camera_space = source.raw_image_is_camera_space;
+  display_cache->highlight_recovery_enabled = source.highlight_recovery_enabled;
+  display_cache->preview_auto_bright_gain = source.preview_auto_bright_gain;
+  display_cache->source_width = display_cache->raw_image.width;
+  display_cache->source_height = display_cache->raw_image.height;
+  display_cache->region_origin_x = 0;
+  display_cache->region_origin_y = 0;
+  display_cache->has_cached_crop = false;
+  display_cache->cached_crop_rect = CropRect();
   return true;
 }
 
@@ -3970,11 +4190,13 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                 std::shared_ptr<PreviewImage> preview,
                                 ProgressCallback progress,
                                 CancelCheck cancel,
-                                std::string* error_message) {
-  const hiraco::ScopedTimingLog crop_timer("crop", "Render converted crop preview");
+                                std::string* error_message,
+                                uint32_t max_dimension,
+                                const RecoveryImageCoordinates* recovery_coordinates) {
+  const hiraco::ScopedTimingLog crop_timer("preview", "Render converted preview");
   if (!preview) {
     if (error_message != nullptr) {
-      *error_message = "missing crop preview output";
+      *error_message = "missing converted preview output";
     }
     return false;
   }
@@ -4048,8 +4270,9 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
   const ResolvedStageSettings settings =
       ResolveStageSettingsForImage(metadata, source_width, source_height, stage_overrides);
 
-  ReportProgress(progress, "crop", 0.05, "Processing converted crop");
+  ReportProgress(progress, "preview", 0.05, "Processing converted preview");
 
+  double camera_pedestal = 0.0;
   if (!cache.raw_image_is_camera_space) {
     if (!ApplyPredictedDetailGain(metadata,
                                   settings,
@@ -4063,20 +4286,12 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
     }
     ApplyLinearDngRasterTransform(metadata, &crop_image);
   } else {
-    const double pedestal = metadata.has_black_level ? metadata.black_level : 0.0;
-    CropRect recovery_region;
-    const CropRect* recovery_region_ptr = nullptr;
-    if (cache.has_cached_crop) {
-      recovery_region.x = cache.region_origin_x;
-      recovery_region.y = cache.region_origin_y;
-      recovery_region.width = cache.raw_image.width;
-      recovery_region.height = cache.raw_image.height;
-      recovery_region_ptr = &recovery_region;
-    }
-    if (pedestal > 0.0) {
-      for (uint16_t& sample : crop_image.pixels) {
-        const double value = static_cast<double>(sample) - pedestal;
-        sample = static_cast<uint16_t>(std::clamp(value, 0.0, 65535.0));
+    camera_pedestal = metadata.has_black_level ? metadata.black_level : 0.0;
+    if (camera_pedestal > 0.0) {
+      #pragma omp parallel for schedule(static) if(crop_image.pixels.size() > 100000)
+      for (size_t index = 0; index < crop_image.pixels.size(); ++index) {
+        const double value = static_cast<double>(crop_image.pixels[index]) - camera_pedestal;
+        crop_image.pixels[index] = static_cast<uint16_t>(std::clamp(value, 0.0, 65535.0));
       }
     }
 
@@ -4084,24 +4299,12 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                   settings,
                                   guide_ptr,
                                   &crop_image,
-                                  65535.0 - pedestal,
+                                  65535.0 - camera_pedestal,
                                   progress,
                                   cancel,
                                   error_message)) {
       return false;
     }
-
-    if (enable_highlight_recovery &&
-        !ApplyOriAssistedHighlightRecovery(highlight_recovery_source_path,
-                                           metadata,
-                                           source_width,
-                                           source_height,
-                                           recovery_region_ptr,
-                                           &crop_image,
-                                           error_message)) {
-      return false;
-    }
-    ReapplyCameraSpacePedestal(pedestal, &crop_image);
   }
 
   if (CheckCancelled(cancel, error_message)) {
@@ -4110,12 +4313,40 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
 
   RasterImage final_crop = CropRasterImage(crop_image, inner_crop);
 
+  if (cache.raw_image_is_camera_space) {
+    uint32_t recovery_full_width = source_width;
+    uint32_t recovery_full_height = source_height;
+    CropRect recovery_region = clamped_crop;
+    if (recovery_coordinates != nullptr &&
+        recovery_coordinates->full_width > 0 &&
+        recovery_coordinates->full_height > 0 &&
+        recovery_coordinates->represented_region.width > 0 &&
+        recovery_coordinates->represented_region.height > 0) {
+      recovery_full_width = recovery_coordinates->full_width;
+      recovery_full_height = recovery_coordinates->full_height;
+      recovery_region = recovery_coordinates->represented_region;
+    }
+
+    if (enable_highlight_recovery &&
+        !ApplyOriAssistedHighlightRecovery(highlight_recovery_source_path,
+                                            metadata,
+                                            recovery_full_width,
+                                            recovery_full_height,
+                                            &recovery_region,
+                                            &final_crop,
+                                            cancel,
+                                            error_message)) {
+      return false;
+    }
+    ReapplyCameraSpacePedestal(camera_pedestal, &final_crop);
+  }
+
   *preview = BuildDisplayPreviewFromRaster(metadata,
-                                          final_crop,
-                                          cache.raw_image_is_camera_space,
-                                          0,
-                                          cache.preview_auto_bright_gain);
-  ReportProgress(progress, "crop", 1.0, "Converted crop ready");
+                                           std::move(final_crop),
+                                           cache.raw_image_is_camera_space,
+                                           max_dimension,
+                                           cache.preview_auto_bright_gain);
+  ReportProgress(progress, "preview", 1.0, "Converted preview ready");
   return true;
 }
 
@@ -4269,6 +4500,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                              payload.raw_image.height,
                                              nullptr,
                                              &payload.raw_image,
+                                             cancel,
                                              &result.message)) {
         return result;
       }
@@ -4435,14 +4667,28 @@ bool BuildProcessingCacheFromRaw(const std::string&,
   return false;
 }
 
+bool BuildDisplayProcessingCache(const ProcessingCache&,
+                                 uint32_t,
+                                 ProcessingCache*,
+                                 std::string* error_message) {
+  if (error_message != nullptr) {
+    *error_message = "Adobe DNG SDK integration not enabled in this build";
+  }
+  return false;
+}
+
 bool RenderConvertedCropPreview(const SourceLinearDngMetadata&,
                                 const ProcessingCache&,
                                 const CropRect&,
+                                const std::string&,
+                                bool,
                                 const StageOverrideSet&,
                                 std::shared_ptr<PreviewImage>,
                                 ProgressCallback,
                                 CancelCheck,
-                                std::string* error_message) {
+                                std::string* error_message,
+                                uint32_t,
+                                const RecoveryImageCoordinates*) {
   if (error_message != nullptr) {
     *error_message = "Adobe DNG SDK integration not enabled in this build";
   }

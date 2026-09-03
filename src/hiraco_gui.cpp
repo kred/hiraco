@@ -1,6 +1,8 @@
 #include "hiraco_core.h"
 
 #include <wx/bitmap.h>
+#include <wx/activityindicator.h>
+#include <wx/artprov.h>
 #include <wx/bmpbuttn.h>
 #include <wx/button.h>
 #include <wx/collpane.h>
@@ -11,7 +13,6 @@
 #include <wx/filedlg.h>
 #include <wx/filepicker.h>
 #include <wx/graphics.h>
-#include <wx/listctrl.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
 #include <wx/scrolwin.h>
@@ -26,11 +27,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <memory>
 #include <optional>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -38,15 +43,35 @@ namespace {
 
 wxDECLARE_EVENT(EVT_HIRACO_SELECTION_READY, wxThreadEvent);
 wxDECLARE_EVENT(EVT_HIRACO_METADATA_READY, wxThreadEvent);
-wxDECLARE_EVENT(EVT_HIRACO_CROP_READY, wxThreadEvent);
+wxDECLARE_EVENT(EVT_HIRACO_CONVERTED_PREVIEW_READY, wxThreadEvent);
 wxDECLARE_EVENT(EVT_HIRACO_CONVERT_PROGRESS, wxThreadEvent);
-wxDECLARE_EVENT(EVT_HIRACO_CONVERT_DONE, wxThreadEvent);
 
 wxDEFINE_EVENT(EVT_HIRACO_SELECTION_READY, wxThreadEvent);
 wxDEFINE_EVENT(EVT_HIRACO_METADATA_READY, wxThreadEvent);
-wxDEFINE_EVENT(EVT_HIRACO_CROP_READY, wxThreadEvent);
+wxDEFINE_EVENT(EVT_HIRACO_CONVERTED_PREVIEW_READY, wxThreadEvent);
 wxDEFINE_EVENT(EVT_HIRACO_CONVERT_PROGRESS, wxThreadEvent);
-wxDEFINE_EVENT(EVT_HIRACO_CONVERT_DONE, wxThreadEvent);
+
+constexpr uint32_t kFullPreviewMaxDimension = 2560;
+// The processing algorithm temporarily allocates several full-frame working
+// planes. Retain up to four 80 MP source caches while reserving most of a
+// 10 GB working-set allowance for those transient buffers.
+constexpr size_t kPreviewCacheBudgetBytes = 2ull * 1024ull * 1024ull * 1024ull;
+
+const wxColour kControlSurface(235, 236, 238);
+const wxColour kControlBorder(213, 215, 218);
+const wxColour kControlSelected(76, 81, 87);
+const wxColour kControlSelectedHover(63, 68, 73);
+const wxColour kControlText(42, 45, 48);
+const wxColour kControlMutedText(102, 106, 110);
+const wxColour kQueueSurface(248, 248, 248);
+const wxColour kQueueSelectedSurface(230, 234, 238);
+
+enum class ProcessingPreset {
+  kNone,
+  kSmall,
+  kMedium,
+  kStrong,
+};
 
 struct QueueItem {
   uint64_t id = 0;
@@ -55,9 +80,9 @@ struct QueueItem {
   std::optional<PreparedSource> prepared;
   bool enable_highlight_recovery = false;
   StageOverrideSet stage_overrides;
+  ProcessingPreset active_preset = ProcessingPreset::kNone;
   wxString resolution_label;
-  wxString state = "Ready";
-  wxString message;
+  uint64_t preview_cache_access_sequence = 0;
 };
 
 struct SelectionReadyPayload {
@@ -66,7 +91,6 @@ struct SelectionReadyPayload {
   bool ok = false;
   PreparedSource prepared;
   std::shared_ptr<PreviewImage> original_preview;
-  CropRect crop_rect;
   std::string error;
 };
 
@@ -77,58 +101,108 @@ struct MetadataReadyPayload {
   std::string error;
 };
 
-struct CropReadyPayload {
+struct ConvertedPreviewReadyPayload {
   uint64_t item_id = 0;
   uint64_t request_id = 0;
   bool ok = false;
-  CropRect crop_rect;
-  std::shared_ptr<PreviewImage> crop_preview;
+  std::shared_ptr<PreviewImage> converted_preview;
   std::string error;
 };
 
 struct ConvertProgressPayload {
-  uint64_t item_id = 0;
   double overall_fraction = 0.0;
   std::string message;
 };
 
-struct ConvertDonePayload {
-  uint64_t item_id = 0;
-  bool ok = false;
-  bool skipped = false;
-  bool canceled = false;
-  std::string message;
+enum class WorkerPriority {
+  kInteractive,
+  kBackground,
 };
 
-wxString ProcessedMarkerForItem(const QueueItem& item) {
-  if (item.state == "Done") {
-    return wxString::FromUTF8("✓");
-  }
-  if (item.state == "Skipped") {
-    return "-";
-  }
-  if (item.state == "Loading" || item.state == "Converting") {
-    return wxString::FromUTF8("…");
-  }
-  if (item.state == "Failed" || item.state == "Canceled") {
-    return wxString::FromUTF8("✗");
-  }
-  return wxString();
-}
+// Image processing already uses OpenMP, FFTW and Halide worker pools. Running
+// several full-image jobs simultaneously oversubscribes those pools and makes
+// the UI slower, not faster. One dispatcher keeps work bounded while allowing
+// the latest interactive request to jump ahead of queued metadata work.
+class ProcessingTaskQueue {
+ public:
+  ProcessingTaskQueue() : worker_([this]() { Run(); }) {}
 
-wxString SettingsMarkerForItem(const QueueItem& item) {
-  return item.stage_overrides.HasAnyOverrides() ? "Custom" : "Default";
-}
+  ProcessingTaskQueue(const ProcessingTaskQueue&) = delete;
+  ProcessingTaskQueue& operator=(const ProcessingTaskQueue&) = delete;
 
-wxString HighlightRecoveryMarkerForItem(const QueueItem& item) {
-  if (!item.prepared.has_value()) {
-    return item.resolution_label == "..." ? "..." : "n/a";
+  ~ProcessingTaskQueue() {
+    Stop();
   }
-  if (!item.prepared->HasHighlightRecoverySource()) {
-    return "n/a";
+
+  bool Enqueue(WorkerPriority priority, std::function<void()> task) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) {
+      return false;
+    }
+    if (priority == WorkerPriority::kInteractive) {
+      interactive_tasks_.push_back(std::move(task));
+    } else {
+      background_tasks_.push_back(std::move(task));
+    }
+    ready_.notify_one();
+    return true;
   }
-  return item.enable_highlight_recovery ? "On" : "Off";
-}
+
+  size_t DiscardPending() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t count = interactive_tasks_.size() + background_tasks_.size();
+    interactive_tasks_.clear();
+    background_tasks_.clear();
+    return count;
+  }
+
+  void Stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopping_) {
+        return;
+      }
+      stopping_ = true;
+      interactive_tasks_.clear();
+      background_tasks_.clear();
+    }
+    ready_.notify_one();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+ private:
+  void Run() {
+    while (true) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [this]() {
+          return stopping_ || !interactive_tasks_.empty() || !background_tasks_.empty();
+        });
+        if (stopping_) {
+          return;
+        }
+        if (!interactive_tasks_.empty()) {
+          task = std::move(interactive_tasks_.front());
+          interactive_tasks_.pop_front();
+        } else {
+          task = std::move(background_tasks_.front());
+          background_tasks_.pop_front();
+        }
+      }
+      task();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<std::function<void()>> interactive_tasks_;
+  std::deque<std::function<void()>> background_tasks_;
+  bool stopping_ = false;
+  std::thread worker_;
+};
 
 bool Is50MpFrame(const PreparedSource& prepared) {
   const SourceLinearDngMetadata& metadata = prepared.metadata;
@@ -174,19 +248,6 @@ wxString ResolutionLabelForPrepared(const PreparedSource& prepared) {
     return wxString();
   }
   return wxString::Format("%ux%u", prepared.image_width, prepared.image_height);
-}
-
-wxString ResolutionTooltipForPrepared(const PreparedSource& prepared) {
-  if (!prepared.IsValid()) {
-    return wxString();
-  }
-
-  const wxString compact = ResolutionLabelForPrepared(prepared);
-  const wxString exact = wxString::Format("%ux%u", prepared.image_width, prepared.image_height);
-  if (compact.empty() || compact == exact) {
-    return exact;
-  }
-  return wxString::Format("%s (%s)", compact, exact);
 }
 
 std::filesystem::path PathFromWxString(const wxString& value) {
@@ -244,96 +305,6 @@ ContinuousRect TransformNativeRectToDisplay(const ContinuousRect& rect,
     std::swap(mapped.right, mapped.bottom);
   }
   return mapped;
-}
-
-ContinuousRect TransformDisplayRectToNative(const ContinuousRect& rect,
-                                            uint32_t native_width,
-                                            uint32_t native_height,
-                                            int libraw_flip) {
-  ContinuousRect mapped = rect;
-  const int normalized_flip = NormalizeLibRawFlip(libraw_flip);
-  if ((normalized_flip & 4) != 0) {
-    std::swap(mapped.left, mapped.top);
-    std::swap(mapped.right, mapped.bottom);
-  }
-  if ((normalized_flip & 2) != 0) {
-    const double flipped_top = static_cast<double>(native_height) - mapped.bottom;
-    const double flipped_bottom = static_cast<double>(native_height) - mapped.top;
-    mapped.top = flipped_top;
-    mapped.bottom = flipped_bottom;
-  }
-  if ((normalized_flip & 1) != 0) {
-    const double flipped_left = static_cast<double>(native_width) - mapped.right;
-    const double flipped_right = static_cast<double>(native_width) - mapped.left;
-    mapped.left = flipped_left;
-    mapped.right = flipped_right;
-  }
-  return mapped;
-}
-
-CropRect PreviewCoverageRectInNative(const PreparedSource& prepared,
-                                     uint32_t preview_width,
-                                     uint32_t preview_height) {
-  CropRect coverage;
-  coverage.width = prepared.image_width;
-  coverage.height = prepared.image_height;
-
-  const SourceLinearDngMetadata& metadata = prepared.metadata;
-  if (!metadata.has_default_crop ||
-      metadata.default_crop_width == 0 ||
-      metadata.default_crop_height == 0) {
-    return coverage;
-  }
-
-  const uint32_t oriented_crop_width =
-      OrientedImageWidth(metadata.default_crop_width, metadata.default_crop_height, metadata.libraw_flip);
-  const uint32_t oriented_crop_height =
-      OrientedImageHeight(metadata.default_crop_width, metadata.default_crop_height, metadata.libraw_flip);
-  const bool matches_default_crop =
-      preview_width == oriented_crop_width && preview_height == oriented_crop_height;
-  const bool matches_half_default_crop =
-      preview_width * 2 == oriented_crop_width && preview_height * 2 == oriented_crop_height;
-
-  if (!matches_default_crop && !matches_half_default_crop) {
-    return coverage;
-  }
-
-  coverage.x = metadata.default_crop_origin_h;
-  coverage.y = metadata.default_crop_origin_v;
-  coverage.width = metadata.default_crop_width;
-  coverage.height = metadata.default_crop_height;
-  return coverage;
-}
-
-CropRect ContinuousRectToCropRect(const ContinuousRect& rect,
-                                  uint32_t native_width,
-                                  uint32_t native_height) {
-  CropRect result;
-  if (native_width == 0 || native_height == 0) {
-    return result;
-  }
-
-  const double max_width = static_cast<double>(native_width);
-  const double max_height = static_cast<double>(native_height);
-  const double clamped_left = std::clamp(rect.left, 0.0, max_width);
-  const double clamped_top = std::clamp(rect.top, 0.0, max_height);
-  const double clamped_right = std::clamp(rect.right, 0.0, max_width);
-  const double clamped_bottom = std::clamp(rect.bottom, 0.0, max_height);
-
-  const uint32_t x = static_cast<uint32_t>(std::clamp<long long>(
-      static_cast<long long>(std::llround(clamped_left)), 0, static_cast<long long>(native_width - 1)));
-  const uint32_t y = static_cast<uint32_t>(std::clamp<long long>(
-      static_cast<long long>(std::llround(clamped_top)), 0, static_cast<long long>(native_height - 1)));
-  const uint32_t right = static_cast<uint32_t>(std::clamp<long long>(
-      static_cast<long long>(std::llround(clamped_right)), static_cast<long long>(x + 1), static_cast<long long>(native_width)));
-  const uint32_t bottom = static_cast<uint32_t>(std::clamp<long long>(
-      static_cast<long long>(std::llround(clamped_bottom)), static_cast<long long>(y + 1), static_cast<long long>(native_height)));
-
-  result.x = x;
-  result.y = y;
-  result.width = right - x;
-  result.height = bottom - y;
-  return result;
 }
 
 void ApplyStageOverridesToResolvedSettings(const StageOverrideSet& overrides,
@@ -445,8 +416,41 @@ wxBitmap MakeBitmapFromPreview(std::shared_ptr<const PreviewImage> preview) {
   return wxBitmap(image);
 }
 
-std::shared_ptr<PreviewImage> CropPreviewImage(std::shared_ptr<const PreviewImage> preview,
-                                               const CropRect& crop_rect) {
+wxBitmap MakeThumbnailBitmap(std::shared_ptr<const PreviewImage> preview,
+                             int max_width,
+                             int max_height) {
+  if (!preview || preview->width == 0 || preview->height == 0 || preview->colors < 3 ||
+      max_width <= 0 || max_height <= 0) {
+    return wxBitmap();
+  }
+
+  const double scale = std::min(static_cast<double>(max_width) / preview->width,
+                                static_cast<double>(max_height) / preview->height);
+  const int width = std::max(1, static_cast<int>(std::round(preview->width * scale)));
+  const int height = std::max(1, static_cast<int>(std::round(preview->height * scale)));
+  wxImage image(width, height);
+  unsigned char* rgb = image.GetData();
+  for (int row = 0; row < height; ++row) {
+    const uint32_t source_row = std::min<uint32_t>(
+        preview->height - 1,
+        static_cast<uint32_t>((static_cast<uint64_t>(row) * preview->height) / height));
+    for (int col = 0; col < width; ++col) {
+      const uint32_t source_col = std::min<uint32_t>(
+          preview->width - 1,
+          static_cast<uint32_t>((static_cast<uint64_t>(col) * preview->width) / width));
+      const size_t source_index =
+          (static_cast<size_t>(source_row) * preview->width + source_col) * preview->colors;
+      const size_t target_index = (static_cast<size_t>(row) * width + col) * 3;
+      rgb[target_index + 0] = preview->pixels[source_index + 0];
+      rgb[target_index + 1] = preview->pixels[source_index + 1];
+      rgb[target_index + 2] = preview->pixels[source_index + 2];
+    }
+  }
+  return wxBitmap(image);
+}
+
+std::shared_ptr<PreviewImage> ExtractPreviewRegion(std::shared_ptr<const PreviewImage> preview,
+                                                   const CropRect& crop_rect) {
   if (!preview || preview->width == 0 || preview->height == 0 || preview->colors == 0) {
     return nullptr;
   }
@@ -472,90 +476,255 @@ std::shared_ptr<PreviewImage> CropPreviewImage(std::shared_ptr<const PreviewImag
   return cropped;
 }
 
-class FitImagePanel final : public wxPanel {
- public:
-  explicit FitImagePanel(wxWindow* parent)
-      : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(280, 280), wxBORDER_SIMPLE) {
-    SetBackgroundStyle(wxBG_STYLE_PAINT);
-    Bind(wxEVT_PAINT, &FitImagePanel::OnPaint, this);
-    Bind(wxEVT_SIZE, &FitImagePanel::OnSize, this);
+std::shared_ptr<PreviewImage> ScalePreviewImage(std::shared_ptr<const PreviewImage> preview,
+                                                uint32_t max_dimension) {
+  if (!preview || preview->width == 0 || preview->height == 0 || preview->colors == 0 ||
+      max_dimension == 0) {
+    return nullptr;
   }
 
-  void SetPreview(std::shared_ptr<const PreviewImage> preview) {
-    bitmap_ = MakeBitmapFromPreview(preview);
+  const uint32_t longest_edge = std::max(preview->width, preview->height);
+  if (longest_edge <= max_dimension) {
+    return std::make_shared<PreviewImage>(*preview);
+  }
+
+  const double scale = static_cast<double>(max_dimension) / longest_edge;
+  auto scaled = std::make_shared<PreviewImage>();
+  scaled->width = std::max(1u, static_cast<uint32_t>(std::lround(preview->width * scale)));
+  scaled->height = std::max(1u, static_cast<uint32_t>(std::lround(preview->height * scale)));
+  scaled->colors = preview->colors;
+  scaled->bits = preview->bits;
+  scaled->pixels.resize(static_cast<size_t>(scaled->width) * scaled->height * scaled->colors);
+
+  for (uint32_t row = 0; row < scaled->height; ++row) {
+    const uint32_t source_row = std::min<uint32_t>(
+        preview->height - 1,
+        static_cast<uint32_t>((static_cast<uint64_t>(row) * preview->height) / scaled->height));
+    for (uint32_t column = 0; column < scaled->width; ++column) {
+      const uint32_t source_column = std::min<uint32_t>(
+          preview->width - 1,
+          static_cast<uint32_t>((static_cast<uint64_t>(column) * preview->width) / scaled->width));
+      const size_t source_index =
+          (static_cast<size_t>(source_row) * preview->width + source_column) * preview->colors;
+      const size_t target_index =
+          (static_cast<size_t>(row) * scaled->width + column) * scaled->colors;
+      std::memcpy(scaled->pixels.data() + target_index,
+                  preview->pixels.data() + source_index,
+                  scaled->colors);
+    }
+  }
+  return scaled;
+}
+
+std::shared_ptr<PreviewImage> MakeComparisonOriginalPreview(
+    std::shared_ptr<const PreviewImage> preview,
+    const PreparedSource& prepared) {
+  if (!preview || preview->width == 0 || preview->height == 0) {
+    return nullptr;
+  }
+
+  std::shared_ptr<PreviewImage> comparison_preview = std::make_shared<PreviewImage>(*preview);
+  const SourceLinearDngMetadata& metadata = prepared.metadata;
+  if (metadata.has_default_crop && metadata.default_crop_width > 0 &&
+      metadata.default_crop_height > 0 && prepared.image_width > 0 && prepared.image_height > 0 &&
+      metadata.default_crop_origin_h < prepared.image_width &&
+      metadata.default_crop_origin_v < prepared.image_height) {
+    CropRect native_crop;
+    native_crop.x = metadata.default_crop_origin_h;
+    native_crop.y = metadata.default_crop_origin_v;
+    native_crop.width = std::min(metadata.default_crop_width, prepared.image_width - native_crop.x);
+    native_crop.height = std::min(metadata.default_crop_height, prepared.image_height - native_crop.y);
+    const ContinuousRect oriented_crop = TransformNativeRectToDisplay(
+        ToContinuousRect(native_crop), prepared.image_width, prepared.image_height, metadata.libraw_flip);
+    const uint32_t oriented_width =
+        OrientedImageWidth(prepared.image_width, prepared.image_height, metadata.libraw_flip);
+    const uint32_t oriented_height =
+        OrientedImageHeight(prepared.image_width, prepared.image_height, metadata.libraw_flip);
+    if (oriented_width > 0 && oriented_height > 0) {
+      const auto scale_coordinate = [](double coordinate, uint32_t source_extent, uint32_t target_extent) {
+        return static_cast<uint32_t>(std::clamp<long long>(
+            std::llround(coordinate * target_extent / source_extent), 0, target_extent));
+      };
+      const uint32_t left = scale_coordinate(oriented_crop.left, oriented_width, preview->width);
+      const uint32_t top = scale_coordinate(oriented_crop.top, oriented_height, preview->height);
+      const uint32_t right = scale_coordinate(oriented_crop.right, oriented_width, preview->width);
+      const uint32_t bottom = scale_coordinate(oriented_crop.bottom, oriented_height, preview->height);
+      if (right > left && bottom > top) {
+        comparison_preview = ExtractPreviewRegion(
+            comparison_preview, CropRect{left, top, right - left, bottom - top});
+      }
+    }
+  }
+  return ScalePreviewImage(comparison_preview, kFullPreviewMaxDimension);
+}
+
+class PaletteButton final : public wxControl {
+ public:
+  PaletteButton(wxWindow* parent, wxWindowID id, const wxString& label)
+      : wxControl(parent, id, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE) {
+    SetLabel(label);
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+    Bind(wxEVT_PAINT, &PaletteButton::OnPaint, this);
+    Bind(wxEVT_LEFT_DOWN, &PaletteButton::OnLeftDown, this);
+    Bind(wxEVT_LEFT_UP, &PaletteButton::OnLeftUp, this);
+    Bind(wxEVT_ENTER_WINDOW, &PaletteButton::OnMouseEnter, this);
+    Bind(wxEVT_LEAVE_WINDOW, &PaletteButton::OnMouseLeave, this);
+  }
+
+  void SetSelected(bool selected) {
+    if (selected_ == selected) {
+      return;
+    }
+    selected_ = selected;
     Refresh();
+  }
+
+ protected:
+  wxSize DoGetBestSize() const override {
+    wxClientDC dc(const_cast<PaletteButton*>(this));
+    dc.SetFont(GetFont());
+    const wxSize text = dc.GetTextExtent(GetLabel());
+    return wxSize(std::max(42, text.GetWidth() + 24), std::max(28, text.GetHeight() + 12));
   }
 
  private:
   void OnPaint(wxPaintEvent&) {
     wxAutoBufferedPaintDC dc(this);
-    dc.SetBackground(wxBrush(wxColour(20, 20, 20)));
+    dc.SetBackground(wxBrush(GetParent()->GetBackgroundColour()));
     dc.Clear();
 
-    if (!bitmap_.IsOk()) {
-      dc.SetTextForeground(*wxLIGHT_GREY);
-      dc.DrawText("Converted crop preview", 16, 16);
+    const wxSize size = GetClientSize();
+    const bool enabled = IsEnabled();
+    wxColour fill = kControlSurface;
+    wxColour text_colour = kControlText;
+    if (!enabled) {
+      fill = wxColour(242, 243, 244);
+      text_colour = wxColour(155, 158, 161);
+    } else if (selected_) {
+      fill = hovered_ ? kControlSelectedHover : kControlSelected;
+      text_colour = *wxWHITE;
+    } else if (hovered_) {
+      fill = wxColour(225, 227, 229);
+    }
+
+    std::unique_ptr<wxGraphicsContext> graphics(wxGraphicsContext::Create(dc));
+    if (graphics != nullptr) {
+      graphics->SetBrush(wxBrush(fill));
+      graphics->SetPen(wxPen(selected_ ? fill : kControlBorder, 1.0));
+      graphics->DrawRoundedRectangle(0.5, 0.5,
+                                     std::max(0, size.GetWidth() - 1),
+                                     std::max(0, size.GetHeight() - 1),
+                                     7.0);
+      graphics->SetFont(GetFont(), text_colour);
+      wxDouble width = 0.0;
+      wxDouble height = 0.0;
+      graphics->GetTextExtent(GetLabel(), &width, &height);
+      graphics->DrawText(GetLabel(), (size.GetWidth() - width) / 2.0,
+                         (size.GetHeight() - height) / 2.0);
       return;
     }
 
-    const wxSize client = GetClientSize();
-    const double scale_x = static_cast<double>(client.GetWidth()) / bitmap_.GetWidth();
-    const double scale_y = static_cast<double>(client.GetHeight()) / bitmap_.GetHeight();
-    const double scale = std::min(scale_x, scale_y);
-    const int draw_width = std::max(1, static_cast<int>(std::round(bitmap_.GetWidth() * scale)));
-    const int draw_height = std::max(1, static_cast<int>(std::round(bitmap_.GetHeight() * scale)));
-    const int offset_x = (client.GetWidth() - draw_width) / 2;
-    const int offset_y = (client.GetHeight() - draw_height) / 2;
-
-    std::unique_ptr<wxGraphicsContext> gc(wxGraphicsContext::Create(dc));
-    if (gc) {
-      gc->DrawBitmap(bitmap_, offset_x, offset_y, draw_width, draw_height);
-    } else {
-      dc.DrawBitmap(bitmap_.ConvertToImage().Scale(draw_width, draw_height), offset_x, offset_y);
-    }
+    dc.SetBrush(wxBrush(fill));
+    dc.SetPen(wxPen(selected_ ? fill : kControlBorder));
+    dc.DrawRoundedRectangle(0, 0, size.GetWidth(), size.GetHeight(), 7);
+    dc.SetTextForeground(text_colour);
+    const wxSize text = dc.GetTextExtent(GetLabel());
+    dc.DrawText(GetLabel(), (size.GetWidth() - text.GetWidth()) / 2,
+                (size.GetHeight() - text.GetHeight()) / 2);
   }
 
-  void OnSize(wxSizeEvent& event) {
+  void OnLeftDown(wxMouseEvent& event) {
+    if (IsEnabled()) {
+      pressed_ = true;
+      CaptureMouse();
+    }
+    event.Skip();
+  }
+
+  void OnLeftUp(wxMouseEvent& event) {
+    const bool activate = pressed_ && GetClientRect().Contains(event.GetPosition());
+    pressed_ = false;
+    if (HasCapture()) {
+      ReleaseMouse();
+    }
+    if (activate) {
+      wxCommandEvent command(wxEVT_BUTTON, GetId());
+      command.SetEventObject(this);
+      ProcessWindowEvent(command);
+    }
+    event.Skip();
+  }
+
+  void OnMouseEnter(wxMouseEvent& event) {
+    hovered_ = true;
     Refresh();
     event.Skip();
   }
 
-  wxBitmap bitmap_;
+  void OnMouseLeave(wxMouseEvent& event) {
+    hovered_ = false;
+    Refresh();
+    event.Skip();
+  }
+
+  bool selected_ = false;
+  bool hovered_ = false;
+  bool pressed_ = false;
 };
 
-class PreviewCanvas final : public wxScrolledWindow {
+class CompareCanvas final : public wxScrolledWindow {
  public:
+  enum class ComparisonMode {
+    kOriginal,
+    kConverted,
+    kSideBySide,
+  };
+
   enum class ZoomMode {
     kFit,
-    k25,
     k50,
     k100,
   };
 
-  explicit PreviewCanvas(wxWindow* parent)
+  explicit CompareCanvas(wxWindow* parent)
       : wxScrolledWindow(parent, wxID_ANY, wxDefaultPosition, wxSize(800, 600), wxBORDER_SIMPLE) {
     SetBackgroundStyle(wxBG_STYLE_PAINT);
     SetScrollRate(1, 1);
-    Bind(wxEVT_PAINT, &PreviewCanvas::OnPaint, this);
-    Bind(wxEVT_SIZE, &PreviewCanvas::OnSize, this);
-    Bind(wxEVT_LEFT_DOWN, &PreviewCanvas::OnLeftDown, this);
-    Bind(wxEVT_LEFT_UP, &PreviewCanvas::OnLeftUp, this);
-    Bind(wxEVT_MOTION, &PreviewCanvas::OnMotion, this);
+    Bind(wxEVT_PAINT, &CompareCanvas::OnPaint, this);
+    Bind(wxEVT_SIZE, &CompareCanvas::OnSize, this);
+    Bind(wxEVT_LEFT_DOWN, &CompareCanvas::OnLeftDown, this);
+    Bind(wxEVT_LEFT_UP, &CompareCanvas::OnLeftUp, this);
+    Bind(wxEVT_MOTION, &CompareCanvas::OnMotion, this);
+    Bind(wxEVT_LEAVE_WINDOW, &CompareCanvas::OnMouseLeave, this);
   }
 
-  void SetPreview(std::shared_ptr<const PreviewImage> preview) {
-    preview_ = std::move(preview);
-    bitmap_ = MakeBitmapFromPreview(preview_);
+  void SetOriginalPreview(std::shared_ptr<const PreviewImage> preview) {
+    original_preview_ = std::move(preview);
+    original_bitmap_ = MakeBitmapFromPreview(original_preview_);
     UpdateVirtualArea();
-    if (!preview_) {
+    Refresh();
+  }
+
+  void SetConvertedPreview(std::shared_ptr<const PreviewImage> preview) {
+    converted_preview_ = std::move(preview);
+    converted_bitmap_ = MakeBitmapFromPreview(converted_preview_);
+    UpdateVirtualArea();
+    Refresh();
+  }
+
+  void SetComparisonMode(ComparisonMode mode) {
+    comparison_mode_ = mode;
+    UpdateVirtualArea();
+    if (zoom_mode_ == ZoomMode::kFit) {
       Scroll(0, 0);
+    } else {
+      CenterView();
     }
     Refresh();
   }
 
-  void SetCropRect(const CropRect& crop_rect) {
-    crop_rect_ = crop_rect;
-    Refresh();
+  ComparisonMode GetComparisonMode() const {
+    return comparison_mode_;
   }
 
   void SetZoomMode(ZoomMode mode) {
@@ -564,106 +733,160 @@ class PreviewCanvas final : public wxScrolledWindow {
     if (zoom_mode_ == ZoomMode::kFit) {
       Scroll(0, 0);
     } else {
-      CenterCropRectInView();
+      CenterView();
     }
     Refresh();
   }
 
-  void SetCropChangedHandler(std::function<void(const CropRect&)> handler) {
-    crop_changed_handler_ = std::move(handler);
+  ZoomMode GetZoomMode() const {
+    return zoom_mode_;
+  }
+
+  void ZoomIn() {
+    if (zoom_mode_ == ZoomMode::kFit) {
+      SetZoomMode(ZoomMode::k50);
+    } else {
+      SetZoomMode(ZoomMode::k100);
+    }
+  }
+
+  void ZoomOut() {
+    if (zoom_mode_ == ZoomMode::k100) {
+      SetZoomMode(ZoomMode::k50);
+    } else {
+      SetZoomMode(ZoomMode::kFit);
+    }
+  }
+
+  bool HasOriginalPreview() const {
+    return original_bitmap_.IsOk();
+  }
+
+  bool HasConvertedPreview() const {
+    return converted_bitmap_.IsOk();
   }
 
  private:
+  const wxBitmap* PrimaryBitmap() const {
+    if (original_bitmap_.IsOk()) {
+      return &original_bitmap_;
+    }
+    if (converted_bitmap_.IsOk()) {
+      return &converted_bitmap_;
+    }
+    return nullptr;
+  }
+
   double CurrentScale() const {
-    if (!preview_ || preview_->width == 0 || preview_->height == 0) {
+    const wxBitmap* bitmap = PrimaryBitmap();
+    if (bitmap == nullptr) {
       return 1.0;
     }
 
     switch (zoom_mode_) {
-      case ZoomMode::k25:
-        return 0.25;
       case ZoomMode::k50:
         return 0.5;
       case ZoomMode::k100:
         return 1.0;
       case ZoomMode::kFit: {
         const wxSize client = GetClientSize();
-        const double scale_x = static_cast<double>(client.GetWidth()) / preview_->width;
-        const double scale_y = static_cast<double>(client.GetHeight()) / preview_->height;
+        const int available_width = comparison_mode_ == ComparisonMode::kSideBySide
+            ? std::max(1, client.GetWidth() / 2)
+            : std::max(1, client.GetWidth());
+        const double scale_x = static_cast<double>(available_width) / bitmap->GetWidth();
+        const double scale_y = static_cast<double>(std::max(1, client.GetHeight())) / bitmap->GetHeight();
         return std::max(0.05, std::min(scale_x, scale_y));
       }
     }
     return 1.0;
   }
 
-  wxSize CurrentDrawSize() const {
-    if (!preview_ || preview_->width == 0 || preview_->height == 0) {
+  wxSize SingleDrawSize() const {
+    const wxBitmap* bitmap = PrimaryBitmap();
+    if (bitmap == nullptr) {
       return wxSize(0, 0);
     }
-
     const double scale = CurrentScale();
-    return wxSize(std::max(1, static_cast<int>(std::round(bitmap_.GetWidth() * scale))),
-                  std::max(1, static_cast<int>(std::round(bitmap_.GetHeight() * scale))));
+    return wxSize(std::max(1, static_cast<int>(std::round(bitmap->GetWidth() * scale))),
+                  std::max(1, static_cast<int>(std::round(bitmap->GetHeight() * scale))));
+  }
+
+  wxSize CurrentDrawSize() const {
+    wxSize size = SingleDrawSize();
+    if (comparison_mode_ == ComparisonMode::kSideBySide) {
+      // The two panes share one pan position.  The additional pane width gives
+      // the scrolled window enough horizontal range to reveal either edge of
+      // both images while they remain visible together.
+      size.SetWidth(size.GetWidth() + std::max(1, GetClientSize().GetWidth() / 2));
+    }
+    return size;
   }
 
   wxPoint CurrentImageOffset() const {
-    if (zoom_mode_ != ZoomMode::kFit || !preview_) {
+    if (zoom_mode_ != ZoomMode::kFit || PrimaryBitmap() == nullptr) {
       return wxPoint(0, 0);
     }
-
     const wxSize client = GetClientSize();
-    const wxSize draw_size = CurrentDrawSize();
-    return wxPoint(std::max(0, (client.GetWidth() - draw_size.GetWidth()) / 2),
-                   std::max(0, (client.GetHeight() - draw_size.GetHeight()) / 2));
-  }
-
-  wxPoint ToImagePoint(const wxPoint& point) const {
-    int logical_x = 0;
-    int logical_y = 0;
-    CalcUnscrolledPosition(point.x, point.y, &logical_x, &logical_y);
-    const wxPoint offset = CurrentImageOffset();
-    const double scale = CurrentScale();
-    return wxPoint(static_cast<int>(std::floor((logical_x - offset.x) / scale)),
-                   static_cast<int>(std::floor((logical_y - offset.y) / scale)));
-  }
-
-  wxRect CropRectToView() const {
-    const double scale = CurrentScale();
-    const wxPoint offset = CurrentImageOffset();
-    return wxRect(offset.x + static_cast<int>(std::round(crop_rect_.x * scale)),
-                  offset.y + static_cast<int>(std::round(crop_rect_.y * scale)),
-                  static_cast<int>(std::round(crop_rect_.width * scale)),
-                  static_cast<int>(std::round(crop_rect_.height * scale)));
+    const wxSize single = SingleDrawSize();
+    const int available_width = comparison_mode_ == ComparisonMode::kSideBySide
+        ? std::max(1, client.GetWidth() / 2)
+        : std::max(1, client.GetWidth());
+    return wxPoint(std::max(0, (available_width - single.GetWidth()) / 2),
+                   std::max(0, (client.GetHeight() - single.GetHeight()) / 2));
   }
 
   void UpdateVirtualArea() {
-    if (!preview_) {
+    if (PrimaryBitmap() == nullptr) {
       SetVirtualSize(0, 0);
       Scroll(0, 0);
       return;
     }
-    const double scale = CurrentScale();
-    SetVirtualSize(static_cast<int>(std::round(preview_->width * scale)),
-                   static_cast<int>(std::round(preview_->height * scale)));
+    const wxSize draw = CurrentDrawSize();
+    SetVirtualSize(draw.GetWidth(), draw.GetHeight());
   }
 
-  void CenterCropRectInView() {
-    if (!preview_ || crop_rect_.width == 0 || crop_rect_.height == 0) {
+  void CenterView() {
+    const wxSize virtual_size = GetVirtualSize();
+    const wxSize client = GetClientSize();
+    Scroll(std::max(0, (virtual_size.GetWidth() - client.GetWidth()) / 2),
+           std::max(0, (virtual_size.GetHeight() - client.GetHeight()) / 2));
+  }
+
+  void DrawBitmap(wxGraphicsContext* graphics,
+                  wxDC& dc,
+                  const wxBitmap& bitmap,
+                  int x,
+                  int y,
+                  int width,
+                  int height) const {
+    if (!bitmap.IsOk() || width <= 0 || height <= 0) {
       return;
     }
+    if (graphics != nullptr) {
+      graphics->DrawBitmap(bitmap, x, y, width, height);
+      return;
+    }
+    dc.DrawBitmap(bitmap.ConvertToImage().Scale(width, height), x, y);
+  }
 
-    const wxRect crop_rect = CropRectToView();
-    const wxSize client = GetClientSize();
-    const wxSize virtual_size = GetVirtualSize();
-    const int max_x = std::max(0, virtual_size.GetWidth() - client.GetWidth());
-    const int max_y = std::max(0, virtual_size.GetHeight() - client.GetHeight());
-    const int target_x = std::clamp(crop_rect.x + crop_rect.width / 2 - client.GetWidth() / 2,
-                                    0,
-                                    max_x);
-    const int target_y = std::clamp(crop_rect.y + crop_rect.height / 2 - client.GetHeight() / 2,
-                                    0,
-                                    max_y);
-    Scroll(target_x, target_y);
+  void DrawLabel(wxGraphicsContext* graphics, wxDC& dc, const wxString& label, int x, int y) const {
+    if (graphics != nullptr) {
+      graphics->SetFont(GetFont(), wxColour(245, 245, 245));
+      graphics->SetBrush(wxBrush(wxColour(20, 20, 20, 210)));
+      graphics->SetPen(*wxTRANSPARENT_PEN);
+      wxDouble width = 0.0;
+      wxDouble height = 0.0;
+      graphics->GetTextExtent(label, &width, &height);
+      graphics->DrawRoundedRectangle(x, y, width + 18, 28, 6);
+      graphics->DrawText(label, x + 9, y + 6);
+      return;
+    }
+    dc.SetTextForeground(*wxWHITE);
+    dc.SetBrush(wxBrush(wxColour(20, 20, 20)));
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    const wxSize text_size = dc.GetTextExtent(label);
+    dc.DrawRoundedRectangle(x, y, text_size.GetWidth() + 18, 28, 6);
+    dc.DrawText(label, x + 9, y + 6);
   }
 
   void OnPaint(wxPaintEvent&) {
@@ -672,30 +895,75 @@ class PreviewCanvas final : public wxScrolledWindow {
     dc.SetBackground(wxBrush(wxColour(18, 18, 18)));
     dc.Clear();
 
-    if (!bitmap_.IsOk()) {
+    const wxBitmap* primary = PrimaryBitmap();
+    if (primary == nullptr) {
       dc.SetTextForeground(*wxLIGHT_GREY);
-      dc.DrawText("Original preview", 16, 16);
+      dc.DrawText("Select an image to preview", 16, 16);
       return;
     }
 
-    const wxSize draw_size = CurrentDrawSize();
+    const wxSize single_size = SingleDrawSize();
     const wxPoint offset = CurrentImageOffset();
+    std::unique_ptr<wxGraphicsContext> graphics(wxGraphicsContext::Create(dc));
+    wxGraphicsContext* gc = graphics.get();
+    const wxBitmap& original = original_bitmap_.IsOk() ? original_bitmap_ : *primary;
+    const wxBitmap& converted = converted_bitmap_.IsOk() ? converted_bitmap_ : original;
 
-    std::unique_ptr<wxGraphicsContext> gc(wxGraphicsContext::Create(dc));
-    if (gc) {
-      gc->DrawBitmap(bitmap_, offset.x, offset.y, draw_size.GetWidth(), draw_size.GetHeight());
-      gc->SetPen(wxPen(wxColour(255, 193, 7), 2.0));
-      gc->SetBrush(*wxTRANSPARENT_BRUSH);
-      const wxRect crop_rect = CropRectToView();
-      gc->DrawRectangle(crop_rect.x, crop_rect.y, crop_rect.width, crop_rect.height);
-    } else {
-      dc.DrawBitmap(bitmap_.ConvertToImage().Scale(draw_size.GetWidth(), draw_size.GetHeight()),
-                    offset.x,
-                    offset.y);
-      dc.SetPen(wxPen(wxColour(255, 193, 7), 2));
-      dc.SetBrush(*wxTRANSPARENT_BRUSH);
-      dc.DrawRectangle(CropRectToView());
+    if (comparison_mode_ == ComparisonMode::kSideBySide) {
+      const wxSize client = GetClientSize();
+      const int left_pane_width = std::max(1, client.GetWidth() / 2);
+      const int right_pane_width = std::max(1, client.GetWidth() - left_pane_width);
+      int view_x = 0;
+      int view_y = 0;
+      GetViewStart(&view_x, &view_y);
+      const int left_pane_x = view_x;
+      const int right_pane_x = view_x + left_pane_width;
+      const auto draw_pane = [&](const wxBitmap& bitmap, int pane_x, int pane_width, int image_x) {
+        if (gc != nullptr) {
+          gc->PushState();
+          gc->Clip(pane_x, view_y, pane_width, client.GetHeight());
+          DrawBitmap(gc,
+                     dc,
+                     bitmap,
+                     image_x,
+                     offset.y,
+                     single_size.GetWidth(),
+                     single_size.GetHeight());
+          gc->PopState();
+          return;
+        }
+        dc.SetClippingRegion(pane_x, view_y, pane_width, client.GetHeight());
+        DrawBitmap(nullptr,
+                   dc,
+                   bitmap,
+                   image_x,
+                   offset.y,
+                   single_size.GetWidth(),
+                   single_size.GetHeight());
+        dc.DestroyClippingRegion();
+      };
+      draw_pane(original, left_pane_x, left_pane_width, offset.x);
+      draw_pane(converted, right_pane_x, right_pane_width, left_pane_width + offset.x);
+      DrawLabel(gc, dc, "Original", left_pane_x + 12, view_y + 12);
+      DrawLabel(gc, dc, "Converted", right_pane_x + 12, view_y + 12);
+      if (gc != nullptr) {
+        gc->SetPen(wxPen(wxColour(210, 210, 210), 1.0));
+        gc->StrokeLine(right_pane_x, view_y, right_pane_x, view_y + client.GetHeight());
+      } else {
+        dc.SetPen(wxPen(wxColour(210, 210, 210), 1));
+        dc.DrawLine(right_pane_x, view_y, right_pane_x, view_y + client.GetHeight());
+      }
+      return;
     }
+
+    if (comparison_mode_ == ComparisonMode::kConverted) {
+      DrawBitmap(gc, dc, converted, offset.x, offset.y, single_size.GetWidth(), single_size.GetHeight());
+      DrawLabel(gc, dc, "Converted", offset.x + 12, offset.y + 12);
+      return;
+    }
+
+    DrawBitmap(gc, dc, original, offset.x, offset.y, single_size.GetWidth(), single_size.GetHeight());
+    DrawLabel(gc, dc, "Original", offset.x + 12, offset.y + 12);
   }
 
   void OnSize(wxSizeEvent& event) {
@@ -707,100 +975,33 @@ class PreviewCanvas final : public wxScrolledWindow {
   }
 
   void OnLeftDown(wxMouseEvent& event) {
-    if (!bitmap_.IsOk()) {
+    if (PrimaryBitmap() == nullptr) {
       return;
     }
-
-    const wxPoint image_point = ToImagePoint(event.GetPosition());
-    int logical_x = 0;
-    int logical_y = 0;
-    CalcUnscrolledPosition(event.GetPosition().x, event.GetPosition().y, &logical_x, &logical_y);
-    const wxRect crop_rect = CropRectToView();
-    left_down_point_ = event.GetPosition();
-    left_down_inside_crop_ = crop_rect.Contains(logical_x, logical_y);
-    dragging_crop_ = false;
     panning_ = false;
-    if (crop_rect.Contains(logical_x, logical_y)) {
-      drag_origin_image_ = image_point;
-      drag_start_crop_ = crop_rect_;
-    } else {
-      last_pan_point_ = event.GetPosition();
-    }
+    last_pan_point_ = event.GetPosition();
     CaptureMouse();
   }
 
-  void OnLeftUp(wxMouseEvent& event) {
-    if (!dragging_crop_ && !panning_ && bitmap_.IsOk() && preview_) {
-      const wxPoint image_point = ToImagePoint(event.GetPosition());
-      CropRect updated = crop_rect_;
-      updated.x = static_cast<uint32_t>(
-          std::clamp(image_point.x - static_cast<int>(updated.width / 2),
-                     0,
-                     static_cast<int>(preview_->width - updated.width)));
-      updated.y = static_cast<uint32_t>(
-          std::clamp(image_point.y - static_cast<int>(updated.height / 2),
-                     0,
-                     static_cast<int>(preview_->height - updated.height)));
-      if (updated.x != crop_rect_.x || updated.y != crop_rect_.y) {
-        crop_rect_ = updated;
-        Refresh();
-        if (crop_changed_handler_) {
-          crop_changed_handler_(crop_rect_);
-        }
-      }
-    }
-
-    dragging_crop_ = false;
+  void OnLeftUp(wxMouseEvent&) {
     panning_ = false;
-    left_down_inside_crop_ = false;
     if (HasCapture()) {
       ReleaseMouse();
     }
   }
 
   void OnMotion(wxMouseEvent& event) {
-    if (!event.Dragging() || !event.LeftIsDown() || !preview_ || preview_->width == 0 || preview_->height == 0) {
-      return;
-    }
-
-    if (left_down_inside_crop_) {
-      if (!dragging_crop_) {
-        const wxPoint current = event.GetPosition();
-        const int travel = std::abs(current.x - left_down_point_.x) + std::abs(current.y - left_down_point_.y);
-        if (travel < 4) {
-          return;
-        }
-        dragging_crop_ = true;
-      }
-
-      const wxPoint current_image = ToImagePoint(event.GetPosition());
-      const int dx = current_image.x - drag_origin_image_.x;
-      const int dy = current_image.y - drag_origin_image_.y;
-
-      CropRect updated = drag_start_crop_;
-      updated.x = static_cast<uint32_t>(std::max(0, std::min<int>(static_cast<int>(preview_->width - updated.width),
-                                                                  static_cast<int>(drag_start_crop_.x) + dx)));
-      updated.y = static_cast<uint32_t>(std::max(0, std::min<int>(static_cast<int>(preview_->height - updated.height),
-                                                                  static_cast<int>(drag_start_crop_.y) + dy)));
-      crop_rect_ = updated;
-      Refresh();
-      if (crop_changed_handler_) {
-        crop_changed_handler_(crop_rect_);
+    if (!event.Dragging() || !event.LeftIsDown() || PrimaryBitmap() == nullptr) {
+      if (zoom_mode_ != ZoomMode::kFit) {
+        SetCursor(wxCursor(wxCURSOR_HAND));
+      } else {
+        SetCursor(wxNullCursor);
       }
       return;
     }
 
-    if (!left_down_inside_crop_ && zoom_mode_ != ZoomMode::kFit) {
-      wxPoint current = event.GetPosition();
-      if (!panning_) {
-        const int travel = std::abs(current.x - left_down_point_.x) + std::abs(current.y - left_down_point_.y);
-        if (travel < 4) {
-          return;
-        }
-        panning_ = true;
-        last_pan_point_ = current;
-      }
-
+    if (zoom_mode_ != ZoomMode::kFit) {
+      const wxPoint current = event.GetPosition();
       const int dx = current.x - last_pan_point_.x;
       const int dy = current.y - last_pan_point_.y;
       int view_x = 0;
@@ -808,21 +1009,25 @@ class PreviewCanvas final : public wxScrolledWindow {
       GetViewStart(&view_x, &view_y);
       Scroll(std::max(0, view_x - dx), std::max(0, view_y - dy));
       last_pan_point_ = current;
+      panning_ = true;
     }
   }
 
-  std::shared_ptr<const PreviewImage> preview_;
-  wxBitmap bitmap_;
-  CropRect crop_rect_;
+  void OnMouseLeave(wxMouseEvent& event) {
+    if (!panning_) {
+      SetCursor(wxNullCursor);
+    }
+    event.Skip();
+  }
+
+  std::shared_ptr<const PreviewImage> original_preview_;
+  std::shared_ptr<const PreviewImage> converted_preview_;
+  wxBitmap original_bitmap_;
+  wxBitmap converted_bitmap_;
+  ComparisonMode comparison_mode_ = ComparisonMode::kSideBySide;
   ZoomMode zoom_mode_ = ZoomMode::kFit;
-  bool dragging_crop_ = false;
   bool panning_ = false;
-  bool left_down_inside_crop_ = false;
-  wxPoint drag_origin_image_;
-  wxPoint left_down_point_;
   wxPoint last_pan_point_;
-  CropRect drag_start_crop_;
-  std::function<void(const CropRect&)> crop_changed_handler_;
 };
 
 class OverwriteDialog final : public wxDialog {
@@ -886,19 +1091,24 @@ struct SliderControl {
   double max_value = 1.0;
   int scale = 100;
   int decimals = 2;
+  // Slider notifications are emitted continuously while a thumb is dragged.
+  // Keep that interaction visual-only; the release submits the one preview
+  // request for the final value.
+  bool dragging = false;
+  std::optional<int> last_preview_request_value;
 };
 
 enum class OutputLocationMode {
   kSpecificDirectory,
-  kRelativeToOriginal,
+  kNextToOriginal,
+  kSubfolderUnderOriginal,
 };
 
 class HiracoMainFrame final : public wxFrame {
  public:
   HiracoMainFrame()
       : wxFrame(nullptr, wxID_ANY, "hiraco-gui", wxDefaultPosition, wxSize(1600, 980)),
-  shutdown_timer_(this),
-  crop_preview_timer_(this) {
+  shutdown_timer_(this) {
     SetDropTarget(new HiracoDropTarget(this));
     BuildUi();
     BuildAppMenuBar();
@@ -911,6 +1121,8 @@ class HiracoMainFrame final : public wxFrame {
     UpdateOutputLocationControls();
     UpdateCompressionChoice();
     UpdateResolvedSliderValues();
+    UpdateCompareButtons();
+    UpdateZoomButtons();
     UpdateButtons();
   }
 
@@ -932,24 +1144,39 @@ class HiracoMainFrame final : public wxFrame {
       metadata_jobs.emplace_back(item.id, item.source_path);
       queue_.push_back(item);
     }
+
+    const bool should_select_first = selected_row_ < 0 && !queue_.empty();
+    const uint64_t selected_item_id = should_select_first ? queue_.front().id : 0;
     RefreshQueue();
-    for (const auto& job : metadata_jobs) {
-      BeginMetadataProbe(job.first, job.second);
-    }
-    if (selected_row_ < 0 && !queue_.empty()) {
+
+    // Queue the first image's interactive preview before opportunistic queue
+    // metadata.  Otherwise a just-added file can be prepared once by the
+    // background probe and a second time by the selection worker.
+    if (should_select_first) {
       SelectRow(0);
+    }
+    for (const auto& job : metadata_jobs) {
+      if (job.first == selected_item_id) {
+        continue;
+      }
+      BeginMetadataProbe(job.first, job.second);
     }
   }
 
  private:
   template <typename Task>
-  void LaunchWorker(Task task) {
+  void LaunchWorker(WorkerPriority priority, Task task) {
     active_workers_.fetch_add(1);
-    std::thread([this, task]() mutable {
+    const bool queued = processing_tasks_.Enqueue(priority, [this, task = std::move(task)]() mutable {
       task();
+      CallAfter([this]() {
+        active_workers_.fetch_sub(1);
+        MaybeFinishClose();
+      });
+    });
+    if (!queued) {
       active_workers_.fetch_sub(1);
-      CallAfter([this]() { MaybeFinishClose(); });
-    }).detach();
+    }
   }
 
   void BuildAppMenuBar() {
@@ -988,53 +1215,59 @@ class HiracoMainFrame final : public wxFrame {
     auto* left_sizer = new wxBoxSizer(wxVERTICAL);
     auto* queue_buttons = new wxBoxSizer(wxHORIZONTAL);
     add_files_button_ = new wxButton(left_panel_, wxID_ANY, "Add Files");
-    remove_button_ = new wxButton(left_panel_, wxID_ANY, "Remove Selected");
-    clear_button_ = new wxButton(left_panel_, wxID_ANY, "Clear");
-    queue_view_toggle_button_ = new wxButton(left_panel_, wxID_ANY, ">");
-    queue_view_toggle_button_->SetMinSize(wxSize(36, -1));
+    clear_button_ = new wxButton(left_panel_, wxID_ANY, "Clear all");
     queue_buttons->Add(add_files_button_, 0, wxRIGHT, 8);
-    queue_buttons->Add(remove_button_, 0, wxRIGHT, 8);
     queue_buttons->Add(clear_button_, 0);
     queue_buttons->AddStretchSpacer();
-    queue_buttons->Add(queue_view_toggle_button_, 0);
 
-    queue_ctrl_ = new wxListCtrl(left_panel_, wxID_ANY, wxDefaultPosition, wxSize(420, -1),
-                                 wxLC_REPORT | wxLC_HRULES | wxLC_VRULES);
-    ConfigureQueueColumns();
+    queue_scroll_ = new wxScrolledWindow(left_panel_, wxID_ANY, wxDefaultPosition, wxSize(320, -1), wxVSCROLL);
+    queue_scroll_->SetScrollRate(0, 12);
+    queue_sizer_ = new wxBoxSizer(wxVERTICAL);
+    queue_scroll_->SetSizer(queue_sizer_);
 
     left_sizer->Add(queue_buttons, 0, wxALL | wxEXPAND, 10);
-    left_sizer->Add(queue_ctrl_, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
+    left_sizer->Add(queue_scroll_, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
     left_panel_->SetSizer(left_sizer);
 
     auto* center_panel = new wxPanel(detail_splitter);
     auto* center_sizer = new wxBoxSizer(wxVERTICAL);
-    auto* zoom_row = new wxBoxSizer(wxHORIZONTAL);
-    zoom_row->Add(new wxStaticText(center_panel, wxID_ANY, "Zoom:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-    zoom_choice_ = new wxChoice(center_panel, wxID_ANY);
-    zoom_choice_->Append("Fit");
-    zoom_choice_->Append("25%");
-    zoom_choice_->Append("50%");
-    zoom_choice_->Append("100%");
-    zoom_choice_->SetSelection(0);
-    zoom_row->Add(zoom_choice_, 0);
-    zoom_row->AddStretchSpacer();
-    auto* crop_hint = new wxStaticText(center_panel, wxID_ANY, "Drag or click the yellow box to move crop");
-    crop_hint->SetForegroundColour(wxColour(110, 110, 110));
-    zoom_row->Add(crop_hint, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 12);
+    auto* preview_toolbar = new wxBoxSizer(wxHORIZONTAL);
+    preview_toolbar->Add(new wxStaticText(center_panel, wxID_ANY, "Compare:"),
+                         0,
+                         wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                         8);
+    original_mode_button_ = new PaletteButton(center_panel, wxID_ANY, "Original");
+    converted_mode_button_ = new PaletteButton(center_panel, wxID_ANY, "Converted");
+    side_by_side_mode_button_ = new PaletteButton(center_panel, wxID_ANY, "Side by side");
+    preview_toolbar->Add(original_mode_button_, 0, wxRIGHT, 4);
+    preview_toolbar->Add(converted_mode_button_, 0, wxRIGHT, 4);
+    preview_toolbar->Add(side_by_side_mode_button_, 0, wxRIGHT, 16);
+    preview_toolbar->Add(new wxStaticText(center_panel, wxID_ANY, "Zoom:"),
+                         0,
+                         wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                         8);
+    zoom_out_button_ = new PaletteButton(center_panel, wxID_ANY, "−");
+    zoom_fit_button_ = new PaletteButton(center_panel, wxID_ANY, "Fit");
+    zoom_50_button_ = new PaletteButton(center_panel, wxID_ANY, "50%");
+    zoom_100_button_ = new PaletteButton(center_panel, wxID_ANY, "100%");
+    zoom_in_button_ = new PaletteButton(center_panel, wxID_ANY, "+");
+    zoom_out_button_->SetMinSize(wxSize(32, -1));
+    zoom_in_button_->SetMinSize(wxSize(32, -1));
+    preview_toolbar->Add(zoom_out_button_, 0, wxRIGHT, 4);
+    preview_toolbar->Add(zoom_fit_button_, 0, wxRIGHT, 4);
+    preview_toolbar->Add(zoom_50_button_, 0, wxRIGHT, 4);
+    preview_toolbar->Add(zoom_100_button_, 0, wxRIGHT, 4);
+    preview_toolbar->Add(zoom_in_button_, 0);
 
-    original_canvas_ = new PreviewCanvas(center_panel);
-    center_sizer->Add(zoom_row, 0, wxALL, 10);
-    center_sizer->Add(original_canvas_, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
+    compare_canvas_ = new CompareCanvas(center_panel);
+    center_sizer->Add(preview_toolbar, 0, wxALL | wxEXPAND, 10);
+    center_sizer->Add(compare_canvas_, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
     center_panel->SetSizer(center_sizer);
 
-    auto* right_panel = new wxPanel(detail_splitter);
+    inspector_panel_ = new wxPanel(detail_splitter);
+    auto* right_panel = inspector_panel_;
     right_panel->SetMinSize(wxSize(460, -1));
     auto* right_sizer = new wxBoxSizer(wxVERTICAL);
-
-    right_sizer->Add(make_section_label(right_panel, "Converted Crop"), 0, wxLEFT | wxTOP, 10);
-    crop_preview_panel_ = new FitImagePanel(right_panel);
-    right_sizer->Add(crop_preview_panel_, 0, wxALL | wxEXPAND, 10);
-    right_sizer->Add(new wxStaticLine(right_panel), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
 
     right_sizer->Add(make_section_label(right_panel, "Output"), 0, wxLEFT, 10);
     auto* output_panel = new wxPanel(right_panel);
@@ -1051,25 +1284,41 @@ class HiracoMainFrame final : public wxFrame {
     compression_choice_->SetSelection(1);
     compression_row->Add(compression_choice_, 1);
     output_sizer->Add(compression_row, 0, wxEXPAND);
+    output_options_pane_ = new wxCollapsiblePane(output_panel, wxID_ANY, "Output Options");
+    auto* options_panel = output_options_pane_->GetPane();
+    auto* options_sizer = new wxBoxSizer(wxVERTICAL);
     specific_directory_radio_ =
-      new wxRadioButton(output_panel, wxID_ANY, "Write to specific directory", wxDefaultPosition, wxDefaultSize, wxRB_GROUP);
-    output_sizer->Add(specific_directory_radio_, 0, wxTOP, 10);
-    output_dir_picker_ = new wxDirPickerCtrl(output_panel, wxID_ANY);
-    output_sizer->Add(output_dir_picker_, 0, wxTOP | wxEXPAND, 6);
-    relative_to_source_radio_ =
-      new wxRadioButton(output_panel, wxID_ANY, "Write relative to original image");
-    output_sizer->Add(relative_to_source_radio_, 0, wxTOP, 10);
-    relative_subdir_hint_label_ =
-      new wxStaticText(output_panel, wxID_ANY, "Leave empty to write next to the original image.");
-    relative_subdir_hint_label_->SetForegroundColour(wxColour(110, 110, 110));
-    output_sizer->Add(relative_subdir_hint_label_, 0, wxTOP | wxEXPAND, 4);
+      new wxRadioButton(options_panel, wxID_ANY, "Specific folder", wxDefaultPosition, wxDefaultSize, wxRB_GROUP);
+    options_sizer->Add(specific_directory_radio_, 0, wxTOP | wxEXPAND, 6);
+    output_dir_picker_ = new wxDirPickerCtrl(options_panel, wxID_ANY);
+    options_sizer->Add(output_dir_picker_, 0, wxTOP | wxEXPAND, 4);
+    next_to_source_radio_ =
+      new wxRadioButton(options_panel, wxID_ANY, "Next to original ORF");
+    options_sizer->Add(next_to_source_radio_, 0, wxTOP | wxEXPAND, 8);
+    relative_subdir_radio_ =
+      new wxRadioButton(options_panel, wxID_ANY, "Subfolder under original ORF");
+    options_sizer->Add(relative_subdir_radio_, 0, wxTOP | wxEXPAND, 8);
     relative_subdir_ctrl_ =
-      new wxTextCtrl(output_panel, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE);
-    relative_subdir_ctrl_->SetHint("Optional subfolder, e.g. converted");
-    output_sizer->Add(relative_subdir_ctrl_, 0, wxTOP | wxEXPAND, 6);
+      new wxTextCtrl(options_panel, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE);
+    relative_subdir_ctrl_->SetHint("Subfolder, e.g. converted");
+    options_sizer->Add(relative_subdir_ctrl_, 0, wxTOP | wxEXPAND, 4);
+    options_panel->SetSizer(options_sizer);
+    options_panel->Fit();
+    output_options_pane_->Collapse(false);
+    output_sizer->Add(output_options_pane_, 0, wxTOP | wxEXPAND, 8);
     output_panel->SetSizer(output_sizer);
     right_sizer->Add(output_panel, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
     right_sizer->Add(new wxStaticLine(right_panel), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
+
+    auto* presets_row = new wxBoxSizer(wxHORIZONTAL);
+    presets_row->Add(make_section_label(right_panel, "Presets"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+    small_preset_button_ = new PaletteButton(right_panel, wxID_ANY, "Small");
+    medium_preset_button_ = new PaletteButton(right_panel, wxID_ANY, "Medium");
+    strong_preset_button_ = new PaletteButton(right_panel, wxID_ANY, "Strong");
+    presets_row->Add(small_preset_button_, 1, wxRIGHT, 6);
+    presets_row->Add(medium_preset_button_, 1, wxRIGHT, 6);
+    presets_row->Add(strong_preset_button_, 1);
+    right_sizer->Add(presets_row, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
 
     right_sizer->Add(make_section_label(right_panel, "Processing"), 0, wxLEFT, 10);
     auto* processing_panel = new wxPanel(right_panel);
@@ -1220,10 +1469,6 @@ class HiracoMainFrame final : public wxFrame {
     convert_action_row->Add(cancel_button_, 1);
     right_sizer->Add(convert_action_row, 0, wxALL | wxEXPAND, 10);
 
-    progress_gauge_ = new wxGauge(right_panel, wxID_ANY, 100);
-    status_label_ = new wxStaticText(right_panel, wxID_ANY, "Ready");
-    right_sizer->Add(progress_gauge_, 0, wxLEFT | wxRIGHT | wxTOP | wxEXPAND, 10);
-    right_sizer->Add(status_label_, 0, wxALL | wxEXPAND, 10);
     right_panel->SetSizer(right_sizer);
 
     detail_splitter->SetMinimumPaneSize(360);
@@ -1234,8 +1479,19 @@ class HiracoMainFrame final : public wxFrame {
     workspace_splitter_->SplitVertically(left_panel_, detail_splitter, 340);
 
     root->Add(workspace_splitter_, 1, wxEXPAND);
+    auto* status_panel = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_THEME);
+    auto* status_sizer = new wxBoxSizer(wxHORIZONTAL);
+    activity_indicator_ = new wxActivityIndicator(status_panel, wxID_ANY);
+    status_label_ = new wxStaticText(status_panel, wxID_ANY, "Ready");
+    progress_gauge_ = new wxGauge(status_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(180, -1));
+    activity_indicator_->SetMinSize(wxSize(22, 22));
+    status_sizer->Add(activity_indicator_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 8);
+    status_sizer->Add(status_label_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+    status_sizer->Add(progress_gauge_, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM | wxRIGHT, 5);
+    status_panel->SetSizer(status_sizer);
+    status_panel->SetMinSize(wxSize(-1, 32));
+    root->Add(status_panel, 0, wxEXPAND);
     SetSizer(root);
-    ApplyQueueViewMode();
   }
 
   wxBoxSizer* CreateStageSectionSizer(wxWindow* parent,
@@ -1332,9 +1588,7 @@ class HiracoMainFrame final : public wxFrame {
 
   void BindEvents() {
     add_files_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnAddFiles, this);
-    remove_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnRemoveSelected, this);
     clear_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnClearQueue, this);
-    queue_view_toggle_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnToggleQueueView, this);
     convert_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnConvert, this);
     cancel_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnCancel, this);
     reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetDefaults, this);
@@ -1344,30 +1598,83 @@ class HiracoMainFrame final : public wxFrame {
     stage1_reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetStage1Defaults, this);
     stage2_reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetStage2Defaults, this);
     stage3_reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetStage3Defaults, this);
+    small_preset_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      OnPresetToggled(ProcessingPreset::kSmall, 0.60f, "Small",
+                      SelectedItem() != nullptr &&
+                          SelectedItem()->active_preset != ProcessingPreset::kSmall);
+    });
+    medium_preset_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      OnPresetToggled(ProcessingPreset::kMedium, 1.00f, "Medium",
+                      SelectedItem() != nullptr &&
+                          SelectedItem()->active_preset != ProcessingPreset::kMedium);
+    });
+    strong_preset_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      OnPresetToggled(ProcessingPreset::kStrong, 1.45f, "Strong",
+                      SelectedItem() != nullptr &&
+                          SelectedItem()->active_preset != ProcessingPreset::kStrong);
+    });
     output_dir_picker_->Bind(wxEVT_DIRPICKER_CHANGED, &HiracoMainFrame::OnOutputDirChanged, this);
     relative_subdir_ctrl_->Bind(wxEVT_TEXT, &HiracoMainFrame::OnRelativeSubdirChanged, this);
     specific_directory_radio_->Bind(wxEVT_RADIOBUTTON, &HiracoMainFrame::OnOutputModeChanged, this);
-    relative_to_source_radio_->Bind(wxEVT_RADIOBUTTON, &HiracoMainFrame::OnOutputModeChanged, this);
+    next_to_source_radio_->Bind(wxEVT_RADIOBUTTON, &HiracoMainFrame::OnOutputModeChanged, this);
+    relative_subdir_radio_->Bind(wxEVT_RADIOBUTTON, &HiracoMainFrame::OnOutputModeChanged, this);
+    output_options_pane_->Bind(wxEVT_COLLAPSIBLEPANE_CHANGED,
+                               [this](wxCollapsiblePaneEvent& event) {
+      event.Skip();
+      CallAfter([this]() {
+        if (close_requested_.load()) {
+          return;
+        }
+        if (inspector_panel_ != nullptr) {
+          inspector_panel_->Layout();
+        }
+        if (workspace_splitter_ != nullptr) {
+          workspace_splitter_->Layout();
+        }
+        Layout();
+        SendSizeEvent();
+      });
+    });
     compression_choice_->Bind(wxEVT_CHOICE, &HiracoMainFrame::OnCompressionChanged, this);
-    zoom_choice_->Bind(wxEVT_CHOICE, &HiracoMainFrame::OnZoomChanged, this);
-    queue_ctrl_->Bind(wxEVT_LIST_ITEM_SELECTED, &HiracoMainFrame::OnQueueSelectionChanged, this);
-    queue_ctrl_->Bind(wxEVT_LEFT_DOWN, &HiracoMainFrame::OnQueueLeftDown, this);
-    queue_ctrl_->Bind(wxEVT_MOTION, &HiracoMainFrame::OnQueueMouseMove, this);
-    queue_ctrl_->Bind(wxEVT_LEAVE_WINDOW, &HiracoMainFrame::OnQueueMouseLeave, this);
+    original_mode_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      compare_canvas_->SetComparisonMode(CompareCanvas::ComparisonMode::kOriginal);
+      UpdateCompareButtons();
+    });
+    converted_mode_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      compare_canvas_->SetComparisonMode(CompareCanvas::ComparisonMode::kConverted);
+      UpdateCompareButtons();
+    });
+    side_by_side_mode_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      compare_canvas_->SetComparisonMode(CompareCanvas::ComparisonMode::kSideBySide);
+      UpdateCompareButtons();
+    });
+    zoom_out_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      compare_canvas_->ZoomOut();
+      UpdateZoomButtons();
+    });
+    zoom_fit_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      compare_canvas_->SetZoomMode(CompareCanvas::ZoomMode::kFit);
+      UpdateZoomButtons();
+    });
+    zoom_50_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      compare_canvas_->SetZoomMode(CompareCanvas::ZoomMode::k50);
+      UpdateZoomButtons();
+    });
+    zoom_100_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      compare_canvas_->SetZoomMode(CompareCanvas::ZoomMode::k100);
+      UpdateZoomButtons();
+    });
+    zoom_in_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      compare_canvas_->ZoomIn();
+      UpdateZoomButtons();
+    });
     Bind(wxEVT_MENU, &HiracoMainFrame::OnQuit, this, wxID_EXIT);
     Bind(wxEVT_CLOSE_WINDOW, &HiracoMainFrame::OnCloseWindow, this);
     shutdown_timer_.Bind(wxEVT_TIMER, &HiracoMainFrame::OnShutdownTimer, this);
-    crop_preview_timer_.Bind(wxEVT_TIMER, &HiracoMainFrame::OnCropPreviewTimer, this);
     Bind(EVT_HIRACO_SELECTION_READY, &HiracoMainFrame::OnSelectionReady, this);
     Bind(EVT_HIRACO_METADATA_READY, &HiracoMainFrame::OnMetadataReady, this);
-    Bind(EVT_HIRACO_CROP_READY, &HiracoMainFrame::OnCropReady, this);
+    Bind(EVT_HIRACO_CONVERTED_PREVIEW_READY, &HiracoMainFrame::OnConvertedPreviewReady, this);
     Bind(EVT_HIRACO_CONVERT_PROGRESS, &HiracoMainFrame::OnConvertProgress, this);
-    Bind(EVT_HIRACO_CONVERT_DONE, &HiracoMainFrame::OnConvertDone, this);
-
-    original_canvas_->SetCropChangedHandler([this](const CropRect& crop_rect) {
-      current_crop_rect_ = crop_rect;
-      ScheduleCropPreview(false);
-    });
 
     BindSlider(stage1_sigma_, [this](double value) {
       UpdateSelectedStageOverrides([value](StageOverrideSet& overrides,
@@ -1433,6 +1740,98 @@ class HiracoMainFrame final : public wxFrame {
                                        base_settings.stage3_gain);
       });
     });
+  }
+
+  void UpdateCompareButtons() {
+    const CompareCanvas::ComparisonMode mode = compare_canvas_->GetComparisonMode();
+    auto update = [mode](PaletteButton* button, CompareCanvas::ComparisonMode button_mode) {
+      button->SetSelected(mode == button_mode);
+    };
+    update(original_mode_button_, CompareCanvas::ComparisonMode::kOriginal);
+    update(converted_mode_button_, CompareCanvas::ComparisonMode::kConverted);
+    update(side_by_side_mode_button_, CompareCanvas::ComparisonMode::kSideBySide);
+  }
+
+  void UpdateZoomButtons() {
+    const CompareCanvas::ZoomMode mode = compare_canvas_->GetZoomMode();
+    auto update = [mode](PaletteButton* button, CompareCanvas::ZoomMode button_mode) {
+      button->SetSelected(mode == button_mode);
+    };
+    update(zoom_fit_button_, CompareCanvas::ZoomMode::kFit);
+    update(zoom_50_button_, CompareCanvas::ZoomMode::k50);
+    update(zoom_100_button_, CompareCanvas::ZoomMode::k100);
+  }
+
+  void BeginStatusActivity(const wxString& message) {
+    status_label_->SetLabel(message);
+    progress_gauge_->SetValue(0);
+    activity_indicator_->Start();
+  }
+
+  void FinishStatusActivity(const wxString& message, int progress = 0) {
+    activity_indicator_->Stop();
+    progress_gauge_->SetValue(std::clamp(progress, 0, 100));
+    status_label_->SetLabel(message);
+  }
+
+  void UpdatePresetButtons() {
+    const QueueItem* item = SelectedItem();
+    const ProcessingPreset active = item == nullptr ? ProcessingPreset::kNone : item->active_preset;
+    const auto update = [active](PaletteButton* button, ProcessingPreset preset) {
+      const bool selected = active == preset;
+      button->SetSelected(selected);
+    };
+    update(small_preset_button_, ProcessingPreset::kSmall);
+    update(medium_preset_button_, ProcessingPreset::kMedium);
+    update(strong_preset_button_, ProcessingPreset::kStrong);
+  }
+
+  void OnPresetToggled(ProcessingPreset preset,
+                       float strength,
+                       const wxString& label,
+                       bool enabled) {
+    QueueItem* item = SelectedItem();
+    if (item == nullptr) {
+      UpdatePresetButtons();
+      return;
+    }
+    if (!enabled) {
+      if (item->active_preset == preset) {
+        item->active_preset = ProcessingPreset::kNone;
+        status_label_->SetLabel("Preset selection cleared");
+      }
+      UpdatePresetButtons();
+      return;
+    }
+    ApplyProcessingPreset(preset, strength, label);
+  }
+
+  void ApplyProcessingPreset(ProcessingPreset preset, float strength, const wxString& label) {
+    QueueItem* item = SelectedItem();
+    if (item == nullptr) {
+      return;
+    }
+
+    const ResolvedStageSettings base = HardcodedSafeStageSettingsForItem(item);
+    ResolvedStageSettings settings = base;
+    const auto scale_detail = [strength](float value) {
+      return std::clamp(1.0f + (value - 1.0f) * strength, 0.25f, 4.0f);
+    };
+    settings.stage1_nsr = std::clamp(base.stage1_nsr * (1.20f - 0.20f * strength), 0.0f, 0.20f);
+    settings.stage2_denoise = std::clamp(base.stage2_denoise + (1.0f - strength) * 0.20f,
+                                         0.0f,
+                                         1.0f);
+    settings.stage2_gain1 = scale_detail(base.stage2_gain1);
+    settings.stage2_gain2 = scale_detail(base.stage2_gain2);
+    settings.stage2_gain3 = scale_detail(base.stage2_gain3);
+    settings.stage3_gain = std::clamp(base.stage3_gain * strength, 0.0f, 4.0f);
+    item->stage_overrides = MakeExplicitStageOverrides(settings);
+    item->active_preset = preset;
+    NormalizeStageOverrides(item);
+    UpdatePresetButtons();
+    RefreshQueueRow(selected_row_);
+    RefreshConvertedPreviewIfPossible();
+    status_label_->SetLabel("Applied " + label + " preset");
   }
 
   void ApplyStageSettingsToSliders(const ResolvedStageSettings& settings) {
@@ -1523,14 +1922,14 @@ class HiracoMainFrame final : public wxFrame {
 
     const ResolvedStageSettings base_settings = BaseStageSettingsForItem(item);
     update(item->stage_overrides, base_settings);
+    item->active_preset = ProcessingPreset::kNone;
+    UpdatePresetButtons();
     NormalizeStageOverrides(item);
-    if (selected_row_ >= 0) {
-      RefreshQueueRow(selected_row_);
-    }
   }
 
   void UpdateResolvedSliderValues() {
     const QueueItem* item = SelectedItem();
+    UpdatePresetButtons();
     if (item == nullptr) {
       ApplyStageSettingsToSliders(ResolveDisplayStageSettings(app_stage_defaults_));
       return;
@@ -1565,24 +1964,19 @@ class HiracoMainFrame final : public wxFrame {
   }
 
   std::vector<int> GetSelectedRows() const {
-    std::vector<int> rows;
-    long row = -1;
-    while ((row = queue_ctrl_->GetNextItem(row, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED)) != -1) {
-      rows.push_back(static_cast<int>(row));
-    }
+    std::vector<int> rows(selected_rows_.begin(), selected_rows_.end());
     if (rows.empty() && selected_row_ >= 0 && selected_row_ < static_cast<int>(queue_.size())) {
       rows.push_back(selected_row_);
     }
     return rows;
   }
 
-  void RefreshCropPreviewIfPossible() {
+  void RefreshConvertedPreviewIfPossible() {
     UpdateResolvedSliderValues();
     if (selected_row_ >= 0 &&
         selected_row_ < static_cast<int>(queue_.size()) &&
-        queue_[selected_row_].prepared.has_value() &&
-        current_crop_rect_.has_value()) {
-      ScheduleCropPreview(false);
+        queue_[selected_row_].prepared.has_value()) {
+      ScheduleConvertedPreview();
     }
   }
 
@@ -1593,99 +1987,19 @@ class HiracoMainFrame final : public wxFrame {
     ++selection_request_id_;
   }
 
-  void InvalidateCropRequests() {
-    if (crop_cancel_) {
-      crop_cancel_->store(true);
+  void InvalidateConvertedPreviewRequests() {
+    if (converted_preview_cancel_) {
+      converted_preview_cancel_->store(true);
     }
-    crop_preview_timer_.Stop();
-    ++crop_request_id_;
-    crop_render_queued_ = false;
-    crop_render_debounced_ = false;
+    ++converted_preview_request_id_;
+    converted_preview_queued_ = false;
   }
 
-  void ArmCropPreviewTimer() {
-    if (close_requested_.load()) {
+  void StartQueuedConvertedPreviewIfIdle() {
+    if (!converted_preview_queued_ || converted_preview_worker_running_) {
       return;
     }
-    crop_preview_timer_.Stop();
-    if (!crop_render_queued_) {
-      return;
-    }
-    crop_preview_timer_.StartOnce(80);
-  }
-
-  void StartQueuedCropPreviewIfIdle() {
-    if (!crop_render_queued_ || crop_worker_running_) {
-      return;
-    }
-    if (crop_render_debounced_) {
-      ArmCropPreviewTimer();
-      return;
-    }
-    crop_preview_timer_.Stop();
-    StartCropPreviewWorker();
-  }
-
-  static uint32_t ScaleCoordBetweenExtents(uint32_t value,
-                                           uint32_t from_extent,
-                                           uint32_t to_extent) {
-    if (from_extent == 0 || to_extent == 0) {
-      return 0;
-    }
-    return static_cast<uint32_t>(
-        std::clamp<uint64_t>((static_cast<uint64_t>(value) * to_extent + from_extent / 2) / from_extent,
-                             0,
-                             to_extent));
-  }
-
-  void ResolveDisplayCropMapping(const PreparedSource& prepared,
-                                 uint32_t preview_width,
-                                 uint32_t preview_height,
-                                 uint32_t* mapped_width,
-                                 uint32_t* mapped_height,
-                                 uint32_t* offset_x,
-                                 uint32_t* offset_y) const {
-    *mapped_width = prepared.image_width;
-    *mapped_height = prepared.image_height;
-    *offset_x = 0;
-    *offset_y = 0;
-
-    const bool matches_default_crop =
-        preview_width == prepared.metadata.default_crop_width &&
-        preview_height == prepared.metadata.default_crop_height;
-    const bool matches_half_default_crop =
-        preview_width == prepared.metadata.default_crop_width / 2 &&
-        preview_height == prepared.metadata.default_crop_height / 2;
-
-    if (prepared.metadata.has_default_crop &&
-        prepared.metadata.default_crop_width > 0 &&
-        prepared.metadata.default_crop_height > 0 &&
-        (matches_default_crop || matches_half_default_crop)) {
-      *mapped_width = prepared.metadata.default_crop_width;
-      *mapped_height = prepared.metadata.default_crop_height;
-      *offset_x = prepared.metadata.default_crop_origin_h;
-      *offset_y = prepared.metadata.default_crop_origin_v;
-    }
-  }
-
-  CropRect MakeInitialDisplayCropRect(const PreparedSource& prepared,
-                                      uint32_t preview_width,
-                                      uint32_t preview_height) const {
-    if (preview_width == 0 || preview_height == 0) {
-      return CropRect();
-    }
-
-    const CropRect coverage = PreviewCoverageRectInNative(prepared, preview_width, preview_height);
-    const uint32_t mapped_width =
-      OrientedImageWidth(coverage.width, coverage.height, prepared.metadata.libraw_flip);
-    const uint32_t mapped_height =
-      OrientedImageHeight(coverage.width, coverage.height, prepared.metadata.libraw_flip);
-
-    const uint32_t display_crop_width =
-        std::max(1u, ScaleCoordBetweenExtents(512, mapped_width, preview_width));
-    const uint32_t display_crop_height =
-        std::max(1u, ScaleCoordBetweenExtents(512, mapped_height, preview_height));
-    return CenterCropRect(preview_width, preview_height, display_crop_width, display_crop_height);
+    StartConvertedPreviewWorker();
   }
 
   static double NormalizeSelectionProgress(const ProcessingProgress& progress) {
@@ -1699,7 +2013,7 @@ class HiracoMainFrame final : public wxFrame {
     return fraction;
   }
 
-  static double NormalizeCropProgress(const ProcessingProgress& progress) {
+  static double NormalizeConvertedPreviewProgress(const ProcessingProgress& progress) {
     const double fraction = std::clamp(progress.fraction, 0.0, 1.0);
     if (progress.phase == "cache") {
       return 0.60 * fraction;
@@ -1707,7 +2021,7 @@ class HiracoMainFrame final : public wxFrame {
     if (progress.phase == "enhance") {
       return 0.60 + 0.30 * fraction;
     }
-    if (progress.phase == "crop") {
+    if (progress.phase == "preview") {
       return 0.90 + 0.10 * fraction;
     }
     return fraction;
@@ -1727,78 +2041,68 @@ class HiracoMainFrame final : public wxFrame {
     return fraction;
   }
 
-  CropRect MapDisplayCropToProcessingCrop(const CropRect& display_crop,
-                                          const PreparedSource& prepared) const {
-    if (display_preview_width_ == 0 || display_preview_height_ == 0) {
-      return ClampCropRect(display_crop, prepared.image_width, prepared.image_height);
-    }
-
-    const CropRect clamped_display = ClampCropRect(display_crop, display_preview_width_, display_preview_height_);
-    const CropRect coverage = PreviewCoverageRectInNative(prepared,
-                                display_preview_width_,
-                                display_preview_height_);
-    const ContinuousRect display_coverage =
-      TransformNativeRectToDisplay(ToContinuousRect(coverage),
-                     prepared.image_width,
-                     prepared.image_height,
-                     prepared.metadata.libraw_flip);
-
-    const double display_coverage_width = std::max(1.0, display_coverage.right - display_coverage.left);
-    const double display_coverage_height = std::max(1.0, display_coverage.bottom - display_coverage.top);
-
-    ContinuousRect display_rect;
-    display_rect.left = display_coverage.left +
-      (static_cast<double>(clamped_display.x) * display_coverage_width) / static_cast<double>(display_preview_width_);
-    display_rect.top = display_coverage.top +
-      (static_cast<double>(clamped_display.y) * display_coverage_height) / static_cast<double>(display_preview_height_);
-    display_rect.right = display_coverage.left +
-      (static_cast<double>(clamped_display.x + clamped_display.width) * display_coverage_width) /
-        static_cast<double>(display_preview_width_);
-    display_rect.bottom = display_coverage.top +
-      (static_cast<double>(clamped_display.y + clamped_display.height) * display_coverage_height) /
-        static_cast<double>(display_preview_height_);
-
-    const ContinuousRect native_rect =
-      TransformDisplayRectToNative(display_rect,
-                     prepared.image_width,
-                     prepared.image_height,
-                     prepared.metadata.libraw_flip);
-    return ClampCropRect(ContinuousRectToCropRect(native_rect,
-                            prepared.image_width,
-                            prepared.image_height),
-               prepared.image_width,
-               prepared.image_height);
-  }
-
   void BindSlider(SliderControl& control, std::function<void(double)> on_change) {
-    auto apply_change = [this, &control, on_change](bool debounce) {
+    auto apply_change = [this, &control, on_change](bool request_preview) {
       const double value = SliderValue(control);
       UpdateSliderLabel(control);
       if (!updating_sliders_) {
         on_change(value);
-        ScheduleCropPreview(debounce);
+        if (request_preview &&
+            control.last_preview_request_value != control.slider->GetValue()) {
+          control.last_preview_request_value = control.slider->GetValue();
+          ScheduleConvertedPreview();
+        }
       }
     };
 
-    control.slider->Bind(wxEVT_SLIDER, [apply_change](wxCommandEvent&) { apply_change(false); });
+    auto begin_drag = [this, &control]() {
+      if (control.dragging) {
+        return;
+      }
+      control.dragging = true;
+      // Do not spend CPU finishing a preview for a value the user is actively
+      // changing.  The final thumb position will submit a replacement.
+      control.last_preview_request_value.reset();
+      InvalidateConvertedPreviewRequests();
+      FinishStatusActivity("Adjust settings, then release to update preview");
+    };
+    auto finish_drag = [&control, apply_change]() {
+      if (!control.dragging) {
+        return;
+      }
+      control.dragging = false;
+      apply_change(true);
+    };
+    auto apply_non_drag_change = [&control, apply_change]() {
+      apply_change(!control.dragging);
+    };
+
+    // wxEVT_SLIDER is emitted for every value change, including every
+    // thumb-track update.  Keep it as a value/settings notification only;
+    // preview scheduling is driven by the semantic scroll events below.
+    control.slider->Bind(wxEVT_SLIDER,
+                         [apply_change](wxCommandEvent&) { apply_change(false); });
     control.slider->Bind(wxEVT_SCROLL_THUMBTRACK,
-                         [apply_change](wxScrollEvent&) { apply_change(true); });
+                         [begin_drag, apply_change](wxScrollEvent&) {
+                           begin_drag();
+                           apply_change(false);
+                         });
     control.slider->Bind(wxEVT_SCROLL_THUMBRELEASE,
-                         [apply_change](wxScrollEvent&) { apply_change(false); });
+                         [finish_drag](wxScrollEvent&) { finish_drag(); });
     control.slider->Bind(wxEVT_SCROLL_CHANGED,
-                         [apply_change](wxScrollEvent&) { apply_change(false); });
+                         [apply_non_drag_change](wxScrollEvent&) { apply_non_drag_change(); });
     control.slider->Bind(wxEVT_SCROLL_LINEUP,
-                         [apply_change](wxScrollEvent&) { apply_change(false); });
+                         [apply_non_drag_change](wxScrollEvent&) { apply_non_drag_change(); });
     control.slider->Bind(wxEVT_SCROLL_LINEDOWN,
-                         [apply_change](wxScrollEvent&) { apply_change(false); });
+                         [apply_non_drag_change](wxScrollEvent&) { apply_non_drag_change(); });
     control.slider->Bind(wxEVT_SCROLL_PAGEUP,
-                         [apply_change](wxScrollEvent&) { apply_change(false); });
+                         [apply_non_drag_change](wxScrollEvent&) { apply_non_drag_change(); });
     control.slider->Bind(wxEVT_SCROLL_PAGEDOWN,
-                         [apply_change](wxScrollEvent&) { apply_change(false); });
+                         [apply_non_drag_change](wxScrollEvent&) { apply_non_drag_change(); });
     control.slider->Bind(wxEVT_SCROLL_TOP,
-                         [apply_change](wxScrollEvent&) { apply_change(false); });
+                         [apply_non_drag_change](wxScrollEvent&) { apply_non_drag_change(); });
     control.slider->Bind(wxEVT_SCROLL_BOTTOM,
-                         [apply_change](wxScrollEvent&) { apply_change(false); });
+                         [apply_non_drag_change](wxScrollEvent&) { apply_non_drag_change(); });
   }
 
   double SliderValue(const SliderControl& control) const {
@@ -1873,11 +2177,9 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     long output_mode = 0;
-    if (config->Read("ui/output_mode", &output_mode)) {
-      output_location_mode_ = output_mode == 1
-                                  ? OutputLocationMode::kRelativeToOriginal
-                                  : OutputLocationMode::kSpecificDirectory;
-    }
+    config->Read("ui/output_mode", &output_mode);
+    long output_mode_version = 0;
+    config->Read("ui/output_mode_version", &output_mode_version);
 
     wxString output_dir;
     if (config->Read("ui/output_dir", &output_dir) && !output_dir.empty()) {
@@ -1887,6 +2189,20 @@ class HiracoMainFrame final : public wxFrame {
     wxString relative_subdir;
     if (config->Read("ui/relative_subdir", &relative_subdir)) {
       relative_subdir_ = PathFromWxString(relative_subdir);
+    }
+
+    if (output_mode_version >= 2 && output_mode == 1) {
+      output_location_mode_ = OutputLocationMode::kNextToOriginal;
+    } else if (output_mode == 2) {
+      output_location_mode_ = OutputLocationMode::kSubfolderUnderOriginal;
+    } else if (output_mode == 1) {
+      // Version-one settings represented both source-relative modes with one
+      // radio button and an optional subfolder field.
+      output_location_mode_ = relative_subdir_.empty()
+          ? OutputLocationMode::kNextToOriginal
+          : OutputLocationMode::kSubfolderUnderOriginal;
+    } else {
+      output_location_mode_ = OutputLocationMode::kSpecificDirectory;
     }
 
     double double_value = 0.0;
@@ -1936,7 +2252,14 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     config->Write("ui/compression", wxString::FromUTF8(ToCompressionString(compression_)));
-    config->Write("ui/output_mode", output_location_mode_ == OutputLocationMode::kRelativeToOriginal ? 1L : 0L);
+    long output_mode = 0;
+    if (output_location_mode_ == OutputLocationMode::kNextToOriginal) {
+      output_mode = 1;
+    } else if (output_location_mode_ == OutputLocationMode::kSubfolderUnderOriginal) {
+      output_mode = 2;
+    }
+    config->Write("ui/output_mode", output_mode);
+    config->Write("ui/output_mode_version", 2L);
     config->Write("ui/output_dir", WxStringFromPath(base_output_dir_));
     config->Write("ui/relative_subdir", WxStringFromPath(relative_subdir_));
 
@@ -1981,285 +2304,169 @@ class HiracoMainFrame final : public wxFrame {
     std::filesystem::path output_directory;
     if (output_location_mode_ == OutputLocationMode::kSpecificDirectory) {
       output_directory = base_output_dir_;
-    } else {
+    } else if (output_location_mode_ == OutputLocationMode::kNextToOriginal) {
       output_directory = source.parent_path();
-      if (!relative_subdir_.empty()) {
-        output_directory /= relative_subdir_;
-      }
+    } else {
+      output_directory = source.parent_path() / relative_subdir_;
     }
     return output_directory / (source.stem().string() + ".dng");
   }
 
   void UpdateOutputLocationControls() {
     const bool specific_directory_mode = output_location_mode_ == OutputLocationMode::kSpecificDirectory;
+    const bool subfolder_mode = output_location_mode_ == OutputLocationMode::kSubfolderUnderOriginal;
     const bool controls_enabled = !conversion_running_ && !close_requested_.load();
     specific_directory_radio_->SetValue(specific_directory_mode);
-    relative_to_source_radio_->SetValue(!specific_directory_mode);
+    next_to_source_radio_->SetValue(output_location_mode_ == OutputLocationMode::kNextToOriginal);
+    relative_subdir_radio_->SetValue(subfolder_mode);
     output_dir_picker_->Enable(controls_enabled && specific_directory_mode);
-    relative_subdir_ctrl_->Enable(controls_enabled && !specific_directory_mode);
-    relative_subdir_hint_label_->Enable(controls_enabled && !specific_directory_mode);
-  }
-
-  void ConfigureQueueColumns() {
-    if (!queue_ctrl_) {
-      return;
-    }
-
-    queue_ctrl_->ClearAll();
-    queue_ctrl_->AppendColumn("File", wxLIST_FORMAT_LEFT, queue_details_expanded_ ? 180 : 220);
-    if (queue_details_expanded_) {
-      queue_ctrl_->AppendColumn("Size", wxLIST_FORMAT_CENTER, 72);
-      queue_ctrl_->AppendColumn("HL Rec", wxLIST_FORMAT_CENTER, 72);
-      queue_ctrl_->AppendColumn("Settings", wxLIST_FORMAT_CENTER, 82);
-      queue_ctrl_->AppendColumn("Target", wxLIST_FORMAT_LEFT, 240);
-    } else {
-      queue_ctrl_->AppendColumn("HL Rec", wxLIST_FORMAT_CENTER, 72);
-    }
-    queue_ctrl_->AppendColumn("Processed", wxLIST_FORMAT_CENTER, 112);
-  }
-
-  void PopulateQueueRow(long row, const QueueItem& item) {
-    if (queue_details_expanded_) {
-      queue_ctrl_->SetItem(row, 1, item.resolution_label);
-      queue_ctrl_->SetItem(row, 2, HighlightRecoveryMarkerForItem(item));
-      queue_ctrl_->SetItem(row, 3, SettingsMarkerForItem(item));
-      queue_ctrl_->SetItem(row, 4, item.target_path.string());
-      queue_ctrl_->SetItem(row, 5, ProcessedMarkerForItem(item));
-      return;
-    }
-
-    queue_ctrl_->SetItem(row, 1, HighlightRecoveryMarkerForItem(item));
-    queue_ctrl_->SetItem(row, 2, ProcessedMarkerForItem(item));
-  }
-
-  void ApplyQueueViewMode() {
-    if (!queue_ctrl_) {
-      return;
-    }
-
-    const int desired_left_width = queue_details_expanded_ ? 780 : 430;
-    const int selected_row = selected_row_;
-
-    ConfigureQueueColumns();
-    RefreshQueue();
-    if (selected_row >= 0 && selected_row < static_cast<int>(queue_.size())) {
-      queue_ctrl_->SetItemState(selected_row,
-                                wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED,
-                                wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED);
-    }
-
-    if (queue_view_toggle_button_) {
-      queue_view_toggle_button_->SetLabel(queue_details_expanded_ ? "<" : ">");
-      queue_view_toggle_button_->SetToolTip(queue_details_expanded_ ? "Collapse queue details" : "Expand queue details");
-    }
-    if (left_panel_) {
-      left_panel_->SetMinSize(wxSize(desired_left_width, -1));
-    }
-    queue_ctrl_->SetMinSize(wxSize(desired_left_width - 20, -1));
-    if (workspace_splitter_ && workspace_splitter_->IsSplit()) {
-      workspace_splitter_->SetSashPosition(desired_left_width);
-    }
-    Layout();
-  }
-
-  void OnToggleQueueView(wxCommandEvent&) {
-    queue_details_expanded_ = !queue_details_expanded_;
-    ApplyQueueViewMode();
+    relative_subdir_ctrl_->Enable(controls_enabled && subfolder_mode);
   }
 
   void UpdateButtons() {
-    if (close_requested_.load()) {
-      add_files_button_->Enable(false);
-      remove_button_->Enable(false);
-      clear_button_->Enable(false);
-      queue_view_toggle_button_->Enable(false);
-      convert_button_->Enable(false);
-      cancel_button_->Enable(false);
-      reset_button_->Enable(false);
-      save_defaults_button_->Enable(false);
-      copy_settings_button_->Enable(false);
-      paste_settings_button_->Enable(false);
-      stage1_reset_button_->Enable(false);
-      stage2_reset_button_->Enable(false);
-      stage3_reset_button_->Enable(false);
-      stage1_sigma_.slider->Enable(false);
-      stage1_nsr_.slider->Enable(false);
-      stage2_denoise_.slider->Enable(false);
-      stage2_gain1_.slider->Enable(false);
-      stage2_gain2_.slider->Enable(false);
-      stage2_gain3_.slider->Enable(false);
-      stage3_radius_.slider->Enable(false);
-      stage3_gain_.slider->Enable(false);
-      UpdateOutputLocationControls();
-      return;
-    }
-
+    const bool disabled = close_requested_.load();
     const bool has_selection = selected_row_ >= 0 && selected_row_ < static_cast<int>(queue_.size());
     const bool has_prepared_selection = has_selection && queue_[selected_row_].prepared.has_value();
     const bool has_clipboard_settings = copied_stage_overrides_.has_value();
     const bool has_selected_rows = !GetSelectedRows().empty();
-    remove_button_->Enable(has_selection && !conversion_running_);
-    clear_button_->Enable(!queue_.empty() && !conversion_running_);
-    add_files_button_->Enable(!conversion_running_);
-    queue_view_toggle_button_->Enable(true);
-    convert_button_->Enable(!queue_.empty() && !conversion_running_);
-    cancel_button_->Enable(conversion_running_);
-    reset_button_->Enable(has_selection && !conversion_running_);
-    save_defaults_button_->Enable(has_selection && !conversion_running_);
-    stage1_reset_button_->Enable(has_selection && !conversion_running_);
-    stage2_reset_button_->Enable(has_selection && !conversion_running_);
-    stage3_reset_button_->Enable(has_selection && !conversion_running_);
-    copy_settings_button_->Enable(has_prepared_selection && !conversion_running_);
-    paste_settings_button_->Enable(has_selected_rows && has_clipboard_settings && !conversion_running_);
-    stage1_sigma_.slider->Enable(has_selection && !conversion_running_);
-    stage1_nsr_.slider->Enable(has_selection && !conversion_running_);
-    stage2_denoise_.slider->Enable(has_selection && !conversion_running_);
-    stage2_gain1_.slider->Enable(has_selection && !conversion_running_);
-    stage2_gain2_.slider->Enable(has_selection && !conversion_running_);
-    stage2_gain3_.slider->Enable(has_selection && !conversion_running_);
-    stage3_radius_.slider->Enable(has_selection && !conversion_running_);
-    stage3_gain_.slider->Enable(has_selection && !conversion_running_);
+    const bool enable_file_settings = has_selection && !conversion_running_ && !disabled;
+
+    add_files_button_->Enable(!conversion_running_ && !disabled);
+    clear_button_->Enable(!queue_.empty() && !conversion_running_ && !disabled);
+    convert_button_->Enable(!queue_.empty() && !conversion_running_ && !disabled);
+    cancel_button_->Enable(conversion_running_ && !disabled);
+    reset_button_->Enable(enable_file_settings);
+    save_defaults_button_->Enable(enable_file_settings);
+    stage1_reset_button_->Enable(enable_file_settings);
+    stage2_reset_button_->Enable(enable_file_settings);
+    stage3_reset_button_->Enable(enable_file_settings);
+    small_preset_button_->Enable(enable_file_settings);
+    medium_preset_button_->Enable(enable_file_settings);
+    strong_preset_button_->Enable(enable_file_settings);
+    copy_settings_button_->Enable(has_prepared_selection && !conversion_running_ && !disabled);
+    paste_settings_button_->Enable(has_selected_rows && has_clipboard_settings && !conversion_running_ && !disabled);
+    stage1_sigma_.slider->Enable(enable_file_settings);
+    stage1_nsr_.slider->Enable(enable_file_settings);
+    stage2_denoise_.slider->Enable(enable_file_settings);
+    stage2_gain1_.slider->Enable(enable_file_settings);
+    stage2_gain2_.slider->Enable(enable_file_settings);
+    stage2_gain3_.slider->Enable(enable_file_settings);
+    stage3_radius_.slider->Enable(enable_file_settings);
+    stage3_gain_.slider->Enable(enable_file_settings);
     UpdateOutputLocationControls();
-  }
-
-  void UpdateQueueTooltip(const wxString& tooltip) {
-    if (queue_tooltip_text_ == tooltip) {
-      return;
-    }
-    queue_tooltip_text_ = tooltip;
-    if (queue_tooltip_text_.empty()) {
-      queue_ctrl_->UnsetToolTip();
-    } else {
-      queue_ctrl_->SetToolTip(queue_tooltip_text_);
-    }
-  }
-
-  int HighlightRecoveryColumnIndex() const {
-    return queue_details_expanded_ ? 2 : 1;
-  }
-
-  int QueueColumnAtX(int x) const {
-    if (!queue_ctrl_) {
-      return -1;
-    }
-
-    int offset = 0;
-    const int column_count = queue_ctrl_->GetColumnCount();
-    for (int column = 0; column < column_count; ++column) {
-      offset += queue_ctrl_->GetColumnWidth(column);
-      if (x < offset) {
-        return column;
-      }
-    }
-
-    return column_count > 0 ? column_count - 1 : -1;
-  }
-
-  void OnQueueLeftDown(wxMouseEvent& event) {
-    int flags = 0;
-    const wxPoint point = event.GetPosition();
-    const long row = queue_ctrl_->HitTest(point, flags);
-    if (row != wxNOT_FOUND && row >= 0 && row < static_cast<long>(queue_.size()) &&
-        QueueColumnAtX(point.x) == HighlightRecoveryColumnIndex()) {
-      QueueItem& item = queue_[static_cast<size_t>(row)];
-      if (item.prepared.has_value() && item.prepared->HasHighlightRecoverySource()) {
-        item.enable_highlight_recovery = !item.enable_highlight_recovery;
-        item.prepared->enable_highlight_recovery = item.enable_highlight_recovery;
-        item.message = item.enable_highlight_recovery
-            ? "ORI-assisted highlight recovery enabled"
-            : "ORI-assisted highlight recovery disabled";
-        RefreshQueueRow(static_cast<int>(row));
-        if (row == selected_row_) {
-          status_label_->SetLabel(item.message);
-          ScheduleCropPreview(false);
-        }
-      }
-    }
-
-    event.Skip();
-  }
-
-  void OnQueueMouseMove(wxMouseEvent& event) {
-    int flags = 0;
-    const wxPoint point = event.GetPosition();
-    const long row = queue_ctrl_->HitTest(point, flags);
-    if (row == wxNOT_FOUND || row < 0 || row >= static_cast<long>(queue_.size())) {
-      UpdateQueueTooltip(wxString());
-      event.Skip();
-      return;
-    }
-
-    const QueueItem& item = queue_[static_cast<size_t>(row)];
-    wxString tooltip;
-    const int column = QueueColumnAtX(point.x);
-    if (column == 0) {
-      tooltip = item.source_path;
-    } else if (column == HighlightRecoveryColumnIndex()) {
-      if (!item.prepared.has_value()) {
-        tooltip = item.resolution_label == "..."
-            ? wxString("Reading file metadata...")
-            : wxString("No highlight recovery companion detected");
-      } else if (!item.prepared->HasHighlightRecoverySource()) {
-        tooltip = "No ORI companion detected for this file";
-      } else {
-        tooltip = wxString::Format("Click to %s ORI-assisted highlight recovery\n%s",
-                                   item.enable_highlight_recovery ? "disable" : "enable",
-                                   item.prepared->highlight_recovery_source_path);
-      }
-    } else if (!queue_details_expanded_) {
-      if (item.state == "Done") {
-        tooltip = "Converted";
-      } else if (item.state == "Skipped") {
-        tooltip = "Skipped";
-      } else if (item.state == "Failed" || item.state == "Canceled") {
-        tooltip = item.message.empty() ? wxString(item.state) : wxString(item.message);
-      } else {
-        tooltip = "Not converted yet";
-      }
-    } else {
-      if (column == 1) {
-        if (item.prepared.has_value()) {
-          tooltip = ResolutionTooltipForPrepared(*item.prepared);
-        } else if (item.resolution_label == "...") {
-          tooltip = "Reading file metadata...";
-        } else {
-          tooltip = "Resolution unavailable";
-        }
-      } else if (column == 3) {
-        tooltip = item.stage_overrides.HasAnyOverrides()
-                      ? wxString("Custom per-file processing settings")
-                      : wxString("Using file-specific defaults");
-      } else if (column == 4) {
-        tooltip = item.target_path.string();
-      } else if (item.state == "Done") {
-        tooltip = "Converted";
-      } else if (item.state == "Skipped") {
-        tooltip = "Skipped";
-      } else if (item.state == "Failed" || item.state == "Canceled") {
-        tooltip = item.message.empty() ? wxString(item.state) : wxString(item.message);
-      } else {
-        tooltip = "Not converted yet";
-      }
-    }
-
-    UpdateQueueTooltip(tooltip);
-    event.Skip();
-  }
-
-  void OnQueueMouseLeave(wxMouseEvent& event) {
-    UpdateQueueTooltip(wxString());
-    event.Skip();
+    UpdatePresetButtons();
   }
 
   void RefreshQueue() {
-    queue_ctrl_->Freeze();
-    queue_ctrl_->DeleteAllItems();
+    if (queue_scroll_ == nullptr || queue_sizer_ == nullptr) {
+      return;
+    }
+
+    queue_scroll_->Freeze();
+    queue_sizer_->Clear(true);
     for (size_t index = 0; index < queue_.size(); ++index) {
       const QueueItem& item = queue_[index];
-      const long row = queue_ctrl_->InsertItem(index, std::filesystem::path(item.source_path).filename().string());
-      PopulateQueueRow(row, item);
+      auto* card = new wxPanel(queue_scroll_, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE);
+      const bool selected = selected_rows_.count(static_cast<int>(index)) != 0;
+      card->SetBackgroundColour(selected ? kQueueSelectedSurface : kQueueSurface);
+      card->SetToolTip(item.source_path);
+      auto* card_sizer = new wxBoxSizer(wxVERTICAL);
+
+      auto* header = new wxBoxSizer(wxHORIZONTAL);
+      auto* name = new wxStaticText(card,
+                                    wxID_ANY,
+                                    std::filesystem::path(item.source_path).filename().string());
+      wxFont name_font = name->GetFont();
+      name_font.MakeBold();
+      name->SetFont(name_font);
+      header->Add(name, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+      auto* remove = new wxBitmapButton(card,
+                                        wxID_ANY,
+                                        wxArtProvider::GetBitmap(wxART_DELETE, wxART_BUTTON, wxSize(16, 16)));
+      remove->SetToolTip("Remove this image");
+      remove->SetMinSize(wxSize(28, 28));
+      header->Add(remove, 0);
+      card_sizer->Add(header, 0, wxALL | wxEXPAND, 7);
+
+      std::shared_ptr<const PreviewImage> cached_preview;
+      if (item.prepared.has_value()) {
+        if (!TryGetCachedOriginalPreview(*item.prepared, {}, &cached_preview)) {
+          cached_preview.reset();
+        }
+      }
+      const wxBitmap thumbnail = MakeThumbnailBitmap(cached_preview, 280, 150);
+      wxWindow* preview_window = nullptr;
+      if (thumbnail.IsOk()) {
+        auto* image = new wxStaticBitmap(card, wxID_ANY, thumbnail);
+        card_sizer->Add(image, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxALIGN_CENTER_HORIZONTAL, 7);
+        preview_window = image;
+      } else {
+        auto* placeholder = new wxPanel(card, wxID_ANY, wxDefaultPosition, wxSize(280, 118), wxBORDER_SIMPLE);
+        placeholder->SetBackgroundColour(kControlSurface);
+        auto* placeholder_sizer = new wxBoxSizer(wxVERTICAL);
+        auto* placeholder_text = new wxStaticText(
+            placeholder,
+            wxID_ANY,
+            "Preview will appear here");
+        placeholder_text->SetForegroundColour(kControlMutedText);
+        placeholder_sizer->AddStretchSpacer();
+        placeholder_sizer->Add(placeholder_text, 0, wxALIGN_CENTER | wxALL, 4);
+        placeholder_sizer->AddStretchSpacer();
+        placeholder->SetSizer(placeholder_sizer);
+        card_sizer->Add(placeholder, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 7);
+        preview_window = placeholder;
+      }
+
+      wxString detail = item.resolution_label == "..." ? wxString() : item.resolution_label;
+      if (item.prepared.has_value() && item.prepared->HasHighlightRecoverySource()) {
+        detail += item.enable_highlight_recovery ? "  ·  HL Rec On" : "  ·  HL Rec Off";
+      }
+      wxStaticText* detail_label = nullptr;
+      if (!detail.empty()) {
+        detail_label = new wxStaticText(card, wxID_ANY, detail);
+        detail_label->SetForegroundColour(kControlMutedText);
+        card_sizer->Add(detail_label, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 7);
+      }
+      wxCheckBox* highlight_recovery = nullptr;
+      if (item.prepared.has_value() && item.prepared->HasHighlightRecoverySource()) {
+        highlight_recovery = new wxCheckBox(card, wxID_ANY, "ORI highlight recovery");
+        highlight_recovery->SetValue(item.enable_highlight_recovery);
+        card_sizer->Add(highlight_recovery, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 7);
+      }
+      card->SetSizer(card_sizer);
+
+      auto select = [this, row = static_cast<int>(index)](wxMouseEvent& event) {
+        SelectThumbnailRow(row, event.CmdDown() || event.ControlDown());
+      };
+      card->Bind(wxEVT_LEFT_DOWN, select);
+      name->Bind(wxEVT_LEFT_DOWN, select);
+      if (detail_label != nullptr) {
+        detail_label->Bind(wxEVT_LEFT_DOWN, select);
+      }
+      preview_window->Bind(wxEVT_LEFT_DOWN, select);
+      if (highlight_recovery != nullptr) {
+        highlight_recovery->Bind(wxEVT_CHECKBOX, [this, row = static_cast<int>(index)](wxCommandEvent& event) {
+          if (row < 0 || row >= static_cast<int>(queue_.size()) || !queue_[row].prepared.has_value()) {
+            return;
+          }
+          QueueItem& queue_item = queue_[row];
+          queue_item.enable_highlight_recovery = event.IsChecked();
+          queue_item.prepared->enable_highlight_recovery = queue_item.enable_highlight_recovery;
+          if (row == selected_row_) {
+            ScheduleConvertedPreview();
+          }
+          RefreshQueue();
+        });
+      }
+      remove->Bind(wxEVT_BUTTON, [this, row = static_cast<int>(index)](wxCommandEvent&) {
+        RemoveQueueRows({row});
+      });
+
+      queue_sizer_->Add(card, 0, wxBOTTOM | wxEXPAND, 8);
     }
-    queue_ctrl_->Thaw();
+    queue_scroll_->FitInside();
+    queue_scroll_->Layout();
+    queue_scroll_->Thaw();
     UpdateButtons();
   }
 
@@ -2276,11 +2483,103 @@ class HiracoMainFrame final : public wxFrame {
     if (index < 0 || index >= static_cast<int>(queue_.size())) {
       return;
     }
-    PopulateQueueRow(index, queue_[index]);
+    RefreshQueue();
+  }
+
+  void NotePreviewCacheUse(int index) {
+    if (index < 0 || index >= static_cast<int>(queue_.size())) {
+      return;
+    }
+    queue_[index].preview_cache_access_sequence = ++preview_cache_access_sequence_;
+  }
+
+  void EnforcePreviewCacheBudget() {
+    size_t total_bytes = 0;
+    for (const QueueItem& item : queue_) {
+      if (item.prepared.has_value()) {
+        total_bytes += GetPreviewCacheBytes(*item.prepared);
+      }
+    }
+
+    while (total_bytes > kPreviewCacheBudgetBytes) {
+      int victim = -1;
+      uint64_t oldest_access = 0;
+      for (size_t index = 0; index < queue_.size(); ++index) {
+        const QueueItem& item = queue_[index];
+        if (static_cast<int>(index) == selected_row_ || !item.prepared.has_value() ||
+            item.preview_cache_access_sequence == 0) {
+          continue;
+        }
+        if (victim < 0 || item.preview_cache_access_sequence < oldest_access) {
+          victim = static_cast<int>(index);
+          oldest_access = item.preview_cache_access_sequence;
+        }
+      }
+      if (victim < 0) {
+        return;
+      }
+
+      const size_t bytes_before = GetPreviewCacheBytes(*queue_[victim].prepared);
+      ReleasePreviewProcessingCache(&*queue_[victim].prepared);
+      const size_t bytes_after = GetPreviewCacheBytes(*queue_[victim].prepared);
+      queue_[victim].preview_cache_access_sequence = 0;
+      total_bytes -= std::min(total_bytes, bytes_before - std::min(bytes_before, bytes_after));
+    }
+  }
+
+  void SelectThumbnailRow(int row, bool toggle_selection) {
+    if (row < 0 || row >= static_cast<int>(queue_.size())) {
+      return;
+    }
+    if (toggle_selection) {
+      if (selected_rows_.count(row) != 0) {
+        selected_rows_.erase(row);
+        if (selected_row_ == row) {
+          selected_row_ = selected_rows_.empty() ? -1 : *selected_rows_.rbegin();
+        }
+      } else {
+        selected_rows_.insert(row);
+        selected_row_ = row;
+      }
+    } else {
+      selected_rows_.clear();
+      selected_rows_.insert(row);
+      selected_row_ = row;
+    }
+    RefreshQueue();
+    UpdateButtons();
+    if (selected_row_ >= 0) {
+      StartSelectionLoad();
+    }
+  }
+
+  void RemoveQueueRows(std::vector<int> rows) {
+    if (rows.empty()) {
+      return;
+    }
+    InvalidateConvertedPreviewRequests();
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
+      if (*it >= 0 && *it < static_cast<int>(queue_.size())) {
+        queue_.erase(queue_.begin() + *it);
+      }
+    }
+    selected_rows_.clear();
+    selected_row_ = -1;
+    RefreshQueue();
+    if (!queue_.empty()) {
+      SelectRow(0);
+    } else {
+      compare_canvas_->SetOriginalPreview(nullptr);
+      compare_canvas_->SetConvertedPreview(nullptr);
+      UpdateResolvedSliderValues();
+      FinishStatusActivity("Ready");
+    }
   }
 
   void BeginMetadataProbe(uint64_t item_id, const std::string& source_path) {
-    LaunchWorker([this, item_id, source_path]() {
+    LaunchWorker(WorkerPriority::kBackground, [this, item_id, source_path]() {
       MetadataReadyPayload payload;
       payload.item_id = item_id;
 
@@ -2307,12 +2606,13 @@ class HiracoMainFrame final : public wxFrame {
   void SelectRow(int row) {
     if (row < 0 || row >= static_cast<int>(queue_.size())) {
       selected_row_ = -1;
+      selected_rows_.clear();
       return;
     }
     selected_row_ = row;
-    queue_ctrl_->SetItemState(row,
-                              wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED,
-                              wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED);
+    selected_rows_.clear();
+    selected_rows_.insert(row);
+    RefreshQueue();
     StartSelectionLoad();
   }
 
@@ -2328,47 +2628,32 @@ class HiracoMainFrame final : public wxFrame {
     if (selection_cancel_) {
       selection_cancel_->store(true);
     }
-    InvalidateCropRequests();
-    current_crop_rect_.reset();
-    display_preview_width_ = 0;
-    display_preview_height_ = 0;
+    InvalidateConvertedPreviewRequests();
 
     if (item_copy.prepared.has_value()) {
-      auto cached_preview = std::make_shared<PreviewImage>();
-      if (TryGetCachedOriginalPreview(*item_copy.prepared, {}, cached_preview)) {
-        current_crop_rect_ = MakeInitialDisplayCropRect(*item_copy.prepared,
-                                                        cached_preview->width,
-                                                        cached_preview->height);
-        display_preview_width_ = cached_preview->width;
-        display_preview_height_ = cached_preview->height;
-        original_canvas_->SetPreview(cached_preview);
-        original_canvas_->SetCropRect(*current_crop_rect_);
-        crop_preview_panel_->SetPreview(nullptr);
-        queue_[selected_row_].state = "Ready";
-        queue_[selected_row_].message = "Original preview ready";
+      std::shared_ptr<const PreviewImage> cached_preview;
+      if (TryGetCachedOriginalPreview(*item_copy.prepared, {}, &cached_preview)) {
+        compare_canvas_->SetOriginalPreview(
+            MakeComparisonOriginalPreview(cached_preview, *item_copy.prepared));
+        compare_canvas_->SetConvertedPreview(nullptr);
         queue_[selected_row_].resolution_label = ResolutionLabelForPrepared(*item_copy.prepared);
         RefreshQueueRow(selected_row_);
-        progress_gauge_->SetValue(0);
-        status_label_->SetLabel("Original preview ready. Rendering converted crop...");
+        status_label_->SetLabel("Original preview ready. Rendering converted preview...");
         UpdateResolvedSliderValues();
         UpdateButtons();
-        ScheduleCropPreview(false);
+        NotePreviewCacheUse(selected_row_);
+        ScheduleConvertedPreview();
         return;
       }
     }
 
-    queue_[selected_row_].state = "Loading";
-    queue_[selected_row_].message = "Rendering original preview";
-    RefreshQueueRow(selected_row_);
-
     const uint64_t request_id = selection_request_id_;
     selection_cancel_ = std::make_shared<std::atomic_bool>(false);
-    original_canvas_->SetPreview(nullptr);
-    crop_preview_panel_->SetPreview(nullptr);
-    progress_gauge_->SetValue(0);
-    status_label_->SetLabel("Loading original preview...");
+    compare_canvas_->SetOriginalPreview(nullptr);
+    compare_canvas_->SetConvertedPreview(nullptr);
+    BeginStatusActivity("Loading original preview...");
 
-    LaunchWorker([this, item_copy, item_id, request_id, cancel_token = selection_cancel_]() {
+    LaunchWorker(WorkerPriority::kInteractive, [this, item_copy, item_id, request_id, cancel_token = selection_cancel_]() {
       SelectionReadyPayload payload;
       payload.item_id = item_id;
       payload.request_id = request_id;
@@ -2382,11 +2667,6 @@ class HiracoMainFrame final : public wxFrame {
           }
           progress_gauge_->SetValue(static_cast<int>(std::round(std::clamp(normalized, 0.0, 1.0) * 100.0)));
           status_label_->SetLabel(message);
-          const int index = FindItemIndex(item_id);
-          if (index >= 0 && queue_[index].state == "Loading") {
-            queue_[index].message = message;
-            RefreshQueueRow(index);
-          }
         });
       };
 
@@ -2429,96 +2709,93 @@ class HiracoMainFrame final : public wxFrame {
 
       payload.ok = true;
       payload.original_preview = original;
-  payload.crop_rect = MakeInitialDisplayCropRect(prepared, original->width, original->height);
       auto* event = new wxThreadEvent(EVT_HIRACO_SELECTION_READY);
       event->SetPayload(payload);
       wxQueueEvent(this, event);
     });
   }
 
-  void ScheduleCropPreview(bool debounce) {
+  void ScheduleConvertedPreview() {
     if (close_requested_.load() ||
         selected_row_ < 0 || selected_row_ >= static_cast<int>(queue_.size())) {
       return;
     }
-    ++crop_request_id_;
-    crop_render_queued_ = true;
-    crop_render_debounced_ = debounce;
-    if (crop_worker_running_ && crop_cancel_) {
-      crop_cancel_->store(true);
+    ++converted_preview_request_id_;
+    converted_preview_queued_ = true;
+    if (converted_preview_worker_running_ && converted_preview_cancel_) {
+      converted_preview_cancel_->store(true);
     }
-    StartQueuedCropPreviewIfIdle();
+    StartQueuedConvertedPreviewIfIdle();
   }
 
-  void StartCropPreviewWorker() {
+  void StartConvertedPreviewWorker() {
     if (close_requested_.load() ||
         selected_row_ < 0 || selected_row_ >= static_cast<int>(queue_.size())) {
       return;
     }
     QueueItem& item = queue_[selected_row_];
-    if (!item.prepared.has_value() || !current_crop_rect_.has_value()) {
+    if (!item.prepared.has_value()) {
       return;
     }
 
-    crop_render_queued_ = false;
-    crop_worker_running_ = true;
-    const uint64_t request_id = crop_request_id_;
-    active_crop_request_id_ = request_id;
-    if (crop_cancel_) {
-      crop_cancel_->store(true);
+    converted_preview_queued_ = false;
+    converted_preview_worker_running_ = true;
+    const uint64_t request_id = converted_preview_request_id_;
+    active_converted_preview_request_id_ = request_id;
+    if (converted_preview_cancel_) {
+      converted_preview_cancel_->store(true);
     }
-    crop_cancel_ = std::make_shared<std::atomic_bool>(false);
+    converted_preview_cancel_ = std::make_shared<std::atomic_bool>(false);
     const uint64_t item_id = item.id;
     PreparedSource prepared = *item.prepared;
     prepared.enable_highlight_recovery = item.enable_highlight_recovery;
-    const CropRect display_crop_rect = *current_crop_rect_;
-    const CropRect crop_rect = MapDisplayCropToProcessingCrop(display_crop_rect, prepared);
     const StageOverrideSet stage_overrides = ResolveEffectiveStageOverrides(item.stage_overrides);
-    item.message = "Rendering crop preview";
-    RefreshQueueRow(selected_row_);
-    progress_gauge_->SetValue(0);
-    status_label_->SetLabel("Rendering converted crop...");
+    BeginStatusActivity("Rendering converted preview...");
 
-    LaunchWorker([this, item_id, request_id, display_crop_rect, prepared, crop_rect, stage_overrides, cancel_token = crop_cancel_]() mutable {
-      CropReadyPayload payload;
+    LaunchWorker(WorkerPriority::kInteractive, [this, item_id, request_id, prepared, stage_overrides,
+                  cancel_token = converted_preview_cancel_]() mutable {
+      ConvertedPreviewReadyPayload payload;
       payload.item_id = item_id;
       payload.request_id = request_id;
-      payload.crop_rect = display_crop_rect;
-      payload.crop_preview = std::make_shared<PreviewImage>();
+      payload.converted_preview = std::make_shared<PreviewImage>();
+
+      if (cancel_token->load()) {
+        payload.error = "operation canceled";
+        auto* event = new wxThreadEvent(EVT_HIRACO_CONVERTED_PREVIEW_READY);
+        event->SetPayload(payload);
+        wxQueueEvent(this, event);
+        return;
+      }
 
       auto report_progress = [this, item_id, request_id](const ProcessingProgress& progress) {
-        const double normalized = NormalizeCropProgress(progress);
+        const double normalized = NormalizeConvertedPreviewProgress(progress);
         const std::string message = progress.message;
         CallAfter([this, item_id, request_id, normalized, message]() {
-          if (close_requested_.load() || conversion_running_ || request_id != crop_request_id_) {
+          if (close_requested_.load() || conversion_running_ ||
+              request_id != converted_preview_request_id_) {
             return;
           }
           progress_gauge_->SetValue(static_cast<int>(std::round(std::clamp(normalized, 0.0, 1.0) * 100.0)));
           status_label_->SetLabel(message);
-          const int index = FindItemIndex(item_id);
-          if (index >= 0 && queue_[index].state == "Ready") {
-            queue_[index].message = message;
-            RefreshQueueRow(index);
-          }
         });
       };
 
       std::string error;
-      if (!RenderConvertedCrop(&prepared,
-                               crop_rect,
-                               stage_overrides,
-                               payload.crop_preview,
-                               {},
-                               report_progress,
-                               [cancel_token]() { return cancel_token->load(); },
-                               &error)) {
+      if (!RenderConvertedFullPreview(&prepared,
+                                      stage_overrides,
+                                      kFullPreviewMaxDimension,
+                                      payload.converted_preview,
+                                      {},
+                                      report_progress,
+                                      [cancel_token]() { return cancel_token->load(); },
+                                      &error)) {
         payload.ok = false;
         payload.error = error;
       } else {
         payload.ok = true;
       }
 
-      auto* event = new wxThreadEvent(EVT_HIRACO_CROP_READY);
+      auto* event = new wxThreadEvent(EVT_HIRACO_CONVERTED_PREVIEW_READY);
       event->SetPayload(payload);
       wxQueueEvent(this, event);
     });
@@ -2547,8 +2824,8 @@ class HiracoMainFrame final : public wxFrame {
     if (selection_cancel_) {
       selection_cancel_->store(true);
     }
-    if (crop_cancel_) {
-      crop_cancel_->store(true);
+    if (converted_preview_cancel_) {
+      converted_preview_cancel_->store(true);
     }
   }
 
@@ -2558,6 +2835,10 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     RequestBackgroundCancel();
+    const size_t discarded_tasks = processing_tasks_.DiscardPending();
+    if (discarded_tasks != 0) {
+      active_workers_.fetch_sub(static_cast<int>(discarded_tasks));
+    }
     shutdown_timer_.Start(100);
     status_label_->SetLabel("Closing...");
     Disable();
@@ -2597,54 +2878,16 @@ class HiracoMainFrame final : public wxFrame {
     AddFiles(paths);
   }
 
-  void OnRemoveSelected(wxCommandEvent&) {
-    InvalidateCropRequests();
-    std::vector<long> selected_rows;
-    long row = -1;
-    while ((row = queue_ctrl_->GetNextItem(row, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED)) != -1) {
-      selected_rows.push_back(row);
-    }
-    if (selected_rows.empty()) {
-      return;
-    }
-
-    std::sort(selected_rows.rbegin(), selected_rows.rend());
-    for (long selected : selected_rows) {
-      queue_.erase(queue_.begin() + selected);
-    }
-    selected_row_ = -1;
-    current_crop_rect_.reset();
-    RefreshQueue();
-    if (!queue_.empty()) {
-      SelectRow(0);
-    } else {
-      display_preview_width_ = 0;
-      display_preview_height_ = 0;
-      original_canvas_->SetPreview(nullptr);
-      crop_preview_panel_->SetPreview(nullptr);
-      UpdateResolvedSliderValues();
-      status_label_->SetLabel("Ready");
-    }
-  }
-
   void OnClearQueue(wxCommandEvent&) {
-    InvalidateCropRequests();
+    InvalidateConvertedPreviewRequests();
     queue_.clear();
     selected_row_ = -1;
-    current_crop_rect_.reset();
-    display_preview_width_ = 0;
-    display_preview_height_ = 0;
-    original_canvas_->SetPreview(nullptr);
-    crop_preview_panel_->SetPreview(nullptr);
+    selected_rows_.clear();
+    compare_canvas_->SetOriginalPreview(nullptr);
+    compare_canvas_->SetConvertedPreview(nullptr);
     UpdateResolvedSliderValues();
-    status_label_->SetLabel("Ready");
+    FinishStatusActivity("Ready");
     RefreshQueue();
-  }
-
-  void OnQueueSelectionChanged(wxListEvent& event) {
-    selected_row_ = static_cast<int>(event.GetIndex());
-    UpdateButtons();
-    StartSelectionLoad();
   }
 
   void OnOutputDirChanged(wxFileDirPickerEvent&) {
@@ -2660,9 +2903,13 @@ class HiracoMainFrame final : public wxFrame {
   }
 
   void OnOutputModeChanged(wxCommandEvent&) {
-    output_location_mode_ = specific_directory_radio_->GetValue()
-                                ? OutputLocationMode::kSpecificDirectory
-                                : OutputLocationMode::kRelativeToOriginal;
+    if (specific_directory_radio_->GetValue()) {
+      output_location_mode_ = OutputLocationMode::kSpecificDirectory;
+    } else if (relative_subdir_radio_->GetValue()) {
+      output_location_mode_ = OutputLocationMode::kSubfolderUnderOriginal;
+    } else {
+      output_location_mode_ = OutputLocationMode::kNextToOriginal;
+    }
     UpdateOutputLocationControls();
     RebuildTargetPaths();
     SaveAppSettings();
@@ -2694,30 +2941,19 @@ class HiracoMainFrame final : public wxFrame {
   }
 
   void OnZoomChanged(wxCommandEvent&) {
-    switch (zoom_choice_->GetSelection()) {
-      case 1:
-        original_canvas_->SetZoomMode(PreviewCanvas::ZoomMode::k25);
-        break;
-      case 2:
-        original_canvas_->SetZoomMode(PreviewCanvas::ZoomMode::k50);
-        break;
-      case 3:
-        original_canvas_->SetZoomMode(PreviewCanvas::ZoomMode::k100);
-        break;
-      case 0:
-      default:
-        original_canvas_->SetZoomMode(PreviewCanvas::ZoomMode::kFit);
-        break;
-    }
+    compare_canvas_->SetZoomMode(CompareCanvas::ZoomMode::kFit);
+    UpdateZoomButtons();
   }
 
   void OnResetDefaults(wxCommandEvent&) {
     if (QueueItem* item = SelectedItem()) {
       item->stage_overrides = HardcodedSafeStageOverridesForItem(item);
+      item->active_preset = ProcessingPreset::kNone;
       NormalizeStageOverrides(item);
+      UpdatePresetButtons();
       RefreshQueueRow(selected_row_);
     }
-    RefreshCropPreviewIfPossible();
+    RefreshConvertedPreviewIfPossible();
   }
 
   void OnSaveDefaults(wxCommandEvent&) {
@@ -2740,10 +2976,12 @@ class HiracoMainFrame final : public wxFrame {
       const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
       overrides->stage1_psf_sigma = safe.stage1_psf_sigma;
       overrides->stage1_nsr = safe.stage1_nsr;
+      item->active_preset = ProcessingPreset::kNone;
       NormalizeStageOverrides(item);
+      UpdatePresetButtons();
       RefreshQueueRow(selected_row_);
     }
-    RefreshCropPreviewIfPossible();
+    RefreshConvertedPreviewIfPossible();
   }
 
   void OnResetStage2Defaults(wxCommandEvent&) {
@@ -2754,10 +2992,12 @@ class HiracoMainFrame final : public wxFrame {
       overrides->stage2_gain1 = safe.stage2_gain1;
       overrides->stage2_gain2 = safe.stage2_gain2;
       overrides->stage2_gain3 = safe.stage2_gain3;
+      item->active_preset = ProcessingPreset::kNone;
       NormalizeStageOverrides(item);
+      UpdatePresetButtons();
       RefreshQueueRow(selected_row_);
     }
-    RefreshCropPreviewIfPossible();
+    RefreshConvertedPreviewIfPossible();
   }
 
   void OnResetStage3Defaults(wxCommandEvent&) {
@@ -2766,10 +3006,12 @@ class HiracoMainFrame final : public wxFrame {
       const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
       overrides->stage3_radius = safe.stage3_radius;
       overrides->stage3_gain = safe.stage3_gain;
+      item->active_preset = ProcessingPreset::kNone;
       NormalizeStageOverrides(item);
+      UpdatePresetButtons();
       RefreshQueueRow(selected_row_);
     }
-    RefreshCropPreviewIfPossible();
+    RefreshConvertedPreviewIfPossible();
   }
 
   void OnCopySettings(wxCommandEvent&) {
@@ -2800,18 +3042,20 @@ class HiracoMainFrame final : public wxFrame {
         continue;
       }
       queue_[row].stage_overrides = *copied_stage_overrides_;
+      queue_[row].active_preset = ProcessingPreset::kNone;
       NormalizeStageOverrides(&queue_[row]);
       RefreshQueueRow(row);
       current_row_updated = current_row_updated || row == selected_row_;
     }
 
     if (current_row_updated) {
-      RefreshCropPreviewIfPossible();
+      RefreshConvertedPreviewIfPossible();
     }
 
     status_label_->SetLabel(wxString::Format("Pasted settings to %zu file%s",
                                              selected_rows.size(),
                                              selected_rows.size() == 1 ? "" : "s"));
+    UpdatePresetButtons();
     UpdateButtons();
   }
 
@@ -2863,39 +3107,32 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     if (!payload.ok) {
-      queue_[index].state = "Failed";
-      queue_[index].message = payload.error;
       RefreshQueueRow(index);
-      status_label_->SetLabel(payload.error);
+      FinishStatusActivity(payload.error);
       return;
     }
 
     queue_[index].prepared = payload.prepared;
-  queue_[index].prepared->enable_highlight_recovery = queue_[index].enable_highlight_recovery;
+    queue_[index].prepared->enable_highlight_recovery = queue_[index].enable_highlight_recovery;
     queue_[index].resolution_label = ResolutionLabelForPrepared(payload.prepared);
-    queue_[index].state = "Ready";
-    queue_[index].message = "Original preview ready";
     RefreshQueueRow(index);
     UpdateButtons();
 
     if (index >= 0 && index == selected_row_) {
-      current_crop_rect_ = payload.crop_rect;
-      display_preview_width_ = payload.original_preview->width;
-      display_preview_height_ = payload.original_preview->height;
-      original_canvas_->SetPreview(payload.original_preview);
-      original_canvas_->SetCropRect(*current_crop_rect_);
-      crop_preview_panel_->SetPreview(nullptr);
-      status_label_->SetLabel("Original preview ready. Rendering converted crop...");
+      compare_canvas_->SetOriginalPreview(
+          MakeComparisonOriginalPreview(payload.original_preview, payload.prepared));
+      compare_canvas_->SetConvertedPreview(nullptr);
+      status_label_->SetLabel("Original preview ready. Rendering converted preview...");
       UpdateResolvedSliderValues();
-      ScheduleCropPreview(false);
+      ScheduleConvertedPreview();
     }
   }
 
-  void OnCropReady(wxThreadEvent& event) {
-    const CropReadyPayload payload = event.GetPayload<CropReadyPayload>();
-    if (payload.request_id == active_crop_request_id_) {
-      crop_worker_running_ = false;
-      active_crop_request_id_ = 0;
+  void OnConvertedPreviewReady(wxThreadEvent& event) {
+    const ConvertedPreviewReadyPayload payload = event.GetPayload<ConvertedPreviewReadyPayload>();
+    if (payload.request_id == active_converted_preview_request_id_) {
+      converted_preview_worker_running_ = false;
+      active_converted_preview_request_id_ = 0;
     }
 
     if (close_requested_.load()) {
@@ -2906,39 +3143,25 @@ class HiracoMainFrame final : public wxFrame {
       return;
     }
 
-    if (payload.request_id != crop_request_id_) {
-      StartQueuedCropPreviewIfIdle();
+    if (payload.request_id != converted_preview_request_id_) {
+      StartQueuedConvertedPreviewIfIdle();
       return;
     }
 
     if (!payload.ok) {
-      const int index = FindItemIndex(payload.item_id);
-      if (index >= 0) {
-        queue_[index].message = payload.error;
-        RefreshQueueRow(index);
-      }
-      status_label_->SetLabel(payload.error);
-      StartQueuedCropPreviewIfIdle();
+      FinishStatusActivity(payload.error);
+      StartQueuedConvertedPreviewIfIdle();
       return;
     }
 
     const int index = FindItemIndex(payload.item_id);
     if (index >= 0 && index == selected_row_) {
-      crop_preview_panel_->SetPreview(payload.crop_preview);
-      status_label_->SetLabel("Converted crop updated");
+      compare_canvas_->SetConvertedPreview(payload.converted_preview);
+      NotePreviewCacheUse(index);
+      EnforcePreviewCacheBudget();
+      FinishStatusActivity("Converted preview updated");
     }
-    if (index >= 0 && queue_[index].state == "Ready") {
-      queue_[index].message = "Preview ready";
-      RefreshQueueRow(index);
-    }
-    StartQueuedCropPreviewIfIdle();
-  }
-
-  void OnCropPreviewTimer(wxTimerEvent&) {
-    if (close_requested_.load() || conversion_running_ || crop_worker_running_ || !crop_render_queued_) {
-      return;
-    }
-    StartCropPreviewWorker();
+    StartQueuedConvertedPreviewIfIdle();
   }
 
   void OnConvert(wxCommandEvent&) {
@@ -2947,17 +3170,28 @@ class HiracoMainFrame final : public wxFrame {
     }
 
     InvalidateSelectionRequests();
-    InvalidateCropRequests();
+    InvalidateConvertedPreviewRequests();
+
+    // A full-resolution export needs substantially more transient memory than
+    // a display preview. The canvas retains its already displayed bitmap, but
+    // the recomputable raw/display caches are no longer useful once conversion
+    // starts. Releasing them here leaves the export headroom instead of keeping
+    // up to the GUI LRU budget resident alongside it.
+    for (QueueItem& item : queue_) {
+      if (item.prepared.has_value()) {
+        ReleasePreviewProcessingCache(&*item.prepared);
+        item.preview_cache_access_sequence = 0;
+      }
+    }
     conversion_running_ = true;
     conversion_cancel_.store(false);
     overwrite_policy_ = OverwritePolicy::kAsk;
-    progress_gauge_->SetValue(0);
-    status_label_->SetLabel("Converting...");
+    BeginStatusActivity("Converting...");
     UpdateButtons();
 
     const std::vector<QueueItem> queue_snapshot = queue_;
 
-    LaunchWorker([this, queue_snapshot]() {
+    LaunchWorker(WorkerPriority::kBackground, [this, queue_snapshot]() {
       for (size_t item_index = 0; item_index < queue_snapshot.size(); ++item_index) {
         if (conversion_cancel_.load()) {
           break;
@@ -2965,8 +3199,7 @@ class HiracoMainFrame final : public wxFrame {
 
         const QueueItem& item = queue_snapshot[item_index];
         auto* progress_event = new wxThreadEvent(EVT_HIRACO_CONVERT_PROGRESS);
-        progress_event->SetPayload(ConvertProgressPayload{item.id,
-                                                          static_cast<double>(item_index) / std::max<size_t>(1, queue_snapshot.size()),
+        progress_event->SetPayload(ConvertProgressPayload{static_cast<double>(item_index) / std::max<size_t>(1, queue_snapshot.size()),
                                                           "Preparing source"});
         wxQueueEvent(this, progress_event);
 
@@ -2980,9 +3213,11 @@ class HiracoMainFrame final : public wxFrame {
                              &error,
                              {},
                              [this]() { return conversion_cancel_.load(); })) {
-            auto* done_event = new wxThreadEvent(EVT_HIRACO_CONVERT_DONE);
-            done_event->SetPayload(ConvertDonePayload{item.id, false, false, false, error});
-            wxQueueEvent(this, done_event);
+            auto* error_event = new wxThreadEvent(EVT_HIRACO_CONVERT_PROGRESS);
+            error_event->SetPayload(ConvertProgressPayload{
+                static_cast<double>(item_index + 1) / std::max<size_t>(1, queue_snapshot.size()),
+                error});
+            wxQueueEvent(this, error_event);
             continue;
           }
         }
@@ -2998,15 +3233,14 @@ class HiracoMainFrame final : public wxFrame {
           overwrite_policy_ = decision.next_policy;
           if (decision.canceled) {
             conversion_cancel_.store(true);
-            auto* done_event = new wxThreadEvent(EVT_HIRACO_CONVERT_DONE);
-            done_event->SetPayload(ConvertDonePayload{item.id, false, false, true, "Conversion canceled"});
-            wxQueueEvent(this, done_event);
             break;
           }
           if (!decision.should_write) {
-            auto* done_event = new wxThreadEvent(EVT_HIRACO_CONVERT_DONE);
-            done_event->SetPayload(ConvertDonePayload{item.id, true, true, false, "Skipped existing target"});
-            wxQueueEvent(this, done_event);
+            auto* skipped_event = new wxThreadEvent(EVT_HIRACO_CONVERT_PROGRESS);
+            skipped_event->SetPayload(ConvertProgressPayload{
+                static_cast<double>(item_index + 1) / std::max<size_t>(1, queue_snapshot.size()),
+                "Skipped existing target"});
+            wxQueueEvent(this, skipped_event);
             continue;
           }
         }
@@ -3016,33 +3250,31 @@ class HiracoMainFrame final : public wxFrame {
                      compression_,
                      ResolveEffectiveStageOverrides(item.stage_overrides),
                                              {},
-                                             [this, item_index, total = queue_snapshot.size(), item_id = item.id](const ProcessingProgress& progress) {
+                                             [this, item_index, total = queue_snapshot.size()](const ProcessingProgress& progress) {
                                                auto* event = new wxThreadEvent(EVT_HIRACO_CONVERT_PROGRESS);
                                                const double overall =
                                                    (static_cast<double>(item_index) + NormalizeConvertProgress(progress)) /
                                                    std::max<size_t>(1, total);
-                                               event->SetPayload(ConvertProgressPayload{item_id, overall, progress.message});
+                                               event->SetPayload(ConvertProgressPayload{overall, progress.message});
                                                wxQueueEvent(this, event);
                                              },
                                              [this]() { return conversion_cancel_.load(); });
 
-        auto* done_event = new wxThreadEvent(EVT_HIRACO_CONVERT_DONE);
-        done_event->SetPayload(ConvertDonePayload{item.id,
-                                                  result.ok,
-                                                  false,
-                                                  !result.ok && result.message == "operation canceled",
-                                                  result.message});
-        wxQueueEvent(this, done_event);
+        auto* completed_event = new wxThreadEvent(EVT_HIRACO_CONVERT_PROGRESS);
+        completed_event->SetPayload(ConvertProgressPayload{
+            static_cast<double>(item_index + 1) / std::max<size_t>(1, queue_snapshot.size()),
+            result.ok ? "Converted file" : result.message});
+        wxQueueEvent(this, completed_event);
+
       }
 
       CallAfter([this]() {
         conversion_running_ = false;
         UpdateButtons();
         if (conversion_cancel_.load()) {
-          status_label_->SetLabel("Conversion canceled");
+          FinishStatusActivity("Conversion canceled");
         } else {
-          status_label_->SetLabel("Batch conversion finished");
-          progress_gauge_->SetValue(100);
+          FinishStatusActivity("Batch conversion finished", 100);
         }
         MaybeFinishClose();
       });
@@ -3082,42 +3314,10 @@ class HiracoMainFrame final : public wxFrame {
     progress_gauge_->SetValue(static_cast<int>(std::round(payload.overall_fraction * 100.0)));
     status_label_->SetLabel(payload.message);
 
-    const int index = FindItemIndex(payload.item_id);
-    if (index >= 0) {
-      queue_[index].state = "Converting";
-      queue_[index].message = payload.message;
-      RefreshQueueRow(index);
-    }
-  }
-
-  void OnConvertDone(wxThreadEvent& event) {
-    if (close_requested_.load()) {
-      return;
-    }
-
-    const ConvertDonePayload payload = event.GetPayload<ConvertDonePayload>();
-    const int index = FindItemIndex(payload.item_id);
-    if (index < 0) {
-      return;
-    }
-
-    if (payload.canceled) {
-      queue_[index].state = "Canceled";
-    } else if (payload.skipped) {
-      queue_[index].state = "Skipped";
-    } else if (payload.ok) {
-      queue_[index].state = "Done";
-    } else {
-      queue_[index].state = "Failed";
-    }
-    queue_[index].message = payload.message;
-    RefreshQueueRow(index);
   }
 
   wxButton* add_files_button_ = nullptr;
-  wxButton* remove_button_ = nullptr;
   wxButton* clear_button_ = nullptr;
-  wxButton* queue_view_toggle_button_ = nullptr;
   wxButton* reset_button_ = nullptr;
   wxButton* save_defaults_button_ = nullptr;
   wxButton* copy_settings_button_ = nullptr;
@@ -3125,26 +3325,36 @@ class HiracoMainFrame final : public wxFrame {
   wxButton* stage1_reset_button_ = nullptr;
   wxButton* stage2_reset_button_ = nullptr;
   wxButton* stage3_reset_button_ = nullptr;
+  PaletteButton* small_preset_button_ = nullptr;
+  PaletteButton* medium_preset_button_ = nullptr;
+  PaletteButton* strong_preset_button_ = nullptr;
   wxButton* convert_button_ = nullptr;
   wxButton* cancel_button_ = nullptr;
-  wxListCtrl* queue_ctrl_ = nullptr;
+  wxScrolledWindow* queue_scroll_ = nullptr;
+  wxBoxSizer* queue_sizer_ = nullptr;
   wxPanel* left_panel_ = nullptr;
-  PreviewCanvas* original_canvas_ = nullptr;
-  FitImagePanel* crop_preview_panel_ = nullptr;
+  wxPanel* inspector_panel_ = nullptr;
+  CompareCanvas* compare_canvas_ = nullptr;
   wxSplitterWindow* workspace_splitter_ = nullptr;
-  wxChoice* zoom_choice_ = nullptr;
+  PaletteButton* original_mode_button_ = nullptr;
+  PaletteButton* converted_mode_button_ = nullptr;
+  PaletteButton* side_by_side_mode_button_ = nullptr;
+  PaletteButton* zoom_out_button_ = nullptr;
+  PaletteButton* zoom_fit_button_ = nullptr;
+  PaletteButton* zoom_50_button_ = nullptr;
+  PaletteButton* zoom_100_button_ = nullptr;
+  PaletteButton* zoom_in_button_ = nullptr;
   wxChoice* compression_choice_ = nullptr;
+  wxCollapsiblePane* output_options_pane_ = nullptr;
   wxRadioButton* specific_directory_radio_ = nullptr;
-  wxRadioButton* relative_to_source_radio_ = nullptr;
+  wxRadioButton* next_to_source_radio_ = nullptr;
+  wxRadioButton* relative_subdir_radio_ = nullptr;
   wxDirPickerCtrl* output_dir_picker_ = nullptr;
-  wxStaticText* relative_subdir_hint_label_ = nullptr;
   wxTextCtrl* relative_subdir_ctrl_ = nullptr;
+  wxActivityIndicator* activity_indicator_ = nullptr;
   wxGauge* progress_gauge_ = nullptr;
   wxStaticText* status_label_ = nullptr;
   wxTimer shutdown_timer_;
-  wxTimer crop_preview_timer_;
-  wxString queue_tooltip_text_;
-  bool queue_details_expanded_ = false;
 
   SliderControl stage1_sigma_;
   SliderControl stage1_nsr_;
@@ -3162,25 +3372,24 @@ class HiracoMainFrame final : public wxFrame {
   OutputLocationMode output_location_mode_ = OutputLocationMode::kSpecificDirectory;
   HiracoCompression compression_ = HiracoCompression::kDeflate;
   std::optional<StageOverrideSet> copied_stage_overrides_;
-  std::optional<CropRect> current_crop_rect_;
-  uint32_t display_preview_width_ = 0;
-  uint32_t display_preview_height_ = 0;
   int selected_row_ = -1;
+  std::set<int> selected_rows_;
   uint64_t next_item_id_ = 1;
   uint64_t selection_request_id_ = 0;
-  uint64_t crop_request_id_ = 0;
-  uint64_t active_crop_request_id_ = 0;
-  bool crop_worker_running_ = false;
-  bool crop_render_queued_ = false;
-  bool crop_render_debounced_ = false;
+  uint64_t converted_preview_request_id_ = 0;
+  uint64_t active_converted_preview_request_id_ = 0;
+  uint64_t preview_cache_access_sequence_ = 0;
+  bool converted_preview_worker_running_ = false;
+  bool converted_preview_queued_ = false;
   bool updating_sliders_ = false;
   bool conversion_running_ = false;
   std::atomic_int active_workers_ = 0;
   std::atomic_bool close_requested_ = false;
   OverwritePolicy overwrite_policy_ = OverwritePolicy::kAsk;
   std::shared_ptr<std::atomic_bool> selection_cancel_;
-  std::shared_ptr<std::atomic_bool> crop_cancel_;
+  std::shared_ptr<std::atomic_bool> converted_preview_cancel_;
   std::atomic_bool conversion_cancel_ = false;
+  ProcessingTaskQueue processing_tasks_;
 };
 
 bool HiracoDropTarget::OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) {

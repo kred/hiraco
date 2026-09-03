@@ -2,6 +2,7 @@
 
 #include "hiraco_types.h"
 
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -76,7 +77,15 @@ bool RenderOriginalPreview(PreparedSource* prepared,
 
 bool TryGetCachedOriginalPreview(const PreparedSource& prepared,
                                  const LibRawOverrideSet& libraw_overrides,
-                                 std::shared_ptr<PreviewImage> preview);
+                                 std::shared_ptr<const PreviewImage>* preview);
+
+// Releases only recomputable converted-preview data. The original preview and
+// metadata remain available, so a queue item can be revisited cheaply.
+void ReleasePreviewProcessingCache(PreparedSource* prepared);
+
+// Returns the bytes currently retained by preview and processing caches for a
+// prepared source. This supports bounded cache residency in the GUI.
+size_t GetPreviewCacheBytes(const PreparedSource& prepared);
 
 bool RenderConvertedCrop(PreparedSource* prepared,
                          const CropRect& crop_rect,
@@ -86,6 +95,18 @@ bool RenderConvertedCrop(PreparedSource* prepared,
                          ProgressCallback progress = {},
                          CancelCheck cancel = {},
                          std::string* error_message = nullptr);
+
+// Renders the same processing result used by conversion as a display-sized,
+// oriented full-frame preview. The longest output edge is capped at
+// max_dimension and matching requests are cached on the prepared source.
+bool RenderConvertedFullPreview(PreparedSource* prepared,
+                                const StageOverrideSet& stage_overrides,
+                                uint32_t max_dimension,
+                                std::shared_ptr<PreviewImage> preview,
+                                const LibRawOverrideSet& libraw_overrides,
+                                ProgressCallback progress = {},
+                                CancelCheck cancel = {},
+                                std::string* error_message = nullptr);
 
 DngWriteResult ConvertToDng(const PreparedSource& prepared,
                             const std::filesystem::path& output_path,
