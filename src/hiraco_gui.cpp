@@ -71,6 +71,7 @@ enum class ProcessingPreset {
   kSmall,
   kMedium,
   kStrong,
+  kCustom,
 };
 
 struct QueueItem {
@@ -80,7 +81,10 @@ struct QueueItem {
   std::optional<PreparedSource> prepared;
   bool enable_highlight_recovery = false;
   StageOverrideSet stage_overrides;
-  ProcessingPreset active_preset = ProcessingPreset::kNone;
+  // This is deliberately separate from the highlighted preset.  A slider
+  // adjustment may mean no button is highlighted, but Restore should still
+  // return to the last preset the user chose.
+  ProcessingPreset last_preset = ProcessingPreset::kSmall;
   wxString resolution_label;
   uint64_t preview_cache_access_sequence = 0;
 };
@@ -713,12 +717,32 @@ class CompareCanvas final : public wxScrolledWindow {
   }
 
   void SetComparisonMode(ComparisonMode mode) {
+    int view_x = 0;
+    int view_y = 0;
+    GetViewStart(&view_x, &view_y);
+    const bool was_fit = zoom_mode_ == ZoomMode::kFit;
+    const double previous_scale = CurrentScale();
+    const ComparisonMode previous_mode = comparison_mode_;
+    if (mode == ComparisonMode::kSideBySide && previous_mode != ComparisonMode::kSideBySide) {
+      non_side_by_side_zoom_mode_ = zoom_mode_;
+    } else if (mode != ComparisonMode::kSideBySide && previous_mode == ComparisonMode::kSideBySide) {
+      zoom_mode_ = non_side_by_side_zoom_mode_;
+    }
     comparison_mode_ = mode;
+    // Side by side is a pixel-level comparison.  Its shared view is always
+    // 100%, so the same source coordinate is visible in both panes.
+    if (comparison_mode_ == ComparisonMode::kSideBySide) {
+      zoom_mode_ = ZoomMode::k100;
+    }
     UpdateVirtualArea();
     if (zoom_mode_ == ZoomMode::kFit) {
       Scroll(0, 0);
-    } else {
+    } else if (comparison_mode_ == ComparisonMode::kSideBySide && was_fit) {
       CenterView();
+    } else {
+      const double current_scale = CurrentScale();
+      RestoreViewPosition(static_cast<int>(std::round(view_x * current_scale / previous_scale)),
+                          static_cast<int>(std::round(view_y * current_scale / previous_scale)));
     }
     Refresh();
   }
@@ -728,6 +752,11 @@ class CompareCanvas final : public wxScrolledWindow {
   }
 
   void SetZoomMode(ZoomMode mode) {
+    if (comparison_mode_ == ComparisonMode::kSideBySide) {
+      mode = ZoomMode::k100;
+    } else {
+      non_side_by_side_zoom_mode_ = mode;
+    }
     zoom_mode_ = mode;
     UpdateVirtualArea();
     if (zoom_mode_ == ZoomMode::kFit) {
@@ -743,6 +772,9 @@ class CompareCanvas final : public wxScrolledWindow {
   }
 
   void ZoomIn() {
+    if (comparison_mode_ == ComparisonMode::kSideBySide) {
+      return;
+    }
     if (zoom_mode_ == ZoomMode::kFit) {
       SetZoomMode(ZoomMode::k50);
     } else {
@@ -751,6 +783,9 @@ class CompareCanvas final : public wxScrolledWindow {
   }
 
   void ZoomOut() {
+    if (comparison_mode_ == ComparisonMode::kSideBySide) {
+      return;
+    }
     if (zoom_mode_ == ZoomMode::k100) {
       SetZoomMode(ZoomMode::k50);
     } else {
@@ -850,6 +885,13 @@ class CompareCanvas final : public wxScrolledWindow {
     const wxSize client = GetClientSize();
     Scroll(std::max(0, (virtual_size.GetWidth() - client.GetWidth()) / 2),
            std::max(0, (virtual_size.GetHeight() - client.GetHeight()) / 2));
+  }
+
+  void RestoreViewPosition(int view_x, int view_y) {
+    const wxSize virtual_size = GetVirtualSize();
+    const wxSize client = GetClientSize();
+    Scroll(std::clamp(view_x, 0, std::max(0, virtual_size.GetWidth() - client.GetWidth())),
+           std::clamp(view_y, 0, std::max(0, virtual_size.GetHeight() - client.GetHeight())));
   }
 
   void DrawBitmap(wxGraphicsContext* graphics,
@@ -958,12 +1000,18 @@ class CompareCanvas final : public wxScrolledWindow {
 
     if (comparison_mode_ == ComparisonMode::kConverted) {
       DrawBitmap(gc, dc, converted, offset.x, offset.y, single_size.GetWidth(), single_size.GetHeight());
-      DrawLabel(gc, dc, "Converted", offset.x + 12, offset.y + 12);
+      int view_x = 0;
+      int view_y = 0;
+      GetViewStart(&view_x, &view_y);
+      DrawLabel(gc, dc, "Converted", view_x + 12, view_y + 12);
       return;
     }
 
     DrawBitmap(gc, dc, original, offset.x, offset.y, single_size.GetWidth(), single_size.GetHeight());
-    DrawLabel(gc, dc, "Original", offset.x + 12, offset.y + 12);
+    int view_x = 0;
+    int view_y = 0;
+    GetViewStart(&view_x, &view_y);
+    DrawLabel(gc, dc, "Original", view_x + 12, view_y + 12);
   }
 
   void OnSize(wxSizeEvent& event) {
@@ -1024,8 +1072,9 @@ class CompareCanvas final : public wxScrolledWindow {
   std::shared_ptr<const PreviewImage> converted_preview_;
   wxBitmap original_bitmap_;
   wxBitmap converted_bitmap_;
-  ComparisonMode comparison_mode_ = ComparisonMode::kSideBySide;
+  ComparisonMode comparison_mode_ = ComparisonMode::kConverted;
   ZoomMode zoom_mode_ = ZoomMode::kFit;
+  ZoomMode non_side_by_side_zoom_mode_ = ZoomMode::kFit;
   bool panning_ = false;
   wxPoint last_pan_point_;
 };
@@ -1124,6 +1173,7 @@ class HiracoMainFrame final : public wxFrame {
     UpdateCompareButtons();
     UpdateZoomButtons();
     UpdateButtons();
+    FinishStatusActivity("Ready");
   }
 
   void AddFiles(const std::vector<std::string>& paths) {
@@ -1232,17 +1282,19 @@ class HiracoMainFrame final : public wxFrame {
     auto* center_panel = new wxPanel(detail_splitter);
     auto* center_sizer = new wxBoxSizer(wxVERTICAL);
     auto* preview_toolbar = new wxBoxSizer(wxHORIZONTAL);
-    preview_toolbar->Add(new wxStaticText(center_panel, wxID_ANY, "Compare:"),
+    auto* compare_toolbar = new wxBoxSizer(wxHORIZONTAL);
+    compare_toolbar->Add(new wxStaticText(center_panel, wxID_ANY, "Compare:"),
                          0,
                          wxALIGN_CENTER_VERTICAL | wxRIGHT,
                          8);
     original_mode_button_ = new PaletteButton(center_panel, wxID_ANY, "Original");
     converted_mode_button_ = new PaletteButton(center_panel, wxID_ANY, "Converted");
     side_by_side_mode_button_ = new PaletteButton(center_panel, wxID_ANY, "Side by side");
-    preview_toolbar->Add(original_mode_button_, 0, wxRIGHT, 4);
-    preview_toolbar->Add(converted_mode_button_, 0, wxRIGHT, 4);
-    preview_toolbar->Add(side_by_side_mode_button_, 0, wxRIGHT, 16);
-    preview_toolbar->Add(new wxStaticText(center_panel, wxID_ANY, "Zoom:"),
+    compare_toolbar->Add(original_mode_button_, 0, wxRIGHT, 4);
+    compare_toolbar->Add(converted_mode_button_, 0, wxRIGHT, 4);
+    compare_toolbar->Add(side_by_side_mode_button_, 0);
+    auto* zoom_toolbar = new wxBoxSizer(wxHORIZONTAL);
+    zoom_toolbar->Add(new wxStaticText(center_panel, wxID_ANY, "Zoom:"),
                          0,
                          wxALIGN_CENTER_VERTICAL | wxRIGHT,
                          8);
@@ -1253,11 +1305,14 @@ class HiracoMainFrame final : public wxFrame {
     zoom_in_button_ = new PaletteButton(center_panel, wxID_ANY, "+");
     zoom_out_button_->SetMinSize(wxSize(32, -1));
     zoom_in_button_->SetMinSize(wxSize(32, -1));
-    preview_toolbar->Add(zoom_out_button_, 0, wxRIGHT, 4);
-    preview_toolbar->Add(zoom_fit_button_, 0, wxRIGHT, 4);
-    preview_toolbar->Add(zoom_50_button_, 0, wxRIGHT, 4);
-    preview_toolbar->Add(zoom_100_button_, 0, wxRIGHT, 4);
-    preview_toolbar->Add(zoom_in_button_, 0);
+    zoom_toolbar->Add(zoom_out_button_, 0, wxRIGHT, 4);
+    zoom_toolbar->Add(zoom_fit_button_, 0, wxRIGHT, 4);
+    zoom_toolbar->Add(zoom_50_button_, 0, wxRIGHT, 4);
+    zoom_toolbar->Add(zoom_100_button_, 0, wxRIGHT, 4);
+    zoom_toolbar->Add(zoom_in_button_, 0);
+    preview_toolbar->Add(compare_toolbar, 0, wxALIGN_CENTER_VERTICAL);
+    preview_toolbar->AddStretchSpacer();
+    preview_toolbar->Add(zoom_toolbar, 0, wxALIGN_CENTER_VERTICAL);
 
     compare_canvas_ = new CompareCanvas(center_panel);
     center_sizer->Add(preview_toolbar, 0, wxALL | wxEXPAND, 10);
@@ -1310,14 +1365,16 @@ class HiracoMainFrame final : public wxFrame {
     right_sizer->Add(output_panel, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
     right_sizer->Add(new wxStaticLine(right_panel), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
 
+    right_sizer->Add(make_section_label(right_panel, "Presets"), 0, wxLEFT | wxBOTTOM, 10);
     auto* presets_row = new wxBoxSizer(wxHORIZONTAL);
-    presets_row->Add(make_section_label(right_panel, "Presets"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
     small_preset_button_ = new PaletteButton(right_panel, wxID_ANY, "Small");
     medium_preset_button_ = new PaletteButton(right_panel, wxID_ANY, "Medium");
     strong_preset_button_ = new PaletteButton(right_panel, wxID_ANY, "Strong");
+    custom_preset_button_ = new PaletteButton(right_panel, wxID_ANY, "Custom");
     presets_row->Add(small_preset_button_, 1, wxRIGHT, 6);
     presets_row->Add(medium_preset_button_, 1, wxRIGHT, 6);
-    presets_row->Add(strong_preset_button_, 1);
+    presets_row->Add(strong_preset_button_, 1, wxRIGHT, 6);
+    presets_row->Add(custom_preset_button_, 1);
     right_sizer->Add(presets_row, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
 
     right_sizer->Add(make_section_label(right_panel, "Processing"), 0, wxLEFT, 10);
@@ -1444,24 +1501,6 @@ class HiracoMainFrame final : public wxFrame {
     processing_sizer->Add(sliders_scroll, 1, wxEXPAND);
     processing_panel->SetSizer(processing_sizer);
     right_sizer->Add(processing_panel, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
-    right_sizer->Add(new wxStaticLine(right_panel), 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
-
-    auto* settings_action_row = new wxBoxSizer(wxHORIZONTAL);
-    reset_button_ = new wxButton(right_panel, wxID_ANY, "Reset file");
-    save_defaults_button_ = new wxButton(right_panel, wxID_ANY, "Save defaults");
-    copy_settings_button_ = new wxButton(right_panel, wxID_ANY, "Copy settings");
-    paste_settings_button_ = new wxButton(right_panel, wxID_ANY, "Paste settings");
-    reset_button_->SetToolTip("Reset the selected file to the built-in safe processing values.");
-    save_defaults_button_->SetToolTip("Save the current non-blur slider values as defaults for future files and launches.");
-    copy_settings_button_->SetToolTip("Copy the current file's resolved processing settings.");
-    paste_settings_button_->SetToolTip("Paste copied settings to all selected queue items.");
-    settings_action_row->Add(reset_button_, 0, wxRIGHT, 8);
-    settings_action_row->Add(copy_settings_button_, 0, wxRIGHT, 8);
-    settings_action_row->Add(paste_settings_button_, 0, wxRIGHT, 8);
-    settings_action_row->Add(save_defaults_button_, 0);
-    settings_action_row->AddStretchSpacer();
-    right_sizer->Add(settings_action_row, 0, wxLEFT | wxRIGHT | wxTOP | wxEXPAND, 10);
-
     auto* convert_action_row = new wxBoxSizer(wxHORIZONTAL);
     convert_button_ = new wxButton(right_panel, wxID_ANY, "Convert");
     cancel_button_ = new wxButton(right_panel, wxID_ANY, "Cancel");
@@ -1506,6 +1545,7 @@ class HiracoMainFrame final : public wxFrame {
     title_label->SetFont(title_font);
     header_row->Add(title_label, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
     *reset_button = new wxButton(parent, wxID_ANY, "Restore");
+    (*reset_button)->SetToolTip("Restore this section from the last selected preset.");
     header_row->Add(*reset_button, 0);
     section_sizer->Add(header_row, 0, wxALL | wxEXPAND, 10);
 
@@ -1591,28 +1631,17 @@ class HiracoMainFrame final : public wxFrame {
     clear_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnClearQueue, this);
     convert_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnConvert, this);
     cancel_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnCancel, this);
-    reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetDefaults, this);
-    save_defaults_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnSaveDefaults, this);
-    copy_settings_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnCopySettings, this);
-    paste_settings_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnPasteSettings, this);
     stage1_reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetStage1Defaults, this);
     stage2_reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetStage2Defaults, this);
     stage3_reset_button_->Bind(wxEVT_BUTTON, &HiracoMainFrame::OnResetStage3Defaults, this);
-    small_preset_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-      OnPresetToggled(ProcessingPreset::kSmall, 0.60f, "Small",
-                      SelectedItem() != nullptr &&
-                          SelectedItem()->active_preset != ProcessingPreset::kSmall);
-    });
-    medium_preset_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-      OnPresetToggled(ProcessingPreset::kMedium, 1.00f, "Medium",
-                      SelectedItem() != nullptr &&
-                          SelectedItem()->active_preset != ProcessingPreset::kMedium);
-    });
-    strong_preset_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
-      OnPresetToggled(ProcessingPreset::kStrong, 1.45f, "Strong",
-                      SelectedItem() != nullptr &&
-                          SelectedItem()->active_preset != ProcessingPreset::kStrong);
-    });
+    small_preset_button_->Bind(wxEVT_BUTTON,
+                               [this](wxCommandEvent&) { ApplyProcessingPreset(ProcessingPreset::kSmall); });
+    medium_preset_button_->Bind(wxEVT_BUTTON,
+                                [this](wxCommandEvent&) { ApplyProcessingPreset(ProcessingPreset::kMedium); });
+    strong_preset_button_->Bind(wxEVT_BUTTON,
+                                [this](wxCommandEvent&) { ApplyProcessingPreset(ProcessingPreset::kStrong); });
+    custom_preset_button_->Bind(wxEVT_BUTTON,
+                                [this](wxCommandEvent&) { ApplyProcessingPreset(ProcessingPreset::kCustom); });
     output_dir_picker_->Bind(wxEVT_DIRPICKER_CHANGED, &HiracoMainFrame::OnOutputDirChanged, this);
     relative_subdir_ctrl_->Bind(wxEVT_TEXT, &HiracoMainFrame::OnRelativeSubdirChanged, this);
     specific_directory_radio_->Bind(wxEVT_RADIOBUTTON, &HiracoMainFrame::OnOutputModeChanged, this);
@@ -1639,14 +1668,17 @@ class HiracoMainFrame final : public wxFrame {
     original_mode_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
       compare_canvas_->SetComparisonMode(CompareCanvas::ComparisonMode::kOriginal);
       UpdateCompareButtons();
+      UpdateZoomButtons();
     });
     converted_mode_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
       compare_canvas_->SetComparisonMode(CompareCanvas::ComparisonMode::kConverted);
       UpdateCompareButtons();
+      UpdateZoomButtons();
     });
     side_by_side_mode_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
       compare_canvas_->SetComparisonMode(CompareCanvas::ComparisonMode::kSideBySide);
       UpdateCompareButtons();
+      UpdateZoomButtons();
     });
     zoom_out_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
       compare_canvas_->ZoomOut();
@@ -1754,15 +1786,26 @@ class HiracoMainFrame final : public wxFrame {
 
   void UpdateZoomButtons() {
     const CompareCanvas::ZoomMode mode = compare_canvas_->GetZoomMode();
+    const bool side_by_side =
+        compare_canvas_->GetComparisonMode() == CompareCanvas::ComparisonMode::kSideBySide;
     auto update = [mode](PaletteButton* button, CompareCanvas::ZoomMode button_mode) {
       button->SetSelected(mode == button_mode);
     };
     update(zoom_fit_button_, CompareCanvas::ZoomMode::kFit);
     update(zoom_50_button_, CompareCanvas::ZoomMode::k50);
     update(zoom_100_button_, CompareCanvas::ZoomMode::k100);
+    zoom_out_button_->Enable(!side_by_side);
+    zoom_fit_button_->Enable(!side_by_side);
+    zoom_50_button_->Enable(!side_by_side);
+    zoom_100_button_->Enable(true);
+    zoom_in_button_->Enable(!side_by_side);
   }
 
   void BeginStatusActivity(const wxString& message) {
+    if (!activity_indicator_->IsShown()) {
+      activity_indicator_->Show();
+      activity_indicator_->GetParent()->Layout();
+    }
     status_label_->SetLabel(message);
     progress_gauge_->SetValue(0);
     activity_indicator_->Start();
@@ -1770,48 +1813,44 @@ class HiracoMainFrame final : public wxFrame {
 
   void FinishStatusActivity(const wxString& message, int progress = 0) {
     activity_indicator_->Stop();
+    activity_indicator_->Hide();
+    activity_indicator_->GetParent()->Layout();
     progress_gauge_->SetValue(std::clamp(progress, 0, 100));
     status_label_->SetLabel(message);
   }
 
   void UpdatePresetButtons() {
     const QueueItem* item = SelectedItem();
-    const ProcessingPreset active = item == nullptr ? ProcessingPreset::kNone : item->active_preset;
-    const auto update = [active](PaletteButton* button, ProcessingPreset preset) {
-      const bool selected = active == preset;
-      button->SetSelected(selected);
+    const bool has_selection = item != nullptr;
+    const auto update = [this, item](PaletteButton* button, ProcessingPreset preset) {
+      button->SetSelected(item != nullptr && SettingsMatchPreset(*item, preset));
     };
     update(small_preset_button_, ProcessingPreset::kSmall);
     update(medium_preset_button_, ProcessingPreset::kMedium);
     update(strong_preset_button_, ProcessingPreset::kStrong);
+    update(custom_preset_button_, ProcessingPreset::kCustom);
+    custom_preset_button_->Enable(has_selection && custom_preset_settings_.has_value() &&
+                                  !conversion_running_ && !close_requested_.load());
   }
 
-  void OnPresetToggled(ProcessingPreset preset,
-                       float strength,
-                       const wxString& label,
-                       bool enabled) {
-    QueueItem* item = SelectedItem();
-    if (item == nullptr) {
-      UpdatePresetButtons();
-      return;
-    }
-    if (!enabled) {
-      if (item->active_preset == preset) {
-        item->active_preset = ProcessingPreset::kNone;
-        status_label_->SetLabel("Preset selection cleared");
-      }
-      UpdatePresetButtons();
-      return;
-    }
-    ApplyProcessingPreset(preset, strength, label);
+  bool SettingsEqual(const ResolvedStageSettings& left, const ResolvedStageSettings& right) const {
+    // Match the precision the sliders can actually represent.  Preset math
+    // can have more precision than the control (for example 0.0972 versus
+    // the displayed 0.097), so a raw float comparison would look wrong.
+    const auto equal = [](float a, float b, int scale) {
+      return std::lround(a * scale) == std::lround(b * scale);
+    };
+    return equal(left.stage1_psf_sigma, right.stage1_psf_sigma, 100) &&
+           equal(left.stage1_nsr, right.stage1_nsr, 1000) &&
+           equal(left.stage2_denoise, right.stage2_denoise, 100) &&
+           equal(left.stage2_gain1, right.stage2_gain1, 100) &&
+           equal(left.stage2_gain2, right.stage2_gain2, 100) &&
+           equal(left.stage2_gain3, right.stage2_gain3, 100) &&
+           left.stage3_radius == right.stage3_radius &&
+           equal(left.stage3_gain, right.stage3_gain, 100);
   }
 
-  void ApplyProcessingPreset(ProcessingPreset preset, float strength, const wxString& label) {
-    QueueItem* item = SelectedItem();
-    if (item == nullptr) {
-      return;
-    }
-
+  ResolvedStageSettings BuiltInPresetSettings(const QueueItem* item, float strength) const {
     const ResolvedStageSettings base = HardcodedSafeStageSettingsForItem(item);
     ResolvedStageSettings settings = base;
     const auto scale_detail = [strength](float value) {
@@ -1825,13 +1864,79 @@ class HiracoMainFrame final : public wxFrame {
     settings.stage2_gain2 = scale_detail(base.stage2_gain2);
     settings.stage2_gain3 = scale_detail(base.stage2_gain3);
     settings.stage3_gain = std::clamp(base.stage3_gain * strength, 0.0f, 4.0f);
-    item->stage_overrides = MakeExplicitStageOverrides(settings);
-    item->active_preset = preset;
+    return settings;
+  }
+
+  std::optional<ResolvedStageSettings> SettingsForPreset(const QueueItem* item,
+                                                          ProcessingPreset preset) const {
+    switch (preset) {
+      case ProcessingPreset::kSmall:
+        return BuiltInPresetSettings(item, 0.60f);
+      case ProcessingPreset::kMedium:
+        return BuiltInPresetSettings(item, 1.00f);
+      case ProcessingPreset::kStrong:
+        return BuiltInPresetSettings(item, 1.45f);
+      case ProcessingPreset::kCustom:
+        return custom_preset_settings_;
+      case ProcessingPreset::kNone:
+        return std::nullopt;
+    }
+    return std::nullopt;
+  }
+
+  ResolvedStageSettings ResolvedSettingsForItem(const QueueItem& item) const {
+    if (item.prepared.has_value()) {
+      return GetResolvedStageSettings(*item.prepared, ResolveEffectiveStageOverrides(item.stage_overrides));
+    }
+    return ResolveDisplayStageSettings(ResolveEffectiveStageOverrides(item.stage_overrides));
+  }
+
+  bool SettingsMatchPreset(const QueueItem& item, ProcessingPreset preset) const {
+    const std::optional<ResolvedStageSettings> preset_settings = SettingsForPreset(&item, preset);
+    return preset_settings.has_value() && SettingsEqual(ResolvedSettingsForItem(item), *preset_settings);
+  }
+
+  bool SettingsMatchAnyBuiltInPreset(const QueueItem& item) const {
+    return SettingsMatchPreset(item, ProcessingPreset::kSmall) ||
+           SettingsMatchPreset(item, ProcessingPreset::kMedium) ||
+           SettingsMatchPreset(item, ProcessingPreset::kStrong);
+  }
+
+  ResolvedStageSettings LastPresetSettings(const QueueItem* item) const {
+    if (item != nullptr) {
+      const std::optional<ResolvedStageSettings> selected = SettingsForPreset(item, item->last_preset);
+      if (selected.has_value()) {
+        return *selected;
+      }
+    }
+    return BuiltInPresetSettings(item, 0.60f);
+  }
+
+  void ApplyProcessingPresetToRow(int row, ProcessingPreset preset, const wxString& label) {
+    if (row < 0 || row >= static_cast<int>(queue_.size())) {
+      return;
+    }
+    QueueItem* item = &queue_[row];
+    const std::optional<ResolvedStageSettings> settings = SettingsForPreset(item, preset);
+    if (!settings.has_value()) {
+      return;
+    }
+    item->stage_overrides = MakeExplicitStageOverrides(*settings);
+    item->last_preset = preset;
     NormalizeStageOverrides(item);
     UpdatePresetButtons();
-    RefreshQueueRow(selected_row_);
-    RefreshConvertedPreviewIfPossible();
+    RefreshQueueRow(row);
+    if (row == selected_row_) {
+      RefreshConvertedPreviewIfPossible();
+    }
     status_label_->SetLabel("Applied " + label + " preset");
+  }
+
+  void ApplyProcessingPreset(ProcessingPreset preset) {
+    const wxString label = preset == ProcessingPreset::kSmall ? "Small" :
+                           preset == ProcessingPreset::kMedium ? "Medium" :
+                           preset == ProcessingPreset::kStrong ? "Strong" : "Custom";
+    ApplyProcessingPresetToRow(selected_row_, preset, label);
   }
 
   void ApplyStageSettingsToSliders(const ResolvedStageSettings& settings) {
@@ -1852,10 +1957,6 @@ class HiracoMainFrame final : public wxFrame {
       return GetResolvedStageSettings(*item->prepared, StageOverrideSet());
     }
     return ResolvedStageSettings();
-  }
-
-  StageOverrideSet HardcodedSafeStageOverridesForItem(const QueueItem* item) const {
-    return MakeExplicitStageOverrides(HardcodedSafeStageSettingsForItem(item));
   }
 
   ResolvedStageSettings BaseStageSettingsForItem(const QueueItem* item) const {
@@ -1922,9 +2023,8 @@ class HiracoMainFrame final : public wxFrame {
 
     const ResolvedStageSettings base_settings = BaseStageSettingsForItem(item);
     update(item->stage_overrides, base_settings);
-    item->active_preset = ProcessingPreset::kNone;
-    UpdatePresetButtons();
     NormalizeStageOverrides(item);
+    UpdatePresetButtons();
   }
 
   void UpdateResolvedSliderValues() {
@@ -2287,18 +2387,6 @@ class HiracoMainFrame final : public wxFrame {
     config->Flush();
   }
 
-  void SaveAppSettingsFromControls() {
-    app_stage_defaults_.stage1_psf_sigma.reset();
-    app_stage_defaults_.stage1_nsr = static_cast<float>(SliderValue(stage1_nsr_));
-    app_stage_defaults_.stage2_denoise = static_cast<float>(SliderValue(stage2_denoise_));
-    app_stage_defaults_.stage2_gain1 = static_cast<float>(SliderValue(stage2_gain1_));
-    app_stage_defaults_.stage2_gain2 = static_cast<float>(SliderValue(stage2_gain2_));
-    app_stage_defaults_.stage2_gain3 = static_cast<float>(SliderValue(stage2_gain3_));
-    app_stage_defaults_.stage3_radius = static_cast<int>(std::round(SliderValue(stage3_radius_)));
-    app_stage_defaults_.stage3_gain = static_cast<float>(SliderValue(stage3_gain_));
-    SaveAppSettings();
-  }
-
   std::filesystem::path ResolveOutputPathForMode(const std::string& source_path) const {
     const std::filesystem::path source(source_path);
     std::filesystem::path output_directory;
@@ -2326,25 +2414,21 @@ class HiracoMainFrame final : public wxFrame {
   void UpdateButtons() {
     const bool disabled = close_requested_.load();
     const bool has_selection = selected_row_ >= 0 && selected_row_ < static_cast<int>(queue_.size());
-    const bool has_prepared_selection = has_selection && queue_[selected_row_].prepared.has_value();
-    const bool has_clipboard_settings = copied_stage_overrides_.has_value();
-    const bool has_selected_rows = !GetSelectedRows().empty();
     const bool enable_file_settings = has_selection && !conversion_running_ && !disabled;
 
     add_files_button_->Enable(!conversion_running_ && !disabled);
     clear_button_->Enable(!queue_.empty() && !conversion_running_ && !disabled);
     convert_button_->Enable(!queue_.empty() && !conversion_running_ && !disabled);
     cancel_button_->Enable(conversion_running_ && !disabled);
-    reset_button_->Enable(enable_file_settings);
-    save_defaults_button_->Enable(enable_file_settings);
     stage1_reset_button_->Enable(enable_file_settings);
     stage2_reset_button_->Enable(enable_file_settings);
     stage3_reset_button_->Enable(enable_file_settings);
+    for (wxButton* button : thumbnail_reset_buttons_) {
+      button->Enable(!conversion_running_ && !disabled);
+    }
     small_preset_button_->Enable(enable_file_settings);
     medium_preset_button_->Enable(enable_file_settings);
     strong_preset_button_->Enable(enable_file_settings);
-    copy_settings_button_->Enable(has_prepared_selection && !conversion_running_ && !disabled);
-    paste_settings_button_->Enable(has_selected_rows && has_clipboard_settings && !conversion_running_ && !disabled);
     stage1_sigma_.slider->Enable(enable_file_settings);
     stage1_nsr_.slider->Enable(enable_file_settings);
     stage2_denoise_.slider->Enable(enable_file_settings);
@@ -2364,6 +2448,7 @@ class HiracoMainFrame final : public wxFrame {
 
     queue_scroll_->Freeze();
     queue_sizer_->Clear(true);
+    thumbnail_reset_buttons_.clear();
     for (size_t index = 0; index < queue_.size(); ++index) {
       const QueueItem& item = queue_[index];
       auto* card = new wxPanel(queue_scroll_, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE);
@@ -2385,6 +2470,10 @@ class HiracoMainFrame final : public wxFrame {
                                         wxArtProvider::GetBitmap(wxART_DELETE, wxART_BUTTON, wxSize(16, 16)));
       remove->SetToolTip("Remove this image");
       remove->SetMinSize(wxSize(28, 28));
+      auto* reset_settings = new wxButton(card, wxID_ANY, "Reset settings");
+      reset_settings->SetToolTip("Reset this image to the Small preset.");
+      thumbnail_reset_buttons_.push_back(reset_settings);
+      header->Add(reset_settings, 0, wxRIGHT, 5);
       header->Add(remove, 0);
       card_sizer->Add(header, 0, wxALL | wxEXPAND, 7);
 
@@ -2444,6 +2533,10 @@ class HiracoMainFrame final : public wxFrame {
         detail_label->Bind(wxEVT_LEFT_DOWN, select);
       }
       preview_window->Bind(wxEVT_LEFT_DOWN, select);
+      preview_window->Bind(wxEVT_RIGHT_DOWN,
+                           [this, preview_window, row = static_cast<int>(index)](wxMouseEvent& event) {
+        ShowThumbnailContextMenu(preview_window, row, event.GetPosition());
+      });
       if (highlight_recovery != nullptr) {
         highlight_recovery->Bind(wxEVT_CHECKBOX, [this, row = static_cast<int>(index)](wxCommandEvent& event) {
           if (row < 0 || row >= static_cast<int>(queue_.size()) || !queue_[row].prepared.has_value()) {
@@ -2460,6 +2553,9 @@ class HiracoMainFrame final : public wxFrame {
       }
       remove->Bind(wxEVT_BUTTON, [this, row = static_cast<int>(index)](wxCommandEvent&) {
         RemoveQueueRows({row});
+      });
+      reset_settings->Bind(wxEVT_BUTTON, [this, row = static_cast<int>(index)](wxCommandEvent&) {
+        ApplyProcessingPresetToRow(row, ProcessingPreset::kSmall, "Small");
       });
 
       queue_sizer_->Add(card, 0, wxBOTTOM | wxEXPAND, 8);
@@ -2945,38 +3041,12 @@ class HiracoMainFrame final : public wxFrame {
     UpdateZoomButtons();
   }
 
-  void OnResetDefaults(wxCommandEvent&) {
-    if (QueueItem* item = SelectedItem()) {
-      item->stage_overrides = HardcodedSafeStageOverridesForItem(item);
-      item->active_preset = ProcessingPreset::kNone;
-      NormalizeStageOverrides(item);
-      UpdatePresetButtons();
-      RefreshQueueRow(selected_row_);
-    }
-    RefreshConvertedPreviewIfPossible();
-  }
-
-  void OnSaveDefaults(wxCommandEvent&) {
-    if (SelectedItem() == nullptr) {
-      return;
-    }
-
-    SaveAppSettingsFromControls();
-    for (QueueItem& item : queue_) {
-      NormalizeStageOverrides(&item);
-    }
-    RefreshQueue();
-    UpdateResolvedSliderValues();
-    status_label_->SetLabel("Saved current defaults");
-  }
-
   void OnResetStage1Defaults(wxCommandEvent&) {
     QueueItem* item = SelectedItem();
     if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-      const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
-      overrides->stage1_psf_sigma = safe.stage1_psf_sigma;
-      overrides->stage1_nsr = safe.stage1_nsr;
-      item->active_preset = ProcessingPreset::kNone;
+      const ResolvedStageSettings preset = LastPresetSettings(item);
+      overrides->stage1_psf_sigma = preset.stage1_psf_sigma;
+      overrides->stage1_nsr = preset.stage1_nsr;
       NormalizeStageOverrides(item);
       UpdatePresetButtons();
       RefreshQueueRow(selected_row_);
@@ -2987,12 +3057,11 @@ class HiracoMainFrame final : public wxFrame {
   void OnResetStage2Defaults(wxCommandEvent&) {
     QueueItem* item = SelectedItem();
     if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-      const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
-      overrides->stage2_denoise = safe.stage2_denoise;
-      overrides->stage2_gain1 = safe.stage2_gain1;
-      overrides->stage2_gain2 = safe.stage2_gain2;
-      overrides->stage2_gain3 = safe.stage2_gain3;
-      item->active_preset = ProcessingPreset::kNone;
+      const ResolvedStageSettings preset = LastPresetSettings(item);
+      overrides->stage2_denoise = preset.stage2_denoise;
+      overrides->stage2_gain1 = preset.stage2_gain1;
+      overrides->stage2_gain2 = preset.stage2_gain2;
+      overrides->stage2_gain3 = preset.stage2_gain3;
       NormalizeStageOverrides(item);
       UpdatePresetButtons();
       RefreshQueueRow(selected_row_);
@@ -3003,10 +3072,9 @@ class HiracoMainFrame final : public wxFrame {
   void OnResetStage3Defaults(wxCommandEvent&) {
     QueueItem* item = SelectedItem();
     if (StageOverrideSet* overrides = SelectedStageOverrides()) {
-      const ResolvedStageSettings safe = HardcodedSafeStageSettingsForItem(item);
-      overrides->stage3_radius = safe.stage3_radius;
-      overrides->stage3_gain = safe.stage3_gain;
-      item->active_preset = ProcessingPreset::kNone;
+      const ResolvedStageSettings preset = LastPresetSettings(item);
+      overrides->stage3_radius = preset.stage3_radius;
+      overrides->stage3_gain = preset.stage3_gain;
       NormalizeStageOverrides(item);
       UpdatePresetButtons();
       RefreshQueueRow(selected_row_);
@@ -3014,49 +3082,92 @@ class HiracoMainFrame final : public wxFrame {
     RefreshConvertedPreviewIfPossible();
   }
 
-  void OnCopySettings(wxCommandEvent&) {
-    QueueItem* item = SelectedItem();
-    if (item == nullptr || !item->prepared.has_value()) {
+  void CopySettingsFromRow(int row) {
+    if (row < 0 || row >= static_cast<int>(queue_.size())) {
       return;
     }
-
-    copied_stage_overrides_ = MakeExplicitStageOverrides(
-        GetResolvedStageSettings(*item->prepared, ResolveEffectiveStageOverrides(item->stage_overrides)));
-    status_label_->SetLabel("Copied settings from selected file");
+    copied_stage_overrides_ = MakeExplicitStageOverrides(ResolvedSettingsForItem(queue_[row]));
+    status_label_->SetLabel("Copied settings");
     UpdateButtons();
   }
 
-  void OnPasteSettings(wxCommandEvent&) {
+  void PasteSettingsToRows(const std::vector<int>& rows, const wxString& message) {
     if (!copied_stage_overrides_.has_value()) {
       return;
     }
-
-    const std::vector<int> selected_rows = GetSelectedRows();
-    if (selected_rows.empty()) {
+    if (rows.empty()) {
       return;
     }
 
     bool current_row_updated = false;
-    for (const int row : selected_rows) {
+    for (const int row : rows) {
       if (row < 0 || row >= static_cast<int>(queue_.size())) {
         continue;
       }
       queue_[row].stage_overrides = *copied_stage_overrides_;
-      queue_[row].active_preset = ProcessingPreset::kNone;
       NormalizeStageOverrides(&queue_[row]);
-      RefreshQueueRow(row);
       current_row_updated = current_row_updated || row == selected_row_;
     }
+
+    RefreshQueue();
 
     if (current_row_updated) {
       RefreshConvertedPreviewIfPossible();
     }
 
-    status_label_->SetLabel(wxString::Format("Pasted settings to %zu file%s",
-                                             selected_rows.size(),
-                                             selected_rows.size() == 1 ? "" : "s"));
+    status_label_->SetLabel(message);
     UpdatePresetButtons();
     UpdateButtons();
+  }
+
+  void SetCustomPresetFromRow(int row) {
+    if (row < 0 || row >= static_cast<int>(queue_.size()) ||
+        SettingsMatchAnyBuiltInPreset(queue_[row])) {
+      return;
+    }
+    custom_preset_settings_ = ResolvedSettingsForItem(queue_[row]);
+    queue_[row].last_preset = ProcessingPreset::kCustom;
+    UpdatePresetButtons();
+    status_label_->SetLabel("Set Custom preset");
+  }
+
+  void ShowThumbnailContextMenu(wxWindow* thumbnail, int row, const wxPoint& position) {
+    if (row < 0 || row >= static_cast<int>(queue_.size()) || conversion_running_ || close_requested_.load()) {
+      return;
+    }
+
+    wxMenu menu;
+    const int copy_id = wxWindow::NewControlId();
+    const int paste_id = wxWindow::NewControlId();
+    const int paste_all_id = wxWindow::NewControlId();
+    const int custom_id = wxWindow::NewControlId();
+    menu.Append(copy_id, "Copy settings");
+    const bool can_paste = copied_stage_overrides_.has_value();
+    if (can_paste) {
+      menu.Append(paste_id, "Paste settings");
+      menu.Append(paste_all_id, "Paste to all images");
+    }
+    if (!SettingsMatchAnyBuiltInPreset(queue_[row])) {
+      menu.AppendSeparator();
+      menu.Append(custom_id, "Set as Custom preset");
+    }
+    menu.Bind(wxEVT_MENU, [this, row, copy_id, paste_id, paste_all_id, custom_id](wxCommandEvent& event) {
+      if (event.GetId() == copy_id) {
+        CopySettingsFromRow(row);
+      } else if (event.GetId() == paste_id) {
+        PasteSettingsToRows({row}, "Pasted settings");
+      } else if (event.GetId() == paste_all_id) {
+        std::vector<int> rows;
+        rows.reserve(queue_.size());
+        for (size_t index = 0; index < queue_.size(); ++index) {
+          rows.push_back(static_cast<int>(index));
+        }
+        PasteSettingsToRows(rows, wxString::Format("Pasted settings to %zu images", rows.size()));
+      } else if (event.GetId() == custom_id) {
+        SetCustomPresetFromRow(row);
+      }
+    });
+    thumbnail->PopupMenu(&menu, position);
   }
 
   void OnMetadataReady(wxThreadEvent& event) {
@@ -3159,7 +3270,7 @@ class HiracoMainFrame final : public wxFrame {
       compare_canvas_->SetConvertedPreview(payload.converted_preview);
       NotePreviewCacheUse(index);
       EnforcePreviewCacheBudget();
-      FinishStatusActivity("Converted preview updated");
+      FinishStatusActivity("Ready");
     }
     StartQueuedConvertedPreviewIfIdle();
   }
@@ -3272,9 +3383,9 @@ class HiracoMainFrame final : public wxFrame {
         conversion_running_ = false;
         UpdateButtons();
         if (conversion_cancel_.load()) {
-          FinishStatusActivity("Conversion canceled");
+          FinishStatusActivity("Ready");
         } else {
-          FinishStatusActivity("Batch conversion finished", 100);
+          FinishStatusActivity("Ready", 100);
         }
         MaybeFinishClose();
       });
@@ -3318,16 +3429,14 @@ class HiracoMainFrame final : public wxFrame {
 
   wxButton* add_files_button_ = nullptr;
   wxButton* clear_button_ = nullptr;
-  wxButton* reset_button_ = nullptr;
-  wxButton* save_defaults_button_ = nullptr;
-  wxButton* copy_settings_button_ = nullptr;
-  wxButton* paste_settings_button_ = nullptr;
   wxButton* stage1_reset_button_ = nullptr;
   wxButton* stage2_reset_button_ = nullptr;
   wxButton* stage3_reset_button_ = nullptr;
   PaletteButton* small_preset_button_ = nullptr;
   PaletteButton* medium_preset_button_ = nullptr;
   PaletteButton* strong_preset_button_ = nullptr;
+  PaletteButton* custom_preset_button_ = nullptr;
+  std::vector<wxButton*> thumbnail_reset_buttons_;
   wxButton* convert_button_ = nullptr;
   wxButton* cancel_button_ = nullptr;
   wxScrolledWindow* queue_scroll_ = nullptr;
@@ -3372,6 +3481,7 @@ class HiracoMainFrame final : public wxFrame {
   OutputLocationMode output_location_mode_ = OutputLocationMode::kSpecificDirectory;
   HiracoCompression compression_ = HiracoCompression::kDeflate;
   std::optional<StageOverrideSet> copied_stage_overrides_;
+  std::optional<ResolvedStageSettings> custom_preset_settings_;
   int selected_row_ = -1;
   std::set<int> selected_rows_;
   uint64_t next_item_id_ = 1;
