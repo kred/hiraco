@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <set>
 #include <string>
@@ -69,11 +70,27 @@ int main(int argc, char** argv) {
 
   const StageOverrideSet stage_overrides = ReadStageOverridesFromEnvironment();
   const LibRawOverrideSet libraw_overrides = ReadLibRawOverridesFromEnvironment();
+  // --debug surfaces the progress callback, which is the only way to observe that
+  // the long JPEG-XL compression phase advances instead of appearing hung.
+  const auto log_progress = [enabled = debug](const ProcessingProgress& update) {
+    if (!enabled) {
+      return;
+    }
+    const std::ios::fmtflags flags = std::cerr.flags();
+    const std::streamsize precision = std::cerr.precision();
+    std::cerr << std::fixed << std::setprecision(3)
+              << "[hiraco][progress][" << update.phase << "] "
+              << update.fraction << " " << update.message << "\n";
+    std::cerr.flags(flags);
+    std::cerr.precision(precision);
+  };
+
   const DngWriteResult result = ConvertToDng(prepared,
                                              std::filesystem::path(output_path),
                                              compression,
                                              stage_overrides,
-                                             libraw_overrides);
+                                             libraw_overrides,
+                                             log_progress);
   if (!result.ok) {
     std::cerr << "Error: " << result.message << "\n";
     return 1;

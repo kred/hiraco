@@ -3909,10 +3909,45 @@ class CallbackAbortSniffer final : public dng_abort_sniffer {
     return true;
   }
 
+  // Some SDK operations (notably JPEG-XL lossless compression) do not emit
+  // StartTask/UpdateProgress callbacks even though they can run for minutes.
+  // They do call Sniff() regularly, so use that hook to advance a coarse,
+  // time-based estimate across [start_fraction, end_fraction] while the
+  // operation runs. This keeps the CLI/GUI from appearing hung.
+  void BeginTimedProgress(const std::string& message,
+                          double start_fraction,
+                          double end_fraction,
+                          double expected_seconds) {
+    timed_message_ = message;
+    timed_start_fraction_ = start_fraction;
+    timed_end_fraction_ = end_fraction;
+    timed_expected_seconds_ = expected_seconds > 0.001 ? expected_seconds : 0.001;
+    timed_start_time_ = std::chrono::steady_clock::now();
+    timed_last_fraction_.store(start_fraction, std::memory_order_relaxed);
+    timed_active_.store(true, std::memory_order_release);
+  }
+
+  void EndTimedProgress() {
+    timed_active_.store(false, std::memory_order_release);
+  }
+
  protected:
   void Sniff() override {
     if (IsCancelled(cancel_)) {
       ThrowUserCanceled();
+    }
+    if (!timed_active_.load(std::memory_order_acquire)) {
+      return;
+    }
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - timed_start_time_).count();
+    const double ratio = std::clamp(elapsed / timed_expected_seconds_, 0.0, 1.0);
+    const double fraction =
+        timed_start_fraction_ + (timed_end_fraction_ - timed_start_fraction_) * ratio;
+    const double last = timed_last_fraction_.load(std::memory_order_relaxed);
+    if (fraction >= last + 0.005) {
+      timed_last_fraction_.store(fraction, std::memory_order_relaxed);
+      ReportProgress(progress_, "convert", fraction, timed_message_);
     }
   }
 
@@ -3932,6 +3967,13 @@ class CallbackAbortSniffer final : public dng_abort_sniffer {
   ProgressCallback progress_;
   CancelCheck cancel_;
   std::string current_task_;
+  std::atomic<bool> timed_active_{false};
+  std::atomic<double> timed_last_fraction_{0.0};
+  std::string timed_message_;
+  double timed_start_fraction_ = 0.0;
+  double timed_end_fraction_ = 0.0;
+  double timed_expected_seconds_ = 1.0;
+  std::chrono::steady_clock::time_point timed_start_time_{};
 };
 
 }  // namespace
@@ -4525,10 +4567,16 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     dng_file_stream stream(output_path.c_str(), true);
     dng_image_writer writer;
     if (compression == "jpeg-xl") {
-      negative->LosslessCompressJXL(host, writer, false);
+      ReportProgress(progress, "convert", 0.92, "Compressing JPEG-XL");
+      sniffer.BeginTimedProgress("Compressing JPEG-XL", 0.92, 0.95, 120.0);
+      {
+        const hiraco::ScopedTimingLog timer("convert", "LosslessCompressJXL");
+        negative->LosslessCompressJXL(host, writer, false);
+      }
+      sniffer.EndTimedProgress();
     }
 
-    ReportProgress(progress, "convert", 0.92, "Writing DNG");
+    ReportProgress(progress, "convert", 0.95, "Writing DNG");
     {
       const hiraco::ScopedTimingLog timer("convert", "Write DNG stream");
       writer.WriteDNG(host,
@@ -4577,6 +4625,7 @@ DngWriteResult WriteSyntheticLinearDng(const std::string& output_path,
     dng_file_stream stream(output_path.c_str(), true);
     dng_image_writer writer;
     if (compression == "jpeg-xl") {
+      const hiraco::ScopedTimingLog timer("convert", "LosslessCompressJXL");
       negative->LosslessCompressJXL(host, writer, false);
     }
 

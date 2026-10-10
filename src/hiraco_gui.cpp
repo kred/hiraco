@@ -2136,7 +2136,7 @@ class HiracoMainFrame final : public wxFrame {
       return 0.10 + 0.80 * fraction;
     }
     if (progress.phase == "write") {
-      return 0.92 + 0.07 * fraction;
+      return 0.95 + 0.04 * fraction;
     }
     return fraction;
   }
