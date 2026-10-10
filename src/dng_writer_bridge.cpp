@@ -1800,11 +1800,17 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
 }
 
 
+// The DNG SDK does not save the version we pass as maxBackwardVersion; it
+// derives the DNGVersion tag from the features actually used and never writes
+// anything below the DNG 1.4 baseline. For these linear DNGs the saved version
+// is 1.4.0.0 for uncompressed/deflate and 1.7.0.0 for lossless JPEG XL, so
+// request exactly those versions instead of asserting DNG 1.6.0.0 that never
+// reaches the file.
 uint32_t DngVersionForCompression(const std::string& compression) {
   if (compression == "jpeg-xl") {
-    return dngVersion_SaveDefault;
+    return dngVersion_1_7_0_0;
   }
-  return dngVersion_1_6_0_0;
+  return dngVersion_1_4_0_0;
 }
 
 void ConfigureHost(dng_host& host, const std::string& compression) {

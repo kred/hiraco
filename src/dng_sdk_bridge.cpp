@@ -21,11 +21,14 @@ std::string FormatDngVersion(uint32_t version) {
   return stream.str();
 }
 
+// The DNG SDK derives the saved DNGVersion tag from the features actually used
+// and never writes below the DNG 1.4 baseline, so these are the versions the
+// writer really produces for each mode.
 uint32_t DngVersionForCompression(const std::string& compression) {
   if (compression == "jpeg-xl") {
-    return dngVersion_SaveDefault;
+    return dngVersion_1_7_0_0;
   }
-  return dngVersion_1_6_0_0;
+  return dngVersion_1_4_0_0;
 }
 
 }  // namespace
@@ -49,7 +52,7 @@ DngWriterConfigSummary BuildDngWriterConfigSummary(const std::string& compressio
     summary.compression_code = ccUncompressed;
     summary.compression_name = "uncompressed";
     summary.dng_version = FormatDngVersion(DngVersionForCompression(compression));
-    summary.status = "Writer can request uncompressed linear DNG output as DNG 1.6.0.0";
+    summary.status = "Writer can request uncompressed linear DNG output as DNG 1.4.0.0";
     return summary;
   }
 
@@ -57,7 +60,7 @@ DngWriterConfigSummary BuildDngWriterConfigSummary(const std::string& compressio
     summary.compression_code = ccDeflate;
     summary.compression_name = "deflate";
     summary.dng_version = FormatDngVersion(DngVersionForCompression(compression));
-    summary.status = "Writer can request Deflate-compressed linear DNG output as DNG 1.6.0.0";
+    summary.status = "Writer can request Deflate-compressed linear DNG output as DNG 1.4.0.0";
     return summary;
   }
 
@@ -67,7 +70,7 @@ DngWriterConfigSummary BuildDngWriterConfigSummary(const std::string& compressio
     summary.dng_version = FormatDngVersion(DngVersionForCompression(compression));
     summary.experimental = true;
     summary.lossless_jpeg_xl = true;
-    summary.status = "Writer can request lossless JPEG XL linear DNG output as experimental DNG 1.7.1.0";
+    summary.status = "Writer can request lossless JPEG XL linear DNG output as experimental DNG 1.7.0.0";
     return summary;
   }
 
