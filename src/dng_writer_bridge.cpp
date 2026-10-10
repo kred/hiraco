@@ -118,10 +118,6 @@ void ReportProgress(const ProgressCallback& progress,
   progress(update);
 }
 
-bool Is80MpFrame(uint32_t width, uint32_t height) {
-  return width == 10386 && height == 7792;
-}
-
 constexpr float kStage2GainMin = 0.25f;
 constexpr float kStage2GainMax = 4.0f;
 constexpr float kStage2FineFromSmallScale = 1.6f;
@@ -578,104 +574,6 @@ bool LoadStackAliasMap(const SourceLinearDngMetadata& metadata,
     value = std::clamp(value, 0.0, 1.0);
   }
   return true;
-}
-
-void UpsampleFloatMap(const std::vector<double>& source,
-                      uint32_t source_width,
-                      uint32_t source_height,
-                      uint32_t target_width,
-                      uint32_t target_height,
-                      std::vector<double>* target) {
-  if (target == nullptr) {
-    return;
-  }
-  target->clear();
-
-  if (source.empty() || source_width == 0 || source_height == 0 ||
-      target_width == 0 || target_height == 0) {
-    return;
-  }
-
-  target->resize(static_cast<size_t>(target_width) * target_height, 0.0);
-
-  const double scale_x = static_cast<double>(source_width) / static_cast<double>(target_width);
-  const double scale_y = static_cast<double>(source_height) / static_cast<double>(target_height);
-  #pragma omp parallel for schedule(static) if(target_height > 100)
-  for (uint32_t row = 0; row < target_height; ++row) {
-    const double y = (static_cast<double>(row) + 0.5) * scale_y - 0.5;
-    const int y0 = static_cast<int>(std::floor(y));
-    const int y1 = y0 + 1;
-    const double wy = y - std::floor(y);
-    const uint32_t sy0 = static_cast<uint32_t>(std::clamp(y0, 0, static_cast<int>(source_height) - 1));
-    const uint32_t sy1 = static_cast<uint32_t>(std::clamp(y1, 0, static_cast<int>(source_height) - 1));
-    for (uint32_t col = 0; col < target_width; ++col) {
-      const double x = (static_cast<double>(col) + 0.5) * scale_x - 0.5;
-      const int x0 = static_cast<int>(std::floor(x));
-      const int x1 = x0 + 1;
-      const double wx = x - std::floor(x);
-      const uint32_t sx0 = static_cast<uint32_t>(std::clamp(x0, 0, static_cast<int>(source_width) - 1));
-      const uint32_t sx1 = static_cast<uint32_t>(std::clamp(x1, 0, static_cast<int>(source_width) - 1));
-
-      const double v00 = source[static_cast<size_t>(sy0) * source_width + sx0];
-      const double v01 = source[static_cast<size_t>(sy0) * source_width + sx1];
-      const double v10 = source[static_cast<size_t>(sy1) * source_width + sx0];
-      const double v11 = source[static_cast<size_t>(sy1) * source_width + sx1];
-      const double top = (1.0 - wx) * v00 + wx * v01;
-      const double bottom = (1.0 - wx) * v10 + wx * v11;
-      (*target)[static_cast<size_t>(row) * target_width + col] =
-          (1.0 - wy) * top + wy * bottom;
-    }
-  }
-}
-
-void UpsampleFloatMapRegion(const std::vector<double>& source,
-                            uint32_t source_width,
-                            uint32_t source_height,
-                            uint32_t full_width,
-                            uint32_t full_height,
-                            const CropRect& region,
-                            std::vector<double>* target) {
-  if (target == nullptr) {
-    return;
-  }
-  target->clear();
-
-  if (source.empty() || source_width == 0 || source_height == 0 ||
-      full_width == 0 || full_height == 0 ||
-      region.width == 0 || region.height == 0) {
-    return;
-  }
-
-  target->resize(static_cast<size_t>(region.width) * region.height, 0.0);
-
-  const double scale_x = static_cast<double>(source_width) / static_cast<double>(full_width);
-  const double scale_y = static_cast<double>(source_height) / static_cast<double>(full_height);
-  #pragma omp parallel for schedule(static) if(region.height > 100)
-  for (uint32_t row = 0; row < region.height; ++row) {
-    const double y = (static_cast<double>(region.y + row) + 0.5) * scale_y - 0.5;
-    const int y0 = static_cast<int>(std::floor(y));
-    const int y1 = y0 + 1;
-    const double wy = y - std::floor(y);
-    const uint32_t sy0 = static_cast<uint32_t>(std::clamp(y0, 0, static_cast<int>(source_height) - 1));
-    const uint32_t sy1 = static_cast<uint32_t>(std::clamp(y1, 0, static_cast<int>(source_height) - 1));
-    for (uint32_t col = 0; col < region.width; ++col) {
-      const double x = (static_cast<double>(region.x + col) + 0.5) * scale_x - 0.5;
-      const int x0 = static_cast<int>(std::floor(x));
-      const int x1 = x0 + 1;
-      const double wx = x - std::floor(x);
-      const uint32_t sx0 = static_cast<uint32_t>(std::clamp(x0, 0, static_cast<int>(source_width) - 1));
-      const uint32_t sx1 = static_cast<uint32_t>(std::clamp(x1, 0, static_cast<int>(source_width) - 1));
-
-      const double v00 = source[static_cast<size_t>(sy0) * source_width + sx0];
-      const double v01 = source[static_cast<size_t>(sy0) * source_width + sx1];
-      const double v10 = source[static_cast<size_t>(sy1) * source_width + sx0];
-      const double v11 = source[static_cast<size_t>(sy1) * source_width + sx1];
-      const double top = (1.0 - wx) * v00 + wx * v01;
-      const double bottom = (1.0 - wx) * v10 + wx * v11;
-      (*target)[static_cast<size_t>(row) * region.width + col] =
-          (1.0 - wy) * top + wy * bottom;
-    }
-  }
 }
 
 struct BilinearAxisSample {
