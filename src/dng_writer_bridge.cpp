@@ -1716,6 +1716,9 @@ void ConfigureHost(dng_host& host, const std::string& compression) {
   host.SetSaveLinearDNG(true);
   host.SetLosslessJXL(compression == "jpeg-xl");
   host.SetLossyMosaicJXL(false);
+  // The stock SDK writer always picks lossless JPEG for 16-bit payloads; the
+  // bundled SDK patch adds this flag so Deflate can actually be requested.
+  host.SetSaveDeflate(compression == "deflate");
 }
 
 bool IsSupportedWriteCompression(const std::string& compression) {

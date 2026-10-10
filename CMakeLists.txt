@@ -28,6 +28,112 @@ if(NOT EXISTS "${HIRACO_DNG_SDK_ROOT}/xmp/toolkit/public/include/XMP.incl_cpp")
   message(FATAL_ERROR "Bundled Adobe XMP toolkit sources were not found under ${HIRACO_DNG_SDK_ROOT}. Ensure the full Adobe DNG SDK bundle is present.")
 endif()
 
+# ---------------------------------------------------------------------------
+# Versioned Adobe DNG SDK patches.
+#
+# The bundled SDK is a pristine, gitignored vendor drop. Where the SDK offers
+# no public API for something Hiraco needs, the fix is kept as a patch named
+# `patches/<sdk-directory-name>_<topic>.patch` and applied here during
+# configure. Embedding the SDK directory name (for example dng_sdk_1_7_1)
+# encodes the SDK version in the filename, so a patch is never silently
+# applied to a different SDK release than the one it was generated against.
+# Applying in place also re-applies automatically when the SDK bundle is
+# refreshed, and stays a no-op when it has already been applied.
+# ---------------------------------------------------------------------------
+function(hiraco_apply_sdk_patch topic marker)
+  foreach(relative_path IN LISTS HIRACO_SDK_PATCH_FILES)
+    set(absolute_path "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}")
+    if(NOT EXISTS "${absolute_path}")
+      message(FATAL_ERROR
+        "DNG SDK patch ${topic} targets a missing file: ${relative_path}")
+    endif()
+  endforeach()
+
+  # The SDK directory name carries the version, for example dng_sdk_1_7_1.
+  get_filename_component(sdk_version_tag "${HIRACO_DNG_SDK_ROOT}" NAME)
+
+  # Clear any .rej/.orig debris left behind by an interrupted apply. This runs
+  # before the idempotency check so a stale file is never left in place.
+  foreach(relative_path IN LISTS HIRACO_SDK_PATCH_FILES)
+    get_filename_component(touched_directory
+      "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}" PATH)
+    file(GLOB stale_patch_debris
+      "${touched_directory}/*.rej" "${touched_directory}/*.orig")
+    foreach(stale_file IN LISTS stale_patch_debris)
+      file(REMOVE "${stale_file}")
+    endforeach()
+  endforeach()
+
+  # Skip when every touched file already carries this patch's marker. This makes
+  # configure idempotent and avoids relying on patch exit codes.
+  set(needs_apply FALSE)
+  foreach(relative_path IN LISTS HIRACO_SDK_PATCH_FILES)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}" touched_content)
+    string(FIND "${touched_content}" "${marker}" marker_position)
+    if(marker_position EQUAL -1)
+      set(needs_apply TRUE)
+    endif()
+  endforeach()
+  if(NOT needs_apply)
+    message(STATUS "DNG SDK patch ${topic} already applied to ${sdk_version_tag}.")
+    return()
+  endif()
+
+  # The SDK directory name already resolved above; fall through to patch lookup.
+  set(patch_file "${CMAKE_CURRENT_SOURCE_DIR}/patches/${sdk_version_tag}_${topic}.patch")
+  if(NOT EXISTS "${patch_file}")
+    message(WARNING
+      "No DNG SDK patch ${patch_file}; the bundled SDK has not been patched for ${topic}.")
+    return()
+  endif()
+
+  find_program(HIRACO_PATCH_EXECUTABLE patch)
+  if(NOT HIRACO_PATCH_EXECUTABLE)
+    message(FATAL_ERROR
+      "A patch executable is required to apply DNG SDK patch ${patch_file} but none was found.")
+  endif()
+
+  # The marker check above keeps this a no-op once the patch is in place. Any
+  # leftover .rej/.orig files from an interrupted run would be stale debris, so
+  # clear them before applying and refuse to leave any behind afterwards.
+  # The marker check above keeps this a no-op once the patch is in place; -N
+  # additionally ignores any already-applied hunks.
+  message(STATUS
+    "Applying DNG SDK patch ${topic} to ${sdk_version_tag}: ${HIRACO_SDK_PATCH_FILES}")
+  execute_process(
+    COMMAND "${HIRACO_PATCH_EXECUTABLE}" -p1 -N --forward --no-backup-if-mismatch
+            -i "${patch_file}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE patch_result
+    OUTPUT_QUIET
+    ERROR_VARIABLE patch_stderr)
+  if(NOT patch_result EQUAL 0)
+    message(FATAL_ERROR "Failed to apply DNG SDK patch ${patch_file}: ${patch_stderr}")
+  endif()
+
+  # A rejected hunk means the bundle does not match the patch it claims to be
+  # for, so surface it instead of silently leaving a partially patched tree.
+  foreach(relative_path IN LISTS HIRACO_SDK_PATCH_FILES)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}.rej")
+      file(READ "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}.rej" reject_content)
+      file(REMOVE "${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}.rej")
+      message(FATAL_ERROR
+        "DNG SDK patch ${patch_file} was rejected by ${relative_path}; the bundled "
+        "SDK does not match the version this patch was generated against.\n${reject_content}")
+    endif()
+  endforeach()
+endfunction()
+
+option(HIRACO_APPLY_SDK_PATCHES "Apply bundled Adobe DNG SDK patches during configure" ON)
+
+# Deflate (Compression=8) for 16-bit linear raw. The stock SDK writer always
+# picks lossless JPEG for ttShort payloads and exposes no way to request it.
+set(HIRACO_SDK_PATCH_FILES
+  dng_sdk_1_7_1/dng_sdk/source/dng_host.h
+  dng_sdk_1_7_1/dng_sdk/source/dng_image_writer.cpp
+)
+hiraco_apply_sdk_patch(deflate "SaveDeflate")
+
 # Find ZLIB first
 find_package(ZLIB REQUIRED)
 
