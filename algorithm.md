@@ -377,8 +377,10 @@ or non-empty text field.
    per-image remove button.
 4. Rebuild the inspector around direct settings, presets, and the expandable
    output options.
-5. Benchmark full-preview refresh on the M4 Pro and add core regression tests
-   for full-preview dimensions, orientation, cancellation, and cache reuse.
+5. Add core regression tests for full-preview dimensions, orientation,
+   cancellation, and cache reuse.  These now live in
+   `tests/hiraco_core_tests.cpp`.  Benchmarking full-preview refresh on the M4
+   Pro is still outstanding (tracked as I-14).
 
 ## 12. Related Files
 
