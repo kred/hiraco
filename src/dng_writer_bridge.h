@@ -36,8 +36,6 @@ bool EstimatePreviewAutoBrightGainFromRaw(const std::string& source_path,
 
 bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                  const SourceLinearDngMetadata& metadata,
-                                 const std::string& highlight_recovery_source_path,
-                                 bool enable_highlight_recovery,
                                  uint32_t source_width,
                                  uint32_t source_height,
                                  const CropRect& crop_rect,

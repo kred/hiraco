@@ -3276,14 +3276,10 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
 
 bool BuildLinearDngPayload(const std::string& source_path,
                            const SourceLinearDngMetadata& metadata,
-                           const std::string& highlight_recovery_source_path,
-                           bool enable_highlight_recovery,
                            const LibRawOverrideSet& libraw_overrides,
                            LinearDngPayload* payload,
                            std::string* error_message) {
   const hiraco::ScopedTimingLog payload_timer("convert", "Build linear DNG payload");
-  (void) highlight_recovery_source_path;
-  (void) enable_highlight_recovery;
   const RenderSettings raw_settings = BuildRawRenderSettings(metadata, libraw_overrides);
   const bool needs_cfa_guide = metadata.has_predicted_detail_gain &&
                                metadata.predicted_detail_gain > 1.0001 &&
@@ -3975,8 +3971,6 @@ bool EstimatePreviewAutoBrightGainFromRaw(const std::string& source_path,
 
 bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                  const SourceLinearDngMetadata& metadata,
-                                 const std::string& highlight_recovery_source_path,
-                                 bool enable_highlight_recovery,
                                  uint32_t source_width,
                                  uint32_t source_height,
                                  const CropRect& crop_rect,
@@ -3986,8 +3980,6 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                  CancelCheck cancel,
                                  std::string* error_message) {
   const hiraco::ScopedTimingLog cache_timer("cache", "Build processing cache");
-  (void) highlight_recovery_source_path;
-  (void) enable_highlight_recovery;
   if (cache == nullptr) {
     if (error_message != nullptr) {
       *error_message = "missing processing cache";
@@ -4393,8 +4385,6 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       const hiraco::ScopedTimingLog timer("convert", "Prepare source payload");
       if (!BuildLinearDngPayload(source_path,
                                  metadata,
-                                 highlight_recovery_source_path,
-                                 enable_highlight_recovery,
                                  libraw_overrides,
                                  &payload,
                                  &render_error)) {
@@ -4604,8 +4594,6 @@ bool EstimatePreviewAutoBrightGainFromRaw(const std::string&,
 
 bool BuildProcessingCacheFromRaw(const std::string&,
                                  const SourceLinearDngMetadata&,
-                                 const std::string&,
-                                 bool,
                                  uint32_t,
                                  uint32_t,
                                  const CropRect&,
