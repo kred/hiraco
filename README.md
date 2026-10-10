@@ -113,7 +113,7 @@ cmake -S . -B build -DHIRACO_BUILD_TESTS=ON
 The CLI currently exposes one command:
 
 ```bash
-./build/release/hiraco-cli convert <source> <output> [--compression uncompressed|deflate|jpeg-xl] [--debug]
+./build/release/hiraco-cli convert <source> <output> [--compression uncompressed|deflate|jpeg-xl] [--hl-rec] [--debug]
 ```
 
 Examples:
@@ -122,9 +122,12 @@ Examples:
 ./build/release/hiraco-cli convert _3210505.ORF output.dng --compression uncompressed
 ./build/release/hiraco-cli convert _3210505.ORF output.dng --compression deflate
 ./build/release/hiraco-cli convert _3210505.ORI output.dng --compression jpeg-xl --debug
+./build/release/hiraco-cli convert _3210505.ORF output.dng --hl-rec
 ```
 
-`--debug` enables timing logs for the main processing phases.
+`--debug` enables timing logs for the main processing phases.  `--hl-rec`
+enables ORI-assisted highlight recovery when a companion file is detected next to
+the source; it is off by default and has no effect when no companion is found.
 
 ### GUI
 

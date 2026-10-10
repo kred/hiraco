@@ -185,8 +185,8 @@ for the first existing filename in this order:
    for example, `<stem>_..orf`)
 
 The GUI exposes this as a per-file `HL Rec` switch, which is **off by default**.
-The label is `n/a` if no candidate file was found.  The CLI does not currently
-expose a switch for this feature.
+The label is `n/a` if no candidate file was found.  The CLI exposes the same
+feature as `--hl-rec`, also **off by default**.
 
 Detection is intentionally only a same-directory filename lookup today.  It does
 not yet validate capture time, exposure, ISO, camera identity, dimensions, or

@@ -10,8 +10,9 @@
 namespace {
 
 int PrintUsage() {
-  std::cerr << "usage: hiraco-cli convert <source> <output> [--compression uncompressed|deflate|jpeg-xl] [--debug]\n";
+  std::cerr << "usage: hiraco-cli convert <source> <output> [--compression uncompressed|deflate|jpeg-xl] [--hl-rec] [--debug]\n";
   std::cerr << "default compression: deflate\n";
+  std::cerr << "--hl-rec enables ORI-assisted highlight recovery when a companion is detected\n";
   return 2;
 }
 
@@ -39,11 +40,14 @@ int main(int argc, char** argv) {
   const std::string output_path = argv[3];
   std::string compression_text = "deflate";
   bool debug = false;
+  bool hl_rec = false;
 
   for (int index = 4; index < argc; ++index) {
     const std::string arg = argv[index];
     if (arg == "--compression" && index + 1 < argc) {
       compression_text = argv[++index];
+    } else if (arg == "--hl-rec") {
+      hl_rec = true;
     } else if (arg == "--debug") {
       debug = true;
     } else {
@@ -67,6 +71,10 @@ int main(int argc, char** argv) {
     std::cerr << "Error: " << error_message << "\n";
     return 1;
   }
+
+  // ShouldUseHighlightRecovery() also requires a detected companion, so this is
+  // a no-op for sources without one.
+  prepared.enable_highlight_recovery = hl_rec;
 
   const StageOverrideSet stage_overrides = ReadStageOverridesFromEnvironment();
   const LibRawOverrideSet libraw_overrides = ReadLibRawOverridesFromEnvironment();
