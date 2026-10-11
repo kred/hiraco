@@ -3803,6 +3803,9 @@ ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata
 
 namespace {
 
+// Smallest fraction advance worth reporting during an indeterminate sweep.
+constexpr double kTimedProgressStep = 0.001;
+
 class CallbackAbortSniffer final : public dng_abort_sniffer {
  public:
   CallbackAbortSniffer(ProgressCallback progress, CancelCheck cancel)
@@ -3814,17 +3817,23 @@ class CallbackAbortSniffer final : public dng_abort_sniffer {
 
   // Some SDK operations (notably JPEG-XL lossless compression) do not emit
   // StartTask/UpdateProgress callbacks even though they can run for minutes.
-  // They do call Sniff() regularly, so use that hook to advance a coarse,
-  // time-based estimate across [start_fraction, end_fraction] while the
-  // operation runs. This keeps the CLI/GUI from appearing hung.
+  // They do call Sniff() regularly, so use that hook to keep the UI moving for
+  // as long as the operation runs. This keeps the CLI/GUI from appearing hung.
+  //
+  // The movement is an indeterminate sweep, not a completion estimate. There is
+  // deliberately no expected-duration parameter: any wall-clock estimate encodes
+  // one machine's throughput, and once it elapsed the bar would freeze for the
+  // remainder of the operation - exactly the stall this was added to remove. The
+  // sweep period is pure visual pacing and never signals that work is nearly
+  // finished.
   void BeginTimedProgress(const std::string& message,
                           double start_fraction,
                           double end_fraction,
-                          double expected_seconds) {
+                          double sweep_seconds) {
     timed_message_ = message;
     timed_start_fraction_ = start_fraction;
     timed_end_fraction_ = end_fraction;
-    timed_expected_seconds_ = expected_seconds > 0.001 ? expected_seconds : 0.001;
+    timed_sweep_seconds_ = sweep_seconds > 0.001 ? sweep_seconds : 0.001;
     timed_start_time_ = std::chrono::steady_clock::now();
     timed_last_fraction_.store(start_fraction, std::memory_order_relaxed);
     timed_active_.store(true, std::memory_order_release);
@@ -3844,11 +3853,23 @@ class CallbackAbortSniffer final : public dng_abort_sniffer {
     }
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - timed_start_time_).count();
-    const double ratio = std::clamp(elapsed / timed_expected_seconds_, 0.0, 1.0);
+    // Sweep the range repeatedly rather than climbing toward a finish line, so
+    // the bar keeps moving however long the operation takes.
+    const double sweep_seconds = timed_sweep_seconds_;
+    const double sweep_phase = std::fmod(elapsed, sweep_seconds) / sweep_seconds;
     const double fraction =
-        timed_start_fraction_ + (timed_end_fraction_ - timed_start_fraction_) * ratio;
+        timed_start_fraction_ +
+        (timed_end_fraction_ - timed_start_fraction_) * sweep_phase;
     const double last = timed_last_fraction_.load(std::memory_order_relaxed);
-    if (fraction >= last + 0.005) {
+    // A fresh sweep cycle intentionally restarts at the bottom of the range;
+    // that relaxation before moving again is what reads as busy work rather
+    // than a stuck bar.
+    if (fraction + kTimedProgressStep < last) {
+      timed_last_fraction_.store(timed_start_fraction_, std::memory_order_relaxed);
+      ReportProgress(progress_, "convert", timed_start_fraction_, timed_message_);
+      return;
+    }
+    if (fraction >= last + kTimedProgressStep) {
       timed_last_fraction_.store(fraction, std::memory_order_relaxed);
       ReportProgress(progress_, "convert", fraction, timed_message_);
     }
@@ -3875,7 +3896,7 @@ class CallbackAbortSniffer final : public dng_abort_sniffer {
   std::string timed_message_;
   double timed_start_fraction_ = 0.0;
   double timed_end_fraction_ = 0.0;
-  double timed_expected_seconds_ = 1.0;
+  double timed_sweep_seconds_ = 1.0;
   std::chrono::steady_clock::time_point timed_start_time_{};
 };
 
@@ -4465,7 +4486,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     dng_image_writer writer;
     if (compression == "jpeg-xl") {
       ReportProgress(progress, "convert", 0.92, "Compressing JPEG-XL");
-      sniffer.BeginTimedProgress("Compressing JPEG-XL", 0.92, 0.95, 120.0);
+      sniffer.BeginTimedProgress("Compressing JPEG-XL", 0.92, 0.95, 8.0);
       {
         const hiraco::ScopedTimingLog timer("convert", "LosslessCompressJXL");
         negative->LosslessCompressJXL(host, writer, false);

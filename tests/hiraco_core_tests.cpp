@@ -1,4 +1,5 @@
 #include "dng_writer_bridge.h"
+#include "dng_sdk_bridge.h"
 #include "hiraco_core.h"
 
 #include <algorithm>
@@ -451,18 +452,20 @@ void TestLocalOm3RecoveryFullPreviewSmoke() {
          "recovery-enabled full preview should retain the normal preview dimensions");
 }
 
-// Resolves a repository fixture relative to the test source file, so the test
-// works no matter which directory ctest runs it from. Returns an empty path
-// when the fixture is absent; callers skip cleanly in that case.
+// Resolves a repository fixture relative to this test file, so the test works
+// no matter which directory ctest runs it from. Always returns a non-empty
+// path and never touches the filesystem; callers must check existence
+// themselves, since the .ORF fixtures are gitignored.
 std::filesystem::path RealOrfFixturePath(const std::string& relative_path) {
   return std::filesystem::path(__FILE__).parent_path().parent_path() / relative_path;
 }
 
 void TestFullPreviewObeysDisplayDimension() {
   const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // The .ORF fixtures are gitignored, so an absent fixture means a broken
+  // checkout rather than a reason to pass vacuously.
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -513,9 +516,10 @@ void TestFullPreviewOrientationMatchesLibRawFlip() {
   // dimensions are not the source dimensions. What must hold is that the
   // oriented aspect ratio and the axis-swap decision survive the scaling.
   const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // The .ORF fixtures are gitignored, so an absent fixture means a broken
+  // checkout rather than a reason to pass vacuously.
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -549,9 +553,10 @@ void TestFullPreviewOrientationMatchesLibRawFlip() {
 
 void TestFullPreviewHonoursCancellation() {
   const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // The .ORF fixtures are gitignored, so an absent fixture means a broken
+  // checkout rather than a reason to pass vacuously.
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -581,9 +586,10 @@ void TestFullPreviewHonoursCancellation() {
 
 void TestFullPreviewReusesCachedPreview() {
   const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // The .ORF fixtures are gitignored, so an absent fixture means a broken
+  // checkout rather than a reason to pass vacuously.
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -612,6 +618,51 @@ void TestFullPreviewReusesCachedPreview() {
          "a cached full preview should retain its geometry");
   Expect(second->pixels == cached_copy.pixels,
          "a cached full preview should return identical pixel data");
+}
+
+// BuildDngWriterConfigSummary is the only externally visible view of both the
+// compression code and the DNG version Hiraco requests. DngVersionForCompression
+// has internal linkage, but summary.dng_version is derived directly from it, so
+// asserting on these strings pins I-01 (which code each mode asks for) and I-03
+// (that the requested version is the one the SDK actually writes).
+void TestDngWriterConfigSummaryReportsRequestedVersionAndCode() {
+  const auto check_mode = [](const std::string& mode,
+                             unsigned expected_code,
+                             const std::string& expected_version) {
+    const DngWriterConfigSummary summary = BuildDngWriterConfigSummary(mode);
+    Expect(summary.can_configure_writer,
+           mode + " mode should be configurable by the writer");
+    Expect(summary.compression_name == mode,
+           mode + " mode should report its own name, got " + summary.compression_name);
+    Expect(summary.compression_code == expected_code,
+           mode + " mode should request compression code " + std::to_string(expected_code) +
+               ", got " + std::to_string(summary.compression_code));
+    Expect(summary.dng_version == expected_version,
+           mode + " mode should request DNG " + expected_version +
+               ", got " + summary.dng_version);
+    // The status string is human-readable output, but it must not contradict
+    // the version the summary actually reports.
+    Expect(summary.status.find("DNG " + expected_version) != std::string::npos,
+           mode + " status string should mention DNG " + expected_version +
+               ", got: " + summary.status);
+  };
+
+  check_mode("uncompressed", 1u, "1.4.0.0");
+  check_mode("deflate", 8u, "1.4.0.0");
+  check_mode("jpeg-xl", 52546u, "1.7.0.0");
+
+  // jpeg-x is the only experimental mode.
+  const DngWriterConfigSummary jpeg_x = BuildDngWriterConfigSummary("jpeg-xl");
+  Expect(jpeg_x.experimental && jpeg_x.lossless_jpeg_xl,
+         "jpeg-xl mode should be flagged experimental and lossless");
+  const DngWriterConfigSummary deflate = BuildDngWriterConfigSummary("deflate");
+  Expect(!deflate.experimental,
+         "deflate mode should not be flagged experimental");
+
+  // An unknown mode must not be silently presented as configurable.
+  const DngWriterConfigSummary unsupported = BuildDngWriterConfigSummary("nope");
+  Expect(!unsupported.can_configure_writer,
+         "an unsupported compression mode should not be configurable");
 }
 
 void TestCropPreviewMatchesFullImageCrop() {
@@ -802,6 +853,7 @@ int main() {
     TestFullPreviewOrientationMatchesLibRawFlip();
     TestFullPreviewHonoursCancellation();
     TestFullPreviewReusesCachedPreview();
+    TestDngWriterConfigSummaryReportsRequestedVersionAndCode();
     TestCropPreviewMatchesFullImageCrop();
     TestDisplayProcessingCacheScalesBothInputs();
     TestStage2SmallMediumLargeGainResponse();

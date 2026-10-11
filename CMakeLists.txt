@@ -93,9 +93,6 @@ function(hiraco_apply_sdk_patch topic marker)
       "A patch executable is required to apply DNG SDK patch ${patch_file} but none was found.")
   endif()
 
-  # The marker check above keeps this a no-op once the patch is in place. Any
-  # leftover .rej/.orig files from an interrupted run would be stale debris, so
-  # clear them before applying and refuse to leave any behind afterwards.
   # The marker check above keeps this a no-op once the patch is in place; -N
   # additionally ignores any already-applied hunks.
   message(STATUS

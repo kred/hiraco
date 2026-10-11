@@ -4,7 +4,9 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -80,17 +82,21 @@ int main(int argc, char** argv) {
   const LibRawOverrideSet libraw_overrides = ReadLibRawOverridesFromEnvironment();
   // --debug surfaces the progress callback, which is the only way to observe that
   // the long JPEG-XL compression phase advances instead of appearing hung.
+  // The callback is invoked from the DNG SDK's worker threads via Sniff(), so
+  // format each line completely and emit it under a mutex; otherwise concurrent
+  // calls can interleave their << chains and garble the log.
   const auto log_progress = [enabled = debug](const ProcessingProgress& update) {
     if (!enabled) {
       return;
     }
-    const std::ios::fmtflags flags = std::cerr.flags();
-    const std::streamsize precision = std::cerr.precision();
-    std::cerr << std::fixed << std::setprecision(3)
-              << "[hiraco][progress][" << update.phase << "] "
-              << update.fraction << " " << update.message << "\n";
-    std::cerr.flags(flags);
-    std::cerr.precision(precision);
+    std::ostringstream line;
+    line << std::fixed << std::setprecision(3)
+         << "[hiraco][progress][" << update.phase << "] "
+         << update.fraction << " " << update.message << "\n";
+
+    static std::mutex progress_log_mutex;
+    const std::lock_guard<std::mutex> lock(progress_log_mutex);
+    std::cerr << line.str();
   };
 
   const DngWriteResult result = ConvertToDng(prepared,

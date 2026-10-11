@@ -16,7 +16,7 @@
  		
 +		// Do we want to request Deflate (ZIP) compression for the raw image?
 +		
-+		bool fSaveDeflate;
++		bool fSaveDeflate = false;
 +		
  		// Do we want to create JXL compressed in saved DNGs?
  		
@@ -28,7 +28,7 @@
 +		/// Setter for flag determining whether to request Deflate (ZIP) compression.
 +		/// \param want If true, request Deflate for compressible raw image data.
 +
-+		bool SetSaveDeflate (bool want)
++		void SetSaveDeflate (bool want)
 +			{
 +			fSaveDeflate = want;
 +			}

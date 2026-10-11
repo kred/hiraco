@@ -2135,6 +2135,8 @@ class HiracoMainFrame final : public wxFrame {
     if (progress.phase == "enhance") {
       return 0.10 + 0.80 * fraction;
     }
+    // The write phase starts where I-02 ends JPEG-XL compression (0.92..0.95)
+    // and leaves headroom below 1.0, which conversion completion reports itself.
     if (progress.phase == "write") {
       return 0.95 + 0.04 * fraction;
     }
