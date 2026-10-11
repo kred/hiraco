@@ -23,6 +23,10 @@ void Expect(bool condition, const std::string& message) {
 // no matter which directory ctest runs it from. Always returns a non-empty
 // path and never touches the filesystem; callers must check existence
 // themselves, since the .ORF fixtures are gitignored.
+//
+// Resolving from __FILE__ rather than the process CWD is load-bearing: ctest
+// runs tests with the build directory as CWD, so a bare "reference/..." path
+// resolves to nothing there and the guard would silently skip.
 std::filesystem::path RealOrfFixturePath(const std::string& relative_path) {
   return std::filesystem::path(__FILE__).parent_path().parent_path() / relative_path;
 }
