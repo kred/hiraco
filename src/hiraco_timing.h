@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 #include <string>
 
 namespace hiraco {
@@ -31,6 +33,15 @@ inline bool TimingLoggingEnabled() {
   return enabled;
 }
 
+// One mutex guarding all --debug diagnostic output on std::cerr. Timing logs and
+// the CLI progress callback are both reachable from SDK worker threads, so they
+// must share a single lock to serialise whole lines. Owning it here keeps it a
+// single instance across every translation unit (inline function-local static).
+inline std::mutex& DiagnosticsLogMutex() {
+  static std::mutex diagnostics_log_mutex;
+  return diagnostics_log_mutex;
+}
+
 inline void LogTiming(const std::string& pipeline,
                       const std::string& step,
                       std::chrono::steady_clock::duration elapsed,
@@ -40,19 +51,23 @@ inline void LogTiming(const std::string& pipeline,
   }
 
   const double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-  const std::ios::fmtflags flags = std::cerr.flags();
-  const std::streamsize precision = std::cerr.precision();
 
-  std::cerr << std::fixed << std::setprecision(1)
-            << "[hiraco][timing][" << pipeline << "] "
-            << step << ": " << elapsed_ms << " ms";
+  // Build the line in a private stream and emit it under the shared diagnostics
+  // mutex, so timing output emitted from SDK worker threads cannot interleave
+  // with the progress logger (or with another LogTiming call) mid-line. This
+  // also avoids mutating std::cerr's format state, which the old code saved and
+  // restored around every call and could clobber concurrently.
+  std::ostringstream line;
+  line << std::fixed << std::setprecision(1)
+       << "[hiraco][timing][" << pipeline << "] "
+       << step << ": " << elapsed_ms << " ms";
   if (!detail.empty()) {
-    std::cerr << " (" << detail << ")";
+    line << " (" << detail << ")";
   }
-  std::cerr << "\n";
+  line << "\n";
 
-  std::cerr.flags(flags);
-  std::cerr.precision(precision);
+  const std::lock_guard<std::mutex> lock(DiagnosticsLogMutex());
+  std::cerr << line.str();
 }
 
 class ScopedTimingLog {

@@ -9,6 +9,8 @@
 #include <sstream>
 #include <string>
 
+#include "hiraco_timing.h"
+
 namespace {
 
 int PrintUsage() {
@@ -83,8 +85,9 @@ int main(int argc, char** argv) {
   // --debug surfaces the progress callback, which is the only way to observe that
   // the long JPEG-XL compression phase advances instead of appearing hung.
   // The callback is invoked from the DNG SDK's worker threads via Sniff(), so
-  // format each line completely and emit it under a mutex; otherwise concurrent
-  // calls can interleave their << chains and garble the log.
+  // format each line completely and emit it under the shared diagnostics mutex;
+  // otherwise concurrent calls could interleave their << chains, or interleave
+  // with the timing logs, and garble the log.
   const auto log_progress = [enabled = debug](const ProcessingProgress& update) {
     if (!enabled) {
       return;
@@ -94,8 +97,7 @@ int main(int argc, char** argv) {
          << "[hiraco][progress][" << update.phase << "] "
          << update.fraction << " " << update.message << "\n";
 
-    static std::mutex progress_log_mutex;
-    const std::lock_guard<std::mutex> lock(progress_log_mutex);
+    const std::lock_guard<std::mutex> lock(hiraco::DiagnosticsLogMutex());
     std::cerr << line.str();
   };
 
