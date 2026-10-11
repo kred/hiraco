@@ -19,6 +19,15 @@ void Expect(bool condition, const std::string& message) {
   }
 }
 
+// Resolves a repository fixture relative to this test file, so the test works
+// no matter which directory ctest runs it from. Always returns a non-empty
+// path and never touches the filesystem; callers must check existence
+// themselves, since the .ORF fixtures are gitignored.
+std::filesystem::path RealOrfFixturePath(const std::string& relative_path) {
+  return std::filesystem::path(__FILE__).parent_path().parent_path() / relative_path;
+}
+
+
 RasterImage MakeSyntheticRgb(uint32_t width, uint32_t height) {
   RasterImage image;
   image.width = width;
@@ -317,10 +326,11 @@ void TestEnhancementPreservesHighlightHeadroom() {
 }
 
 void TestRealOrfPreviewSmoke() {
-  const std::filesystem::path source_path = std::filesystem::path("reference") / "_3210504.ORF";
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // .ORF fixtures are gitignored, and ctest runs with the build directory as
+  // the CWD, so resolve from this test file and fail loudly rather than skip.
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -345,10 +355,11 @@ void TestRealOrfPreviewSmoke() {
 }
 
 void TestRealOrfCropPreviewFollowsCropRect() {
-  const std::filesystem::path source_path = std::filesystem::path("reference") / "_3210504.ORF";
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // .ORF fixtures are gitignored, and ctest runs with the build directory as
+  // the CWD, so resolve from this test file and fail loudly rather than skip.
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -381,10 +392,11 @@ void TestRealOrfCropPreviewFollowsCropRect() {
 }
 
 void TestRealOrfPreviewAutoBrightGainEstimate() {
-  const std::filesystem::path source_path = std::filesystem::path("reference") / "_3210504.ORF";
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // .ORF fixtures are gitignored, and ctest runs with the build directory as
+  // the CWD, so resolve from this test file and fail loudly rather than skip.
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -407,11 +419,9 @@ void TestLocalOm3RecoveryFullPreviewSmoke() {
   // The sample directory is intentionally untracked. Exercise the
   // display-resolution recovery mapping when a local OM-3 ORF/ORI pair is
   // available, without making the portable test suite depend on that fixture.
-  const std::filesystem::path source_path =
-      std::filesystem::path(__FILE__).parent_path().parent_path() / "sample" / "_8142491.ORF";
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  const std::filesystem::path source_path = RealOrfFixturePath("sample/_8142491.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -450,14 +460,6 @@ void TestLocalOm3RecoveryFullPreviewSmoke() {
   Expect(recovery_preview->width == normal_preview->width &&
              recovery_preview->height == normal_preview->height,
          "recovery-enabled full preview should retain the normal preview dimensions");
-}
-
-// Resolves a repository fixture relative to this test file, so the test works
-// no matter which directory ctest runs it from. Always returns a non-empty
-// path and never touches the filesystem; callers must check existence
-// themselves, since the .ORF fixtures are gitignored.
-std::filesystem::path RealOrfFixturePath(const std::string& relative_path) {
-  return std::filesystem::path(__FILE__).parent_path().parent_path() / relative_path;
 }
 
 void TestFullPreviewObeysDisplayDimension() {
