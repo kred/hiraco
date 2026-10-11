@@ -1909,26 +1909,6 @@ void ApplyOm3HighResCfaPrecondition(const SourceLinearDngMetadata& metadata,
   std::copy(updated.begin(), updated.end(), raw);
 }
 
-RasterImage MakeSyntheticRgbImage() {
-  RasterImage image;
-  image.width = 48;
-  image.height = 32;
-  image.colors = 3;
-  image.bits = 16;
-  image.pixels.resize(static_cast<size_t>(image.width) * image.height * image.colors);
-
-  for (uint32_t row = 0; row < image.height; ++row) {
-    for (uint32_t col = 0; col < image.width; ++col) {
-      const size_t index = (static_cast<size_t>(row) * image.width + col) * image.colors;
-      image.pixels[index + 0] = static_cast<uint16_t>((col * 65535u) / (image.width - 1));
-      image.pixels[index + 1] = static_cast<uint16_t>((row * 65535u) / (image.height - 1));
-      image.pixels[index + 2] = static_cast<uint16_t>(((row + col) * 65535u) / (image.width + image.height - 2));
-    }
-  }
-
-  return image;
-}
-
 bool RenderLibRawImage(const std::string& source_path,
                        const SourceLinearDngMetadata& metadata,
                        const RenderSettings& settings,
@@ -4518,54 +4498,6 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
   return result;
 }
 
-DngWriteResult WriteSyntheticLinearDng(const std::string& output_path,
-                                       const std::string& compression) {
-  DngWriteResult result;
-
-  if (!IsSupportedWriteCompression(compression)) {
-    result.message = UnsupportedCompressionMessage(compression);
-    return result;
-  }
-
-  try {
-    RasterImage processed = MakeSyntheticRgbImage();
-    PreviewImage preview_image = BuildPreviewImage(processed, 256);
-
-    dng_host host;
-    ConfigureHost(host, compression);
-
-    AutoPtr<dng_negative> negative(host.Make_dng_negative());
-    PopulateLinearRawNegative(host, "synthetic-gradient.raw", processed, SourceLinearDngMetadata(), *negative.Get(), 1.0);
-
-    dng_preview_list preview_list;
-    AppendImagePreview(host, preview_image, &preview_list);
-
-    dng_file_stream stream(output_path.c_str(), true);
-    dng_image_writer writer;
-    if (compression == "jpeg-xl") {
-      const hiraco::ScopedTimingLog timer("convert", "LosslessCompressJXL");
-      negative->LosslessCompressJXL(host, writer, false);
-    }
-
-    writer.WriteDNG(host,
-                    stream,
-                    *negative.Get(),
-                    &preview_list,
-                    DngVersionForCompression(compression),
-                    compression == "uncompressed");
-    stream.Flush();
-
-    result.ok = true;
-    result.message = "synthetic linear DNG write succeeded";
-  } catch (const dng_exception& exc) {
-    result.message = exc.what();
-  } catch (const std::exception& exc) {
-    result.message = exc.what();
-  }
-
-  return result;
-}
-
 #else
 
 DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string&) {
@@ -4685,12 +4617,6 @@ DngWriteResult WriteLinearDngFromRaw(const std::string&,
                                      double,
                                      ProgressCallback,
                                      CancelCheck) {
-  DngWriteResult result;
-  result.message = "Adobe DNG SDK integration not enabled in this build";
-  return result;
-}
-
-DngWriteResult WriteSyntheticLinearDng(const std::string&, const std::string&) {
   DngWriteResult result;
   result.message = "Adobe DNG SDK integration not enabled in this build";
   return result;

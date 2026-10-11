@@ -86,6 +86,3 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      double preview_auto_bright_gain = 1.0,
                                      ProgressCallback progress = {},
                                      CancelCheck cancel = {});
-
-DngWriteResult WriteSyntheticLinearDng(const std::string& output_path,
-                                       const std::string& compression);
