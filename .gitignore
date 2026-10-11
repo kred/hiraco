@@ -32,3 +32,7 @@ tmp/
 bin/
 obj/
 .vscode/
+
+# Patch leftovers from the DNG SDK patch machinery in CMakeLists.txt.
+*.rej
+*.orig

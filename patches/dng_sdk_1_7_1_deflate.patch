@@ -1,0 +1,61 @@
+# Hiraco: Deflate compression patch for the bundled Adobe DNG SDK 1.7.1
+#
+# The stock dng_image_writer always selects lossless JPEG (ccJPEG) for 16-bit
+# (ttShort) raw payloads and exposes no way for a caller to request Adobe
+# Deflate (ccDeflate). This patch adds an opt-in flag on dng_host and honours
+# it in the compression-selection fallback so Hiraco can actually emit
+# Compression=8 for `--compression deflate`.
+#
+# Applies to the SDK bundle in dng_sdk_1_7_1 only. CMakeLists.txt applies this
+# file automatically during configure when the bundled SDK version matches.
+--- a/dng_sdk_1_7_1/dng_sdk/source/dng_host.h
++++ b/dng_sdk_1_7_1/dng_sdk/source/dng_host.h
+@@ -98,6 +98,10 @@
+ 		
+ 		bool fSaveLinearDNG;
+ 		
++		// Do we want to request Deflate (ZIP) compression for the raw image?
++		
++		bool fSaveDeflate = false;
++		
+ 		// Do we want to create JXL compressed in saved DNGs?
+ 		
+ 		bool fLossyMosaicJXL = false;
+@@ -329,6 +333,22 @@
+ 
+ 		virtual uint32 SaveDNGVersion () const;
+ 
++		/// Setter for flag determining whether to request Deflate (ZIP) compression.
++		/// \param want If true, request Deflate for compressible raw image data.
++
++		void SetSaveDeflate (bool want)
++			{
++			fSaveDeflate = want;
++			}
++			
++		/// Getter for flag determining whether Deflate compression is requested.
++
++		bool SaveDeflate () const
++			{
++			return fSaveDeflate;
++			}
++			
++
+ 		/// Setter for flag determining whether to force saving a linear DNG file.	
+ 		/// \param linear If true, we should force saving a linear DNG file.
+ 
+--- a/dng_sdk_1_7_1/dng_sdk/source/dng_image_writer.cpp
++++ b/dng_sdk_1_7_1/dng_sdk/source/dng_image_writer.cpp
+@@ -7653,10 +7653,10 @@
+ 		else if (negative.RawImage ().PixelType () == ttLong)
+ 			compression = isCompressed32BitInteger ? ccDeflate : ccUncompressed;
+ 
+-		// Fall back to Lossless JPEG.
++		// Fall back to Lossless JPEG, unless Deflate was requested.
+ 		
+ 		else
+-			compression = ccJPEG;
++			compression = host.SaveDeflate () ? ccDeflate : ccJPEG;
+ 		
+ 		}
+ 

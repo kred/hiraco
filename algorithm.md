@@ -185,8 +185,8 @@ for the first existing filename in this order:
    for example, `<stem>_..orf`)
 
 The GUI exposes this as a per-file `HL Rec` switch, which is **off by default**.
-The label is `n/a` if no candidate file was found.  The CLI does not currently
-expose a switch for this feature.
+The label is `n/a` if no candidate file was found.  The CLI exposes the same
+feature as `--hl-rec`, also **off by default**.
 
 Detection is intentionally only a same-directory filename lookup today.  It does
 not yet validate capture time, exposure, ISO, camera identity, dimensions, or
@@ -377,8 +377,10 @@ or non-empty text field.
    per-image remove button.
 4. Rebuild the inspector around direct settings, presets, and the expandable
    output options.
-5. Benchmark full-preview refresh on the M4 Pro and add core regression tests
-   for full-preview dimensions, orientation, cancellation, and cache reuse.
+5. Add core regression tests for full-preview dimensions, orientation,
+   cancellation, and cache reuse.  These now live in
+   `tests/hiraco_core_tests.cpp`.  Benchmarking full-preview refresh on the M4
+   Pro is still outstanding (tracked as I-14).
 
 ## 12. Related Files
 

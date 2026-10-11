@@ -36,8 +36,6 @@ bool EstimatePreviewAutoBrightGainFromRaw(const std::string& source_path,
 
 bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                  const SourceLinearDngMetadata& metadata,
-                                 const std::string& highlight_recovery_source_path,
-                                 bool enable_highlight_recovery,
                                  uint32_t source_width,
                                  uint32_t source_height,
                                  const CropRect& crop_rect,
@@ -88,6 +86,3 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      double preview_auto_bright_gain = 1.0,
                                      ProgressCallback progress = {},
                                      CancelCheck cancel = {});
-
-DngWriteResult WriteSyntheticLinearDng(const std::string& output_path,
-                                       const std::string& compression);

@@ -1,4 +1,5 @@
 #include "dng_writer_bridge.h"
+#include "dng_sdk_bridge.h"
 #include "hiraco_core.h"
 
 #include <algorithm>
@@ -17,6 +18,19 @@ void Expect(bool condition, const std::string& message) {
     throw std::runtime_error(message);
   }
 }
+
+// Resolves a repository fixture relative to this test file, so the test works
+// no matter which directory ctest runs it from. Always returns a non-empty
+// path and never touches the filesystem; callers must check existence
+// themselves, since the .ORF fixtures are gitignored.
+//
+// Resolving from __FILE__ rather than the process CWD is load-bearing: ctest
+// runs tests with the build directory as CWD, so a bare "reference/..." path
+// resolves to nothing there and the guard would silently skip.
+std::filesystem::path RealOrfFixturePath(const std::string& relative_path) {
+  return std::filesystem::path(__FILE__).parent_path().parent_path() / relative_path;
+}
+
 
 RasterImage MakeSyntheticRgb(uint32_t width, uint32_t height) {
   RasterImage image;
@@ -316,10 +330,11 @@ void TestEnhancementPreservesHighlightHeadroom() {
 }
 
 void TestRealOrfPreviewSmoke() {
-  const std::filesystem::path source_path = std::filesystem::path("reference") / "_3210504.ORF";
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // .ORF fixtures are gitignored, and ctest runs with the build directory as
+  // the CWD, so resolve from this test file and fail loudly rather than skip.
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -344,10 +359,11 @@ void TestRealOrfPreviewSmoke() {
 }
 
 void TestRealOrfCropPreviewFollowsCropRect() {
-  const std::filesystem::path source_path = std::filesystem::path("reference") / "_3210504.ORF";
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // .ORF fixtures are gitignored, and ctest runs with the build directory as
+  // the CWD, so resolve from this test file and fail loudly rather than skip.
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -380,10 +396,11 @@ void TestRealOrfCropPreviewFollowsCropRect() {
 }
 
 void TestRealOrfPreviewAutoBrightGainEstimate() {
-  const std::filesystem::path source_path = std::filesystem::path("reference") / "_3210504.ORF";
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  // .ORF fixtures are gitignored, and ctest runs with the build directory as
+  // the CWD, so resolve from this test file and fail loudly rather than skip.
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -406,11 +423,9 @@ void TestLocalOm3RecoveryFullPreviewSmoke() {
   // The sample directory is intentionally untracked. Exercise the
   // display-resolution recovery mapping when a local OM-3 ORF/ORI pair is
   // available, without making the portable test suite depend on that fixture.
-  const std::filesystem::path source_path =
-      std::filesystem::path(__FILE__).parent_path().parent_path() / "sample" / "_8142491.ORF";
-  if (!std::filesystem::exists(source_path)) {
-    return;
-  }
+  const std::filesystem::path source_path = RealOrfFixturePath("sample/_8142491.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
 
   PreparedSource prepared;
   std::string error_message;
@@ -449,6 +464,211 @@ void TestLocalOm3RecoveryFullPreviewSmoke() {
   Expect(recovery_preview->width == normal_preview->width &&
              recovery_preview->height == normal_preview->height,
          "recovery-enabled full preview should retain the normal preview dimensions");
+}
+
+void TestFullPreviewObeysDisplayDimension() {
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  // The .ORF fixtures are gitignored, so an absent fixture means a broken
+  // checkout rather than a reason to pass vacuously.
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
+
+  PreparedSource prepared;
+  std::string error_message;
+  Expect(PrepareSource(source_path.string(), &prepared, &error_message),
+         "full-preview dimension test should prepare source: " + error_message);
+
+  for (const uint32_t max_dimension : {512u, 256u}) {
+    auto preview = std::make_shared<PreviewImage>();
+    const bool ok = RenderConvertedFullPreview(&prepared,
+                                               {},
+                                               max_dimension,
+                                               preview,
+                                               {},
+                                               {},
+                                               {},
+                                               &error_message);
+    Expect(ok, "full preview at " + std::to_string(max_dimension) +
+                    " should succeed: " + error_message);
+    Expect(preview->width > 0 && preview->height > 0,
+           "full preview should produce non-empty image data");
+    Expect(std::max(preview->width, preview->height) <= max_dimension,
+           "full preview should obey its display-size limit");
+
+    const double expected_aspect = static_cast<double>(prepared.image_width) /
+                                   static_cast<double>(prepared.image_height);
+    const double actual_aspect = static_cast<double>(preview->width) /
+                                 static_cast<double>(preview->height);
+    Expect(std::abs(actual_aspect - expected_aspect) < 0.02,
+           "full preview should preserve the source aspect ratio");
+  }
+}
+
+void TestFullPreviewOrientationMatchesLibRawFlip() {
+  // The orientation helpers are public and can be exercised directly with a
+  // non-trivial flip, which no available fixture exercises end to end.
+  const uint32_t width = 900;
+  const uint32_t height = 600;
+  Expect(OrientedImageWidth(width, height, 0) == width &&
+             OrientedImageHeight(width, height, 0) == height,
+         "a zero flip should not swap image axes");
+  Expect(OrientedImageWidth(width, height, 5) == height &&
+             OrientedImageHeight(width, height, 5) == width,
+         "a 90-degree flip should swap image axes");
+  Expect(!LibRawFlipSwapsAxes(0) && LibRawFlipSwapsAxes(5),
+         "LibRawFlipSwapsAxes should detect axis-swapping flips");
+
+  // End to end: the full preview is downscaled to the display limit, so its
+  // dimensions are not the source dimensions. What must hold is that the
+  // oriented aspect ratio and the axis-swap decision survive the scaling.
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  // The .ORF fixtures are gitignored, so an absent fixture means a broken
+  // checkout rather than a reason to pass vacuously.
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
+
+  PreparedSource prepared;
+  std::string error_message;
+  Expect(PrepareSource(source_path.string(), &prepared, &error_message),
+         "full-preview orientation test should prepare source: " + error_message);
+
+  const uint32_t oriented_width = OrientedImageWidth(prepared.image_width,
+                                                      prepared.image_height,
+                                                      prepared.metadata.libraw_flip);
+  const uint32_t oriented_height = OrientedImageHeight(prepared.image_width,
+                                                       prepared.image_height,
+                                                       prepared.metadata.libraw_flip);
+  const uint32_t oriented_long = std::max(oriented_width, oriented_height);
+  const uint32_t oriented_short = std::min(oriented_width, oriented_height);
+  const double oriented_aspect = static_cast<double>(oriented_short) /
+                                 static_cast<double>(oriented_long);
+
+  auto preview = std::make_shared<PreviewImage>();
+  const bool ok =
+      RenderConvertedFullPreview(&prepared, {}, 512, preview, {}, {}, {}, &error_message);
+  Expect(ok, "full preview should succeed: " + error_message);
+  Expect(std::max(preview->width, preview->height) <= 512u,
+         "full preview should respect its display-size limit");
+  const double preview_aspect = static_cast<double>(std::min(preview->width, preview->height)) /
+                                static_cast<double>(std::max(preview->width, preview->height));
+  Expect(std::abs(preview_aspect - oriented_aspect) < 0.01,
+         "full preview aspect ratio should match the oriented source geometry");
+  Expect((preview->width >= preview->height) == (oriented_width >= oriented_height),
+         "full preview orientation should match the oriented source geometry");
+}
+
+void TestFullPreviewHonoursCancellation() {
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  // The .ORF fixtures are gitignored, so an absent fixture means a broken
+  // checkout rather than a reason to pass vacuously.
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
+
+  PreparedSource prepared;
+  std::string error_message;
+  Expect(PrepareSource(source_path.string(), &prepared, &error_message),
+         "cancellation test should prepare source: " + error_message);
+
+  int cancel_calls = 0;
+  const CancelCheck cancel = [&cancel_calls]() {
+    ++cancel_calls;
+    return true;
+  };
+
+  auto preview = std::make_shared<PreviewImage>();
+  const bool ok = RenderConvertedFullPreview(&prepared,
+                                             {},
+                                             512,
+                                             preview,
+                                             {},
+                                             {},
+                                             cancel,
+                                             &error_message);
+  Expect(!ok, "a cancelled full preview request should fail");
+  Expect(error_message == "operation canceled",
+         "a cancelled full preview request should report cancellation");
+  Expect(cancel_calls > 0, "the cancel check should be consulted");
+}
+
+void TestFullPreviewReusesCachedPreview() {
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  // The .ORF fixtures are gitignored, so an absent fixture means a broken
+  // checkout rather than a reason to pass vacuously.
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
+
+  PreparedSource prepared;
+  std::string error_message;
+  Expect(PrepareSource(source_path.string(), &prepared, &error_message),
+         "cache-reuse test should prepare source: " + error_message);
+
+  auto first = std::make_shared<PreviewImage>();
+  const bool first_ok =
+      RenderConvertedFullPreview(&prepared, {}, 512, first, {}, {}, {}, &error_message);
+  Expect(first_ok, "first full preview should succeed: " + error_message);
+  Expect(first->width > 0 && first->height > 0,
+         "first full preview should produce image data");
+
+  const PreviewImage cached_copy = *first;
+
+  // A rebuild would be cancelled immediately (see the cancellation test), so a
+  // successful second call returning identical bytes proves the cached preview
+  // was reused rather than rebuilt.
+  const CancelCheck cancel = []() { return true; };
+  auto second = std::make_shared<PreviewImage>();
+  const bool second_ok =
+      RenderConvertedFullPreview(&prepared, {}, 512, second, {}, {}, cancel, &error_message);
+  Expect(second_ok, "a cached full preview should be returned without rebuilding");
+  Expect(second->width == cached_copy.width && second->height == cached_copy.height &&
+             second->colors == cached_copy.colors && second->bits == cached_copy.bits,
+         "a cached full preview should retain its geometry");
+  Expect(second->pixels == cached_copy.pixels,
+         "a cached full preview should return identical pixel data");
+}
+
+// BuildDngWriterConfigSummary is the only externally visible view of both the
+// compression code and the DNG version Hiraco requests. DngVersionForCompression
+// has internal linkage, but summary.dng_version is derived directly from it, so
+// asserting on these strings pins I-01 (which code each mode asks for) and I-03
+// (that the requested version is the one the SDK actually writes).
+void TestDngWriterConfigSummaryReportsRequestedVersionAndCode() {
+  const auto check_mode = [](const std::string& mode,
+                             unsigned expected_code,
+                             const std::string& expected_version) {
+    const DngWriterConfigSummary summary = BuildDngWriterConfigSummary(mode);
+    Expect(summary.can_configure_writer,
+           mode + " mode should be configurable by the writer");
+    Expect(summary.compression_name == mode,
+           mode + " mode should report its own name, got " + summary.compression_name);
+    Expect(summary.compression_code == expected_code,
+           mode + " mode should request compression code " + std::to_string(expected_code) +
+               ", got " + std::to_string(summary.compression_code));
+    Expect(summary.dng_version == expected_version,
+           mode + " mode should request DNG " + expected_version +
+               ", got " + summary.dng_version);
+    // The status string is human-readable output, but it must not contradict
+    // the version the summary actually reports.
+    Expect(summary.status.find("DNG " + expected_version) != std::string::npos,
+           mode + " status string should mention DNG " + expected_version +
+               ", got: " + summary.status);
+  };
+
+  check_mode("uncompressed", 1u, "1.4.0.0");
+  check_mode("deflate", 8u, "1.4.0.0");
+  check_mode("jpeg-xl", 52546u, "1.7.0.0");
+
+  // jpeg-x is the only experimental mode.
+  const DngWriterConfigSummary jpeg_x = BuildDngWriterConfigSummary("jpeg-xl");
+  Expect(jpeg_x.experimental && jpeg_x.lossless_jpeg_xl,
+         "jpeg-xl mode should be flagged experimental and lossless");
+  const DngWriterConfigSummary deflate = BuildDngWriterConfigSummary("deflate");
+  Expect(!deflate.experimental,
+         "deflate mode should not be flagged experimental");
+
+  // An unknown mode must not be silently presented as configurable.
+  const DngWriterConfigSummary unsupported = BuildDngWriterConfigSummary("nope");
+  Expect(!unsupported.can_configure_writer,
+         "an unsupported compression mode should not be configurable");
 }
 
 void TestCropPreviewMatchesFullImageCrop() {
@@ -635,6 +855,11 @@ int main() {
     TestRealOrfCropPreviewFollowsCropRect();
     TestRealOrfPreviewAutoBrightGainEstimate();
     TestLocalOm3RecoveryFullPreviewSmoke();
+    TestFullPreviewObeysDisplayDimension();
+    TestFullPreviewOrientationMatchesLibRawFlip();
+    TestFullPreviewHonoursCancellation();
+    TestFullPreviewReusesCachedPreview();
+    TestDngWriterConfigSummaryReportsRequestedVersionAndCode();
     TestCropPreviewMatchesFullImageCrop();
     TestDisplayProcessingCacheScalesBothInputs();
     TestStage2SmallMediumLargeGainResponse();

@@ -118,10 +118,6 @@ void ReportProgress(const ProgressCallback& progress,
   progress(update);
 }
 
-bool Is80MpFrame(uint32_t width, uint32_t height) {
-  return width == 10386 && height == 7792;
-}
-
 constexpr float kStage2GainMin = 0.25f;
 constexpr float kStage2GainMax = 4.0f;
 constexpr float kStage2FineFromSmallScale = 1.6f;
@@ -578,104 +574,6 @@ bool LoadStackAliasMap(const SourceLinearDngMetadata& metadata,
     value = std::clamp(value, 0.0, 1.0);
   }
   return true;
-}
-
-void UpsampleFloatMap(const std::vector<double>& source,
-                      uint32_t source_width,
-                      uint32_t source_height,
-                      uint32_t target_width,
-                      uint32_t target_height,
-                      std::vector<double>* target) {
-  if (target == nullptr) {
-    return;
-  }
-  target->clear();
-
-  if (source.empty() || source_width == 0 || source_height == 0 ||
-      target_width == 0 || target_height == 0) {
-    return;
-  }
-
-  target->resize(static_cast<size_t>(target_width) * target_height, 0.0);
-
-  const double scale_x = static_cast<double>(source_width) / static_cast<double>(target_width);
-  const double scale_y = static_cast<double>(source_height) / static_cast<double>(target_height);
-  #pragma omp parallel for schedule(static) if(target_height > 100)
-  for (uint32_t row = 0; row < target_height; ++row) {
-    const double y = (static_cast<double>(row) + 0.5) * scale_y - 0.5;
-    const int y0 = static_cast<int>(std::floor(y));
-    const int y1 = y0 + 1;
-    const double wy = y - std::floor(y);
-    const uint32_t sy0 = static_cast<uint32_t>(std::clamp(y0, 0, static_cast<int>(source_height) - 1));
-    const uint32_t sy1 = static_cast<uint32_t>(std::clamp(y1, 0, static_cast<int>(source_height) - 1));
-    for (uint32_t col = 0; col < target_width; ++col) {
-      const double x = (static_cast<double>(col) + 0.5) * scale_x - 0.5;
-      const int x0 = static_cast<int>(std::floor(x));
-      const int x1 = x0 + 1;
-      const double wx = x - std::floor(x);
-      const uint32_t sx0 = static_cast<uint32_t>(std::clamp(x0, 0, static_cast<int>(source_width) - 1));
-      const uint32_t sx1 = static_cast<uint32_t>(std::clamp(x1, 0, static_cast<int>(source_width) - 1));
-
-      const double v00 = source[static_cast<size_t>(sy0) * source_width + sx0];
-      const double v01 = source[static_cast<size_t>(sy0) * source_width + sx1];
-      const double v10 = source[static_cast<size_t>(sy1) * source_width + sx0];
-      const double v11 = source[static_cast<size_t>(sy1) * source_width + sx1];
-      const double top = (1.0 - wx) * v00 + wx * v01;
-      const double bottom = (1.0 - wx) * v10 + wx * v11;
-      (*target)[static_cast<size_t>(row) * target_width + col] =
-          (1.0 - wy) * top + wy * bottom;
-    }
-  }
-}
-
-void UpsampleFloatMapRegion(const std::vector<double>& source,
-                            uint32_t source_width,
-                            uint32_t source_height,
-                            uint32_t full_width,
-                            uint32_t full_height,
-                            const CropRect& region,
-                            std::vector<double>* target) {
-  if (target == nullptr) {
-    return;
-  }
-  target->clear();
-
-  if (source.empty() || source_width == 0 || source_height == 0 ||
-      full_width == 0 || full_height == 0 ||
-      region.width == 0 || region.height == 0) {
-    return;
-  }
-
-  target->resize(static_cast<size_t>(region.width) * region.height, 0.0);
-
-  const double scale_x = static_cast<double>(source_width) / static_cast<double>(full_width);
-  const double scale_y = static_cast<double>(source_height) / static_cast<double>(full_height);
-  #pragma omp parallel for schedule(static) if(region.height > 100)
-  for (uint32_t row = 0; row < region.height; ++row) {
-    const double y = (static_cast<double>(region.y + row) + 0.5) * scale_y - 0.5;
-    const int y0 = static_cast<int>(std::floor(y));
-    const int y1 = y0 + 1;
-    const double wy = y - std::floor(y);
-    const uint32_t sy0 = static_cast<uint32_t>(std::clamp(y0, 0, static_cast<int>(source_height) - 1));
-    const uint32_t sy1 = static_cast<uint32_t>(std::clamp(y1, 0, static_cast<int>(source_height) - 1));
-    for (uint32_t col = 0; col < region.width; ++col) {
-      const double x = (static_cast<double>(region.x + col) + 0.5) * scale_x - 0.5;
-      const int x0 = static_cast<int>(std::floor(x));
-      const int x1 = x0 + 1;
-      const double wx = x - std::floor(x);
-      const uint32_t sx0 = static_cast<uint32_t>(std::clamp(x0, 0, static_cast<int>(source_width) - 1));
-      const uint32_t sx1 = static_cast<uint32_t>(std::clamp(x1, 0, static_cast<int>(source_width) - 1));
-
-      const double v00 = source[static_cast<size_t>(sy0) * source_width + sx0];
-      const double v01 = source[static_cast<size_t>(sy0) * source_width + sx1];
-      const double v10 = source[static_cast<size_t>(sy1) * source_width + sx0];
-      const double v11 = source[static_cast<size_t>(sy1) * source_width + sx1];
-      const double top = (1.0 - wx) * v00 + wx * v01;
-      const double bottom = (1.0 - wx) * v10 + wx * v11;
-      (*target)[static_cast<size_t>(row) * region.width + col] =
-          (1.0 - wy) * top + wy * bottom;
-    }
-  }
 }
 
 struct BilinearAxisSample {
@@ -1800,11 +1698,17 @@ bool ApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
 }
 
 
+// The DNG SDK does not save the version we pass as maxBackwardVersion; it
+// derives the DNGVersion tag from the features actually used and never writes
+// anything below the DNG 1.4 baseline. For these linear DNGs the saved version
+// is 1.4.0.0 for uncompressed/deflate and 1.7.0.0 for lossless JPEG XL, so
+// request exactly those versions instead of asserting DNG 1.6.0.0 that never
+// reaches the file.
 uint32_t DngVersionForCompression(const std::string& compression) {
   if (compression == "jpeg-xl") {
-    return dngVersion_SaveDefault;
+    return dngVersion_1_7_0_0;
   }
-  return dngVersion_1_6_0_0;
+  return dngVersion_1_4_0_0;
 }
 
 void ConfigureHost(dng_host& host, const std::string& compression) {
@@ -1812,6 +1716,9 @@ void ConfigureHost(dng_host& host, const std::string& compression) {
   host.SetSaveLinearDNG(true);
   host.SetLosslessJXL(compression == "jpeg-xl");
   host.SetLossyMosaicJXL(false);
+  // The stock SDK writer always picks lossless JPEG for 16-bit payloads; the
+  // bundled SDK patch adds this flag so Deflate can actually be requested.
+  host.SetSaveDeflate(compression == "deflate");
 }
 
 bool IsSupportedWriteCompression(const std::string& compression) {
@@ -2000,26 +1907,6 @@ void ApplyOm3HighResCfaPrecondition(const SourceLinearDngMetadata& metadata,
   }
 
   std::copy(updated.begin(), updated.end(), raw);
-}
-
-RasterImage MakeSyntheticRgbImage() {
-  RasterImage image;
-  image.width = 48;
-  image.height = 32;
-  image.colors = 3;
-  image.bits = 16;
-  image.pixels.resize(static_cast<size_t>(image.width) * image.height * image.colors);
-
-  for (uint32_t row = 0; row < image.height; ++row) {
-    for (uint32_t col = 0; col < image.width; ++col) {
-      const size_t index = (static_cast<size_t>(row) * image.width + col) * image.colors;
-      image.pixels[index + 0] = static_cast<uint16_t>((col * 65535u) / (image.width - 1));
-      image.pixels[index + 1] = static_cast<uint16_t>((row * 65535u) / (image.height - 1));
-      image.pixels[index + 2] = static_cast<uint16_t>(((row + col) * 65535u) / (image.width + image.height - 2));
-    }
-  }
-
-  return image;
 }
 
 bool RenderLibRawImage(const std::string& source_path,
@@ -3372,14 +3259,10 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
 
 bool BuildLinearDngPayload(const std::string& source_path,
                            const SourceLinearDngMetadata& metadata,
-                           const std::string& highlight_recovery_source_path,
-                           bool enable_highlight_recovery,
                            const LibRawOverrideSet& libraw_overrides,
                            LinearDngPayload* payload,
                            std::string* error_message) {
   const hiraco::ScopedTimingLog payload_timer("convert", "Build linear DNG payload");
-  (void) highlight_recovery_source_path;
-  (void) enable_highlight_recovery;
   const RenderSettings raw_settings = BuildRawRenderSettings(metadata, libraw_overrides);
   const bool needs_cfa_guide = metadata.has_predicted_detail_gain &&
                                metadata.predicted_detail_gain > 1.0001 &&
@@ -3900,6 +3783,9 @@ ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata
 
 namespace {
 
+// Smallest fraction advance worth reporting during an indeterminate sweep.
+constexpr double kTimedProgressStep = 0.001;
+
 class CallbackAbortSniffer final : public dng_abort_sniffer {
  public:
   CallbackAbortSniffer(ProgressCallback progress, CancelCheck cancel)
@@ -3909,10 +3795,63 @@ class CallbackAbortSniffer final : public dng_abort_sniffer {
     return true;
   }
 
+  // Some SDK operations (notably JPEG-XL lossless compression) do not emit
+  // StartTask/UpdateProgress callbacks even though they can run for minutes.
+  // They do call Sniff() regularly, so use that hook to keep the UI moving for
+  // as long as the operation runs. This keeps the CLI/GUI from appearing hung.
+  //
+  // The movement is an indeterminate sweep, not a completion estimate. There is
+  // deliberately no expected-duration parameter: any wall-clock estimate encodes
+  // one machine's throughput, and once it elapsed the bar would freeze for the
+  // remainder of the operation - exactly the stall this was added to remove. The
+  // sweep period is pure visual pacing and never signals that work is nearly
+  // finished.
+  void BeginTimedProgress(const std::string& message,
+                          double start_fraction,
+                          double end_fraction,
+                          double sweep_seconds) {
+    timed_message_ = message;
+    timed_start_fraction_ = start_fraction;
+    timed_end_fraction_ = end_fraction;
+    timed_sweep_seconds_ = sweep_seconds > 0.001 ? sweep_seconds : 0.001;
+    timed_start_time_ = std::chrono::steady_clock::now();
+    timed_last_fraction_.store(start_fraction, std::memory_order_relaxed);
+    timed_active_.store(true, std::memory_order_release);
+  }
+
+  void EndTimedProgress() {
+    timed_active_.store(false, std::memory_order_release);
+  }
+
  protected:
   void Sniff() override {
     if (IsCancelled(cancel_)) {
       ThrowUserCanceled();
+    }
+    if (!timed_active_.load(std::memory_order_acquire)) {
+      return;
+    }
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - timed_start_time_).count();
+    // Sweep the range repeatedly rather than climbing toward a finish line, so
+    // the bar keeps moving however long the operation takes.
+    const double sweep_seconds = timed_sweep_seconds_;
+    const double sweep_phase = std::fmod(elapsed, sweep_seconds) / sweep_seconds;
+    const double fraction =
+        timed_start_fraction_ +
+        (timed_end_fraction_ - timed_start_fraction_) * sweep_phase;
+    const double last = timed_last_fraction_.load(std::memory_order_relaxed);
+    // A fresh sweep cycle intentionally restarts at the bottom of the range;
+    // that relaxation before moving again is what reads as busy work rather
+    // than a stuck bar.
+    if (fraction + kTimedProgressStep < last) {
+      timed_last_fraction_.store(timed_start_fraction_, std::memory_order_relaxed);
+      ReportProgress(progress_, "convert", timed_start_fraction_, timed_message_);
+      return;
+    }
+    if (fraction >= last + kTimedProgressStep) {
+      timed_last_fraction_.store(fraction, std::memory_order_relaxed);
+      ReportProgress(progress_, "convert", fraction, timed_message_);
     }
   }
 
@@ -3932,6 +3871,13 @@ class CallbackAbortSniffer final : public dng_abort_sniffer {
   ProgressCallback progress_;
   CancelCheck cancel_;
   std::string current_task_;
+  std::atomic<bool> timed_active_{false};
+  std::atomic<double> timed_last_fraction_{0.0};
+  std::string timed_message_;
+  double timed_start_fraction_ = 0.0;
+  double timed_end_fraction_ = 0.0;
+  double timed_sweep_seconds_ = 1.0;
+  std::chrono::steady_clock::time_point timed_start_time_{};
 };
 
 }  // namespace
@@ -4029,8 +3975,6 @@ bool EstimatePreviewAutoBrightGainFromRaw(const std::string& source_path,
 
 bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                  const SourceLinearDngMetadata& metadata,
-                                 const std::string& highlight_recovery_source_path,
-                                 bool enable_highlight_recovery,
                                  uint32_t source_width,
                                  uint32_t source_height,
                                  const CropRect& crop_rect,
@@ -4040,8 +3984,6 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                  CancelCheck cancel,
                                  std::string* error_message) {
   const hiraco::ScopedTimingLog cache_timer("cache", "Build processing cache");
-  (void) highlight_recovery_source_path;
-  (void) enable_highlight_recovery;
   if (cache == nullptr) {
     if (error_message != nullptr) {
       *error_message = "missing processing cache";
@@ -4447,8 +4389,6 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       const hiraco::ScopedTimingLog timer("convert", "Prepare source payload");
       if (!BuildLinearDngPayload(source_path,
                                  metadata,
-                                 highlight_recovery_source_path,
-                                 enable_highlight_recovery,
                                  libraw_overrides,
                                  &payload,
                                  &render_error)) {
@@ -4525,10 +4465,16 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     dng_file_stream stream(output_path.c_str(), true);
     dng_image_writer writer;
     if (compression == "jpeg-xl") {
-      negative->LosslessCompressJXL(host, writer, false);
+      ReportProgress(progress, "convert", 0.92, "Compressing JPEG-XL");
+      sniffer.BeginTimedProgress("Compressing JPEG-XL", 0.92, 0.95, 8.0);
+      {
+        const hiraco::ScopedTimingLog timer("convert", "LosslessCompressJXL");
+        negative->LosslessCompressJXL(host, writer, false);
+      }
+      sniffer.EndTimedProgress();
     }
 
-    ReportProgress(progress, "convert", 0.92, "Writing DNG");
+    ReportProgress(progress, "convert", 0.95, "Writing DNG");
     {
       const hiraco::ScopedTimingLog timer("convert", "Write DNG stream");
       writer.WriteDNG(host,
@@ -4543,53 +4489,6 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     result.ok = true;
     result.message = "native linear DNG write succeeded";
     ReportProgress(progress, "convert", 1.0, "Conversion complete");
-  } catch (const dng_exception& exc) {
-    result.message = exc.what();
-  } catch (const std::exception& exc) {
-    result.message = exc.what();
-  }
-
-  return result;
-}
-
-DngWriteResult WriteSyntheticLinearDng(const std::string& output_path,
-                                       const std::string& compression) {
-  DngWriteResult result;
-
-  if (!IsSupportedWriteCompression(compression)) {
-    result.message = UnsupportedCompressionMessage(compression);
-    return result;
-  }
-
-  try {
-    RasterImage processed = MakeSyntheticRgbImage();
-    PreviewImage preview_image = BuildPreviewImage(processed, 256);
-
-    dng_host host;
-    ConfigureHost(host, compression);
-
-    AutoPtr<dng_negative> negative(host.Make_dng_negative());
-    PopulateLinearRawNegative(host, "synthetic-gradient.raw", processed, SourceLinearDngMetadata(), *negative.Get(), 1.0);
-
-    dng_preview_list preview_list;
-    AppendImagePreview(host, preview_image, &preview_list);
-
-    dng_file_stream stream(output_path.c_str(), true);
-    dng_image_writer writer;
-    if (compression == "jpeg-xl") {
-      negative->LosslessCompressJXL(host, writer, false);
-    }
-
-    writer.WriteDNG(host,
-                    stream,
-                    *negative.Get(),
-                    &preview_list,
-                    DngVersionForCompression(compression),
-                    compression == "uncompressed");
-    stream.Flush();
-
-    result.ok = true;
-    result.message = "synthetic linear DNG write succeeded";
   } catch (const dng_exception& exc) {
     result.message = exc.what();
   } catch (const std::exception& exc) {
@@ -4651,8 +4550,6 @@ bool EstimatePreviewAutoBrightGainFromRaw(const std::string&,
 
 bool BuildProcessingCacheFromRaw(const std::string&,
                                  const SourceLinearDngMetadata&,
-                                 const std::string&,
-                                 bool,
                                  uint32_t,
                                  uint32_t,
                                  const CropRect&,
@@ -4720,12 +4617,6 @@ DngWriteResult WriteLinearDngFromRaw(const std::string&,
                                      double,
                                      ProgressCallback,
                                      CancelCheck) {
-  DngWriteResult result;
-  result.message = "Adobe DNG SDK integration not enabled in this build";
-  return result;
-}
-
-DngWriteResult WriteSyntheticLinearDng(const std::string&, const std::string&) {
   DngWriteResult result;
   result.message = "Adobe DNG SDK integration not enabled in this build";
   return result;

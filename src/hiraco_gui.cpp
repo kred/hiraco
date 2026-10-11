@@ -2135,8 +2135,12 @@ class HiracoMainFrame final : public wxFrame {
     if (progress.phase == "enhance") {
       return 0.10 + 0.80 * fraction;
     }
+    // The write phase begins at 0.95 in every compression mode, not just JPEG-XL:
+    // in uncompressed/deflate the convert phase jumps straight to 0.95 "Writing
+    // DNG". It coincides with where the I-02 JPEG-XL sweep (0.92..0.95) ends.
+    // The 0.04 span stops short of 1.0, which conversion completion reports.
     if (progress.phase == "write") {
-      return 0.92 + 0.07 * fraction;
+      return 0.95 + 0.04 * fraction;
     }
     return fraction;
   }
