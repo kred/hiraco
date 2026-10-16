@@ -810,6 +810,18 @@ bool RenderConvertedCrop(PreparedSource* prepared,
     return false;
   }
 
+  // Explicit recovery coordinates for the crop path.  Crop previews render from
+  // full-frame resolution processing caches (their source_width stays the full
+  // frame), so the represented region is the requested crop in full-frame
+  // coordinates.  Passing it explicitly keeps the mapping correct even if a
+  // future caller reuses a display-resolution cache, whose source_width
+  // BuildDisplayProcessingCache overwrites with the display size.
+  RecoveryImageCoordinates recovery_coordinates;
+  recovery_coordinates.full_width = prepared->image_width;
+  recovery_coordinates.full_height = prepared->image_height;
+  recovery_coordinates.represented_region =
+      ClampCropRect(crop_rect, prepared->image_width, prepared->image_height);
+
   std::shared_ptr<const ProcessingCache> cached_processing_cache;
   {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
@@ -830,7 +842,9 @@ bool RenderConvertedCrop(PreparedSource* prepared,
                                       preview,
                                       progress,
                                       cancel,
-                                      error_message);
+                                      error_message,
+                                      0,
+                                      &recovery_coordinates);
   }
 
   auto cache = std::make_shared<ProcessingCache>();
@@ -870,7 +884,9 @@ bool RenderConvertedCrop(PreparedSource* prepared,
                                     preview,
                                     progress,
                                     cancel,
-                                    error_message);
+                                    error_message,
+                                    0,
+                                    &recovery_coordinates);
 }
 
 bool RenderConvertedFullPreview(PreparedSource* prepared,
@@ -1067,13 +1083,31 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
     return static_cast<uint32_t>(
         (static_cast<uint64_t>(value) * source_extent + display_extent - 1) / display_extent);
   };
+  // Floor twin of scale_coordinate_ceil: maps a display-cache coordinate back
+  // into source-cache coordinates without rounding up.
+  const auto scale_coordinate_floor = [](uint32_t value,
+                                         uint32_t source_extent,
+                                         uint32_t display_extent) {
+    if (display_extent == 0) {
+      return 0u;
+    }
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(value) * source_extent) / display_extent);
+  };
   RecoveryImageCoordinates recovery_coordinates;
   recovery_coordinates.full_width = source_cache->source_width;
   recovery_coordinates.full_height = source_cache->source_height;
+  // The represented region must describe the field of view the display image
+  // actually contains: map the display crop back into source-cache
+  // coordinates (display -> source).  The left/top edges previously used the
+  // source -> display scale_coordinate lambda, which mapped the image onto the
+  // full raw frame and shifted target/companion recovery sampling by the
+  // default-crop origin (up to ~2 preview px at 2560).  floor on the left/top
+  // and ceil on the right/bottom bound the rendered content within 1 px.
   recovery_coordinates.represented_region.x = source_cache_region.x +
-      scale_coordinate(display_crop.x, source_cache_region.width, display_cache->raw_image.width);
+      scale_coordinate_floor(display_crop.x, source_cache_region.width, display_cache->raw_image.width);
   recovery_coordinates.represented_region.y = source_cache_region.y +
-      scale_coordinate(display_crop.y, source_cache_region.height, display_cache->raw_image.height);
+      scale_coordinate_floor(display_crop.y, source_cache_region.height, display_cache->raw_image.height);
   const uint32_t recovery_right = source_cache_region.x + scale_coordinate_ceil(
       display_crop.x + display_crop.width,
       source_cache_region.width,

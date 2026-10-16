@@ -1,4 +1,5 @@
 #include "hiraco_core.h"
+#include "dng_writer_bridge.h"
 
 #include <wx/bitmap.h>
 #include <wx/activityindicator.h>
@@ -80,6 +81,15 @@ struct QueueItem {
   std::filesystem::path target_path;
   std::optional<PreparedSource> prepared;
   bool enable_highlight_recovery = false;
+  // Per-selection overlay state: whether the converted preview marks the pixels
+  // recovery restored.  Kept with the item so switching rows and back restores
+  // the user's choice for that image, and so toggling never re-renders.
+  bool show_recovered_pixels = false;
+  // Diagnostics from the most recent recovery-enabled preview render of this
+  // item, so cached re-renders still report the outcome (see
+  // GetLastHighlightRecoveryStats).
+  HighlightRecoveryStats recovery_stats;
+  bool has_recovery_stats = false;
   StageOverrideSet stage_overrides;
   // This is deliberately separate from the highlighted preset.  A slider
   // adjustment may mean no button is highlighted, but Restore should still
@@ -111,6 +121,9 @@ struct ConvertedPreviewReadyPayload {
   bool ok = false;
   std::shared_ptr<PreviewImage> converted_preview;
   std::string error;
+  bool recovery_enabled = false;
+  bool recovery_stats_valid = false;
+  HighlightRecoveryStats recovery_stats;
 };
 
 struct ConvertProgressPayload {
@@ -712,8 +725,48 @@ class CompareCanvas final : public wxScrolledWindow {
   void SetConvertedPreview(std::shared_ptr<const PreviewImage> preview) {
     converted_preview_ = std::move(preview);
     converted_bitmap_ = MakeBitmapFromPreview(converted_preview_);
+    // A new preview invalidates any cached cast: the mask, and therefore the
+    // overlay, belongs to that preview and not to the next one.
+    cast_bitmap_ = wxBitmap();
+    cast_bitmap_valid_ = false;
     UpdateVirtualArea();
     Refresh();
+  }
+
+  // Turns the pink overlay on or off for the current converted preview.  The
+  // overlay bitmap is built once per preview and then cached, so toggling the
+  // checkbox only repaints: no re-render and no pixel copy.
+  void SetShowRecoveredPixels(bool show) {
+    if (show == show_recovered_pixels_) {
+      return;
+    }
+    show_recovered_pixels_ = show;
+    Refresh();
+  }
+
+  bool ShowsRecoveredPixels() const {
+    return show_recovered_pixels_;
+  }
+
+  bool HasRecoveredPixelsToShow() const {
+    return converted_preview_ && !converted_preview_->recovered_mask.empty();
+  }
+
+  // Builds (once) and returns the pink overlay for the current preview, or an
+  // empty bitmap when there is nothing to overlay.  The cast is destructive, so
+  // it runs on a copy and the clean converted bitmap is kept alongside it.
+  const wxBitmap& CastBitmap() {
+    if (!cast_bitmap_valid_) {
+      cast_bitmap_valid_ = true;
+      cast_bitmap_ = wxBitmap();
+      if (converted_preview_ && !converted_preview_->recovered_mask.empty()) {
+        auto cast = std::make_shared<PreviewImage>(*converted_preview_);
+        if (ApplyRecoveredPixelCast(cast.get()) > 0) {
+          cast_bitmap_ = MakeBitmapFromPreview(cast);
+        }
+      }
+    }
+    return cast_bitmap_;
   }
 
   void SetComparisonMode(ComparisonMode mode) {
@@ -802,6 +855,7 @@ class CompareCanvas final : public wxScrolledWindow {
   }
 
  private:
+
   const wxBitmap* PrimaryBitmap() const {
     if (original_bitmap_.IsOk()) {
       return &original_bitmap_;
@@ -949,7 +1003,26 @@ class CompareCanvas final : public wxScrolledWindow {
     std::unique_ptr<wxGraphicsContext> graphics(wxGraphicsContext::Create(dc));
     wxGraphicsContext* gc = graphics.get();
     const wxBitmap& original = original_bitmap_.IsOk() ? original_bitmap_ : *primary;
-    const wxBitmap& converted = converted_bitmap_.IsOk() ? converted_bitmap_ : original;
+    // The converted pane draws the cast overlay when it is available and asked
+    // for; every other pane (and the Original comparison mode) draws the clean
+    // image.  The placement rule lives in
+    // ResolveRecoveredPixelCastPlacement so it is pinned by a unit test, and the
+    // overlay is built per preview independent of zoom: the bitmap is chosen
+    // before the pane scaling in DrawBitmap, so the cast scales with the image at
+    // every zoom level.
+    const RecoveredPixelCastPlacement cast_placement =
+        ResolveRecoveredPixelCastPlacement(
+            show_recovered_pixels_,
+            HasRecoveredPixelsToShow(),
+            comparison_mode_ != ComparisonMode::kOriginal,
+            comparison_mode_ != ComparisonMode::kConverted);
+    wxBitmap converted_source =
+        converted_bitmap_.IsOk() ? converted_bitmap_ : original;
+    const wxBitmap& cast = CastBitmap();
+    if (cast_placement.on_converted && cast.IsOk()) {
+      converted_source = cast;
+    }
+    const wxBitmap& converted = converted_source;
 
     if (comparison_mode_ == ComparisonMode::kSideBySide) {
       const wxSize client = GetClientSize();
@@ -1072,6 +1145,15 @@ class CompareCanvas final : public wxScrolledWindow {
   std::shared_ptr<const PreviewImage> converted_preview_;
   wxBitmap original_bitmap_;
   wxBitmap converted_bitmap_;
+  // Pre-built pink overlay for the converted preview.  Empty when the preview
+  // carries no recovery mask, so the Original pane and the "no mask" case both
+  // fall back to the clean bitmap.
+  wxBitmap cast_bitmap_;
+  // Whether cast_bitmap_ has been built for the current converted_preview_.
+  // Guarded by being built lazily and invalidated with the preview, so toggling
+  // the checkbox is a repaint rather than a rebuild.
+  bool cast_bitmap_valid_ = false;
+  bool show_recovered_pixels_ = false;
   ComparisonMode comparison_mode_ = ComparisonMode::kConverted;
   ZoomMode zoom_mode_ = ZoomMode::kFit;
   ZoomMode non_side_by_side_zoom_mode_ = ZoomMode::kFit;
@@ -1311,6 +1393,18 @@ class HiracoMainFrame final : public wxFrame {
     zoom_toolbar->Add(zoom_100_button_, 0, wxRIGHT, 4);
     zoom_toolbar->Add(zoom_in_button_, 0);
     preview_toolbar->Add(compare_toolbar, 0, wxALIGN_CENTER_VERTICAL);
+    preview_toolbar->AddStretchSpacer();
+    // Same bar as Compare and Zoom: marks the pixels ORI highlight recovery
+    // restored so the effect can be seen directly instead of inferred from the
+    // status line.  Per-selection state, like the queue card's ORI checkbox.
+    // A stretch spacer on both sides centres this group between Compare and
+    // Zoom instead of leaving it flush against Zoom.
+    auto* cast_toolbar = new wxBoxSizer(wxHORIZONTAL);
+    show_recovered_pixels_checkbox_ = new wxCheckBox(center_panel, wxID_ANY,
+                                                     "Show recovered pixels");
+    cast_toolbar->Add(show_recovered_pixels_checkbox_, 0,
+                      wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+    preview_toolbar->Add(cast_toolbar, 0, wxALIGN_CENTER_VERTICAL);
     preview_toolbar->AddStretchSpacer();
     preview_toolbar->Add(zoom_toolbar, 0, wxALIGN_CENTER_VERTICAL);
 
@@ -1700,6 +1794,14 @@ class HiracoMainFrame final : public wxFrame {
       compare_canvas_->ZoomIn();
       UpdateZoomButtons();
     });
+    show_recovered_pixels_checkbox_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) {
+      const bool show = show_recovered_pixels_checkbox_->IsChecked();
+      compare_canvas_->SetShowRecoveredPixels(show);
+      if (selected_row_ >= 0 && selected_row_ < static_cast<int>(queue_.size())) {
+        queue_[selected_row_].show_recovered_pixels = show;
+      }
+      UpdateRecoveredPixelCastControls();
+    });
     Bind(wxEVT_MENU, &HiracoMainFrame::OnQuit, this, wxID_EXIT);
     Bind(wxEVT_CLOSE_WINDOW, &HiracoMainFrame::OnCloseWindow, this);
     shutdown_timer_.Bind(wxEVT_TIMER, &HiracoMainFrame::OnShutdownTimer, this);
@@ -1799,6 +1901,29 @@ class HiracoMainFrame final : public wxFrame {
     zoom_50_button_->Enable(!side_by_side);
     zoom_100_button_->Enable(true);
     zoom_in_button_->Enable(!side_by_side);
+  }
+
+  // Syncs the "Show recovered pixels" checkbox with the selected item and with
+  // whether the current preview actually carries a recovery mask.  The control
+  // is disabled when there is nothing to show, so its meaning is never "the
+  // feature is broken" when the image simply has no recoverable highlights.
+  void UpdateRecoveredPixelCastControls() {
+    if (show_recovered_pixels_checkbox_ == nullptr) {
+      return;
+    }
+    const bool has_selection =
+        selected_row_ >= 0 && selected_row_ < static_cast<int>(queue_.size());
+    const bool has_mask = compare_canvas_->HasRecoveredPixelsToShow();
+    const bool requested =
+        has_selection && queue_[selected_row_].show_recovered_pixels;
+    show_recovered_pixels_checkbox_->Enable(has_selection && has_mask);
+    // SetValue can re-enter the event handler, so guard on the actual value.
+    if (show_recovered_pixels_checkbox_->GetValue() != requested) {
+      show_recovered_pixels_checkbox_->SetValue(requested);
+      compare_canvas_->SetShowRecoveredPixels(requested && has_mask);
+    } else {
+      compare_canvas_->SetShowRecoveredPixels(requested && has_mask);
+    }
   }
 
   void BeginStatusActivity(const wxString& message) {
@@ -2651,6 +2776,8 @@ class HiracoMainFrame final : public wxFrame {
     if (selected_row_ >= 0) {
       StartSelectionLoad();
     }
+    // The overlay state is per selection, so the checkbox follows the row.
+    UpdateRecoveredPixelCastControls();
   }
 
   void RemoveQueueRows(std::vector<int> rows) {
@@ -2673,6 +2800,7 @@ class HiracoMainFrame final : public wxFrame {
     } else {
       compare_canvas_->SetOriginalPreview(nullptr);
       compare_canvas_->SetConvertedPreview(nullptr);
+      UpdateRecoveredPixelCastControls();
       UpdateResolvedSliderValues();
       FinishStatusActivity("Ready");
     }
@@ -2714,6 +2842,7 @@ class HiracoMainFrame final : public wxFrame {
     selected_rows_.insert(row);
     RefreshQueue();
     StartSelectionLoad();
+    UpdateRecoveredPixelCastControls();
   }
 
   void StartSelectionLoad() {
@@ -2751,6 +2880,7 @@ class HiracoMainFrame final : public wxFrame {
     selection_cancel_ = std::make_shared<std::atomic_bool>(false);
     compare_canvas_->SetOriginalPreview(nullptr);
     compare_canvas_->SetConvertedPreview(nullptr);
+    UpdateRecoveredPixelCastControls();
     BeginStatusActivity("Loading original preview...");
 
     LaunchWorker(WorkerPriority::kInteractive, [this, item_copy, item_id, request_id, cancel_token = selection_cancel_]() {
@@ -2881,6 +3011,11 @@ class HiracoMainFrame final : public wxFrame {
       };
 
       std::string error;
+      // Snapshot the recovery-run sequence around the render: a fresh run
+      // increments it, a cached preview reuse does not.
+      const bool recovery_enabled = prepared.ShouldUseHighlightRecovery();
+      const HighlightRecoveryStats stats_before =
+          recovery_enabled ? GetLastHighlightRecoveryStats() : HighlightRecoveryStats{};
       if (!RenderConvertedFullPreview(&prepared,
                                       stage_overrides,
                                       kFullPreviewMaxDimension,
@@ -2893,6 +3028,14 @@ class HiracoMainFrame final : public wxFrame {
         payload.error = error;
       } else {
         payload.ok = true;
+      }
+      payload.recovery_enabled = recovery_enabled;
+      if (recovery_enabled) {
+        const HighlightRecoveryStats stats_after = GetLastHighlightRecoveryStats();
+        if (stats_after.run_sequence != stats_before.run_sequence) {
+          payload.recovery_stats = stats_after;
+          payload.recovery_stats_valid = true;
+        }
       }
 
       auto* event = new wxThreadEvent(EVT_HIRACO_CONVERTED_PREVIEW_READY);
@@ -2985,6 +3128,7 @@ class HiracoMainFrame final : public wxFrame {
     selected_rows_.clear();
     compare_canvas_->SetOriginalPreview(nullptr);
     compare_canvas_->SetConvertedPreview(nullptr);
+    UpdateRecoveredPixelCastControls();
     UpdateResolvedSliderValues();
     FinishStatusActivity("Ready");
     RefreshQueue();
@@ -3272,9 +3416,30 @@ class HiracoMainFrame final : public wxFrame {
     const int index = FindItemIndex(payload.item_id);
     if (index >= 0 && index == selected_row_) {
       compare_canvas_->SetConvertedPreview(payload.converted_preview);
+      // A freshly rendered preview carries the mask, so the overlay can be built
+      // for the new image and the checkbox enabled.
+      UpdateRecoveredPixelCastControls();
       NotePreviewCacheUse(index);
       EnforcePreviewCacheBudget();
-      FinishStatusActivity("Ready");
+      std::string ready_message = "Ready";
+      if (payload.recovery_enabled) {
+        if (payload.recovery_stats_valid) {
+          queue_[index].recovery_stats = payload.recovery_stats;
+          queue_[index].has_recovery_stats = true;
+        }
+        if (queue_[index].has_recovery_stats) {
+          const HighlightRecoveryStats& stats = queue_[index].recovery_stats;
+          if (!stats.applicable) {
+            ready_message = "Ready · highlight recovery not applicable to this image";
+          } else if (stats.changed == 0) {
+            ready_message = "Ready · highlight recovery: no recoverable highlights found";
+          } else {
+            ready_message = "Ready · highlight recovery: " +
+                            std::to_string(stats.changed) + " px restored";
+          }
+        }
+      }
+      FinishStatusActivity(ready_message);
     }
     StartQueuedConvertedPreviewIfIdle();
   }
@@ -3457,6 +3622,7 @@ class HiracoMainFrame final : public wxFrame {
   PaletteButton* zoom_50_button_ = nullptr;
   PaletteButton* zoom_100_button_ = nullptr;
   PaletteButton* zoom_in_button_ = nullptr;
+  wxCheckBox* show_recovered_pixels_checkbox_ = nullptr;
   wxChoice* compression_choice_ = nullptr;
   wxCollapsiblePane* output_options_pane_ = nullptr;
   wxRadioButton* specific_directory_radio_ = nullptr;

@@ -15,6 +15,59 @@ struct DngWriterRuntimeSummary {
 
 DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string& compression);
 
+// Diagnostics for the most recent ORI highlight-recovery run.  Surfaced in the
+// GUI status line so users can see recovery engage (or learn that the image has
+// no recoverable highlights) without HIRACO_DEBUG_HL_RECOVERY.  run_sequence
+// increments on every run so callers can distinguish a fresh run from a cached
+// preview render that skipped recovery entirely.
+struct HighlightRecoveryStats {
+  bool applicable = false;
+  uint64_t candidates = 0;
+  uint64_t changed = 0;
+  uint64_t run_sequence = 0;
+};
+
+// Which pane of the compare canvas the recovered-pixel cast is drawn on.
+// This is the whole of the "where does the cast appear" rule, kept in
+// hiraco-core so it can be tested without a GUI: the GUI's OnPaint only has to
+// ask this question once and draw the bitmap it returns.
+struct RecoveredPixelCastPlacement {
+  bool on_original = false;
+  bool on_converted = false;
+};
+
+// The cast marks what *recovery* changed, so it belongs to the converted image
+// only.  It is therefore drawn on the converted pane when the converted image is
+// visible at all, and never on the original: kOriginal shows the unprocessed ORF
+// preview, in which recovery never ran.  Zoom never changes the answer -- the
+// bitmap is picked before the pane scaling -- but it is a parameter anyway so the
+// rule is stated over every combination the user can reach.
+inline RecoveredPixelCastPlacement ResolveRecoveredPixelCastPlacement(
+    bool show_recovered_pixels,
+    bool has_recovered_mask,
+    bool converted_visible,
+    bool original_visible) {
+  (void)original_visible;  // The cast never goes on the original pane.
+  if (!show_recovered_pixels || !has_recovered_mask) {
+    return {};
+  }
+  RecoveredPixelCastPlacement placement;
+  placement.on_converted = converted_visible;
+  return placement;
+}
+
+HighlightRecoveryStats GetLastHighlightRecoveryStats();
+
+// Marks the recovered pixels of a converted preview so the GUI can show them.
+// Every pixel whose `recovered_mask` byte is 1 is replaced with solid pink
+// (255, 0, 255); every other pixel is left byte-identical, so the rest of the
+// preview is unchanged and the cast never touches a pixel recovery did not
+// recover.  Returns the number of pixels it changed.  A preview whose mask is
+// empty, sized differently from its pixels, or has fewer than three colours is
+// left untouched and reports 0, so the helper refuses caller bugs instead of
+// reading or writing out of bounds.
+size_t ApplyRecoveredPixelCast(PreviewImage* preview);
+
 ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata& metadata,
                                                    uint32_t width,
                                                    uint32_t height,

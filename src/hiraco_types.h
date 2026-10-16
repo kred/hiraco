@@ -146,6 +146,13 @@ struct PreviewImage {
   uint32_t colors = 0;
   uint32_t bits = 8;
   std::vector<uint8_t> pixels;
+  // Optional per-pixel overlay for the GUI's "show recovered pixels" cast: one
+  // byte per pixel in row-major order, 1 where ORI highlight recovery changed
+  // the pixel.  Empty (the default) means "no mask available", which is
+  // distinct from a valid all-zero mask and keeps every existing caller that
+  // never asks for the mask bit-identical.  Sized exactly width*height, so a
+  // mask can never be written out of bounds.
+  std::vector<uint8_t> recovered_mask;
 };
 
 struct CropRect {

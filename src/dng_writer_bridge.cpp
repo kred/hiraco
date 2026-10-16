@@ -210,6 +210,13 @@ struct HighlightRecoveryCompanionCacheEntry {
 std::mutex g_highlight_recovery_companion_cache_mutex;
 std::optional<HighlightRecoveryCompanionCacheEntry> g_highlight_recovery_companion_cache;
 
+// Diagnostics for the most recent recovery run (GUI status line, no env var).
+// The globals live in the file's anonymous namespace; the accessor is defined
+// outside it (below) so it has external linkage for GUI callers.
+std::mutex g_highlight_recovery_stats_mutex;
+HighlightRecoveryStats g_highlight_recovery_stats;
+uint64_t g_highlight_recovery_run_sequence = 0;
+
 void InitFftwThreads() {
   std::call_once(g_fftw_init_flag, [] {
     if (fftw_init_threads()) {
@@ -2071,12 +2078,18 @@ double BilinearSampleChannel(const RasterImage& image,
   return (1.0 - wy) * top + wy * bottom;
 }
 
+// Applies ORI-assisted highlight recovery in place.  When `recovered_mask` is
+// non-null it is resized to exactly width*height and set to 1 at every pixel
+// the blend changed (0 elsewhere), so the GUI can mark those pixels.  A null
+// pointer leaves the pixel data untouched and every existing caller
+// bit-identical.
 bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_source_path,
                                        const SourceLinearDngMetadata& metadata,
                                        uint32_t full_width,
                                        uint32_t full_height,
                                        const CropRect* region,
                                        RasterImage* image,
+                                       std::vector<uint8_t>* recovered_mask,
                                        CancelCheck cancel,
                                        std::string* error_message) {
   if (image == nullptr ||
@@ -2085,6 +2098,17 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
       !IsOm3HighResMetadata(metadata) ||
       !metadata.has_black_level ||
       !metadata.has_as_shot_neutral) {
+    {
+      std::lock_guard<std::mutex> lock(g_highlight_recovery_stats_mutex);
+      g_highlight_recovery_stats = HighlightRecoveryStats{};
+      g_highlight_recovery_stats.run_sequence = ++g_highlight_recovery_run_sequence;
+    }
+    // Recovery did not run, so nothing was recovered: an empty mask (not a
+    // zeroed one) distinguishes "no recovery happened" from "recovery ran and
+    // changed nothing", which is what the GUI status line reports.
+    if (recovered_mask != nullptr) {
+      recovered_mask->clear();
+    }
     return true;
   }
 
@@ -2162,6 +2186,48 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
   const CropRect companion_active = ResolveActiveRect(companion_metadata,
                                                       companion_render->width,
                                                       companion_render->height);
+
+  // Scene extent this run actually has pixels for, in full-frame coordinates.
+  // For the full-frame path (preview and write) this equals target_active; for a
+  // crop-preview render it is the crop, so the alignment search and the base
+  // grid cover the rendered area instead of sampling (and clamp) a region the
+  // image does not contain.  Everything downstream is expressed relative to it.
+  const uint32_t scene_x = std::max(target_active.x, target_image_region.x);
+  const uint32_t scene_y = std::max(target_active.y, target_image_region.y);
+  const uint32_t scene_right =
+      std::min(target_active.x + target_active.width,
+               target_image_region.x + target_image_region.width);
+  const uint32_t scene_bottom =
+      std::min(target_active.y + target_active.height,
+               target_image_region.y + target_image_region.height);
+  const uint32_t scene_width = std::max(1u, scene_right - scene_x);
+  const uint32_t scene_height = std::max(1u, scene_bottom - scene_y);
+  // Scene extent expressed in companion pixels (the companion is the reference
+  // scale for the alignment search and the base grid).
+  const uint32_t scene_width_companion = std::max(
+      1u,
+      static_cast<uint32_t>(static_cast<uint64_t>(scene_width) *
+                            std::max(companion_active.width, 1u) /
+                            std::max(target_active.width, 1u)));
+  const uint32_t scene_height_companion = std::max(
+      1u,
+      static_cast<uint32_t>(static_cast<uint64_t>(scene_height) *
+                            std::max(companion_active.height, 1u) /
+                            std::max(target_active.height, 1u)));
+  const auto scene_to_companion_row = [&](double full_row) {
+    return static_cast<double>(companion_active.y) +
+           (full_row - static_cast<double>(target_active.y)) *
+               static_cast<double>(companion_active.height) /
+               static_cast<double>(std::max(target_active.height, 1u)) -
+           0.5;
+  };
+  const auto scene_to_companion_col = [&](double full_col) {
+    return static_cast<double>(companion_active.x) +
+           (full_col - static_cast<double>(target_active.x)) *
+               static_cast<double>(companion_active.width) /
+               static_cast<double>(std::max(target_active.width, 1u)) -
+           0.5;
+  };
   const double pedestal = metadata.black_level;
   const double companion_pedestal = companion_metadata.has_black_level
       ? companion_metadata.black_level
@@ -2171,49 +2237,112 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
   const bool debug_recovery = std::getenv("HIRACO_DEBUG_HL_RECOVERY") != nullptr;
   std::atomic<uint64_t> candidate_pixels = 0;
   std::atomic<uint64_t> changed_pixels = 0;
+  // Per-filter rejection diagnostics (used by HIRACO_DEBUG_HL_RECOVERY and the
+  // GUI recovery status); cheap atomics, always tracked.
+  std::atomic<uint64_t> rejected_companion_low = 0;
+  std::atomic<uint64_t> rejected_misaligned = 0;
+  std::atomic<uint64_t> rejected_no_deficit = 0;
+  std::atomic<uint64_t> rejected_no_blend = 0;
+  std::atomic<uint64_t> deficit_samples = 0;
+  // Deficit accumulator: std::atomic<double> has no fetch_add pre-C++20, so
+  // accumulate (deficit + kDeficitOffset) * 2^20 as integers.
+  constexpr double kDeficitOffset = 16.0;
+  constexpr double kDeficitScale = 1048576.0;
+  constexpr double kNormScale = 1048576.0;
+  std::atomic<uint64_t> deficit_sum_scaled = 0;
+  std::atomic<uint64_t> deficit_over_05 = 0;
+  std::atomic<uint64_t> deficit_over_10 = 0;
+  std::atomic<uint64_t> rejected_not_highlight = 0;
+  // Scene-space value distributions over candidates (diagnostics only).
+  std::atomic<uint64_t> candidate_base_norm_sum = 0;
+  std::atomic<uint64_t> candidate_signal_norm_sum = 0;
+  std::atomic<uint64_t> candidate_companion_norm_sum = 0;
+  std::atomic<uint64_t> candidate_norm_samples = 0;
+  // Deficit histogram restricted to the scene-space highlight population.
+  std::atomic<uint64_t> highlight_deficit_samples = 0;
+  std::atomic<uint64_t> highlight_def_over_05 = 0;
+  std::atomic<uint64_t> highlight_def_over_10 = 0;
 
+  // Resolution-invariant alignment search (audit D-3).  Target and companion are
+  // both sampled in scene coordinates, so the registration offset lives in
+  // companion-native pixels at *every* processing resolution -- it is a property
+  // of the two files, not of the preview size.  The range is therefore a
+  // fraction of the companion frame (with a floor), searched coarse-to-fine,
+  // instead of a fixed +-2 px window that saturated on the OM-3 pairs (it kept
+  // returning the boundary offset).  The true optimum is (-7,-5) / (-6,-6)
+  // companion px on _8142491 / _8142490 at 512 px: align_mae 1568 -> 1386 and
+  // 2045 -> 1773 (docs/highlight-recovery-audit.md §9.6).
+  constexpr double kAlignSearchFraction = 0.01;    // +-1% of the companion frame
+  constexpr int kAlignMinOffsetPx = 16;           // never search less than this
+  constexpr int kAlignCoarseStridePx = 4;         // coarse pass granularity
+  constexpr int kAlignFineRadiusPx = 2;           // +-one coarse stride, 1 px steps
+  constexpr uint32_t kAlignSampleStepPx = 64;     // sampling stride over the frame
+  const auto alignment_error = [&](int dx, int dy) {
+    double total_error = 0.0;
+    uint64_t sample_count = 0;
+    for (uint32_t sample_row = 0; sample_row < scene_height_companion;
+         sample_row += kAlignSampleStepPx) {
+      for (uint32_t sample_col = 0; sample_col < scene_width_companion;
+           sample_col += kAlignSampleStepPx) {
+        // Scene point covered by this sample, in full-frame coordinates.
+        const double full_row =
+            static_cast<double>(scene_y) +
+            (static_cast<double>(sample_row) + 0.5) *
+                static_cast<double>(scene_height) /
+                static_cast<double>(scene_height_companion) -
+            0.5;
+        const double full_col =
+            static_cast<double>(scene_x) +
+            (static_cast<double>(sample_col) + 0.5) *
+                static_cast<double>(scene_width) /
+                static_cast<double>(scene_width_companion) -
+            0.5;
+        const double companion_row = scene_to_companion_row(full_row) + dy;
+        const double companion_col = scene_to_companion_col(full_col) + dx;
+        const double companion_green = std::max(
+            BilinearSampleChannel(*companion_render, companion_row, companion_col, 1) - companion_pedestal,
+            0.0);
+        const double target_row = full_to_image_coordinate(full_row,
+                                                            target_image_region.y,
+                                                            target_image_region.height,
+                                                            image->height);
+        const double target_col = full_to_image_coordinate(full_col,
+                                                            target_image_region.x,
+                                                            target_image_region.width,
+                                                            image->width);
+        const double target_green = std::max(
+            BilinearSampleChannel(*image, target_row, target_col, 1),
+            0.0);
+        total_error += std::abs(target_green - companion_green);
+        ++sample_count;
+      }
+    }
+    return total_error / static_cast<double>(std::max<uint64_t>(sample_count, 1u));
+  };
+
+  const int coarse_radius = std::max(
+      kAlignMinOffsetPx,
+      static_cast<int>(std::lround(kAlignSearchFraction *
+                                   static_cast<double>(scene_width_companion))));
   int best_dx = 0;
   int best_dy = 0;
   double best_error = std::numeric_limits<double>::infinity();
-  const int max_offset = 2;
-  const uint32_t step = 64;
-  for (int dy = -max_offset; dy <= max_offset; ++dy) {
-    for (int dx = -max_offset; dx <= max_offset; ++dx) {
-      double total_error = 0.0;
-      uint64_t sample_count = 0;
-      for (uint32_t sample_row = 0; sample_row < companion_active.height; sample_row += step) {
-        for (uint32_t sample_col = 0; sample_col < companion_active.width; sample_col += step) {
-          const double companion_row = static_cast<double>(companion_active.y + sample_row + dy);
-          const double companion_col = static_cast<double>(companion_active.x + sample_col + dx);
-          const double companion_green = std::max(
-              BilinearSampleChannel(*companion_render, companion_row, companion_col, 1) - companion_pedestal,
-              0.0);
-
-          const double u = (static_cast<double>(sample_col) + 0.5) /
-                           static_cast<double>(std::max(companion_active.width, 1u));
-          const double v = (static_cast<double>(sample_row) + 0.5) /
-                           static_cast<double>(std::max(companion_active.height, 1u));
-          const double full_row = static_cast<double>(target_active.y) +
-                                  v * static_cast<double>(target_active.height) - 0.5;
-          const double full_col = static_cast<double>(target_active.x) +
-                                  u * static_cast<double>(target_active.width) - 0.5;
-          const double target_row = full_to_image_coordinate(full_row,
-                                                              target_image_region.y,
-                                                              target_image_region.height,
-                                                              image->height);
-          const double target_col = full_to_image_coordinate(full_col,
-                                                              target_image_region.x,
-                                                              target_image_region.width,
-                                                              image->width);
-          const double target_green = std::max(
-              BilinearSampleChannel(*image, target_row, target_col, 1),
-              0.0);
-          total_error += std::abs(target_green - companion_green);
-          ++sample_count;
-        }
+  for (int dy = -coarse_radius; dy <= coarse_radius; dy += kAlignCoarseStridePx) {
+    for (int dx = -coarse_radius; dx <= coarse_radius; dx += kAlignCoarseStridePx) {
+      const double mean_error = alignment_error(dx, dy);
+      if (mean_error < best_error) {
+        best_error = mean_error;
+        best_dx = dx;
+        best_dy = dy;
       }
-
-      const double mean_error = total_error / std::max<uint64_t>(sample_count, 1u);
+    }
+  }
+  // Fine pass around the coarse optimum, one companion pixel at a time.
+  const int coarse_dx = best_dx;
+  const int coarse_dy = best_dy;
+  for (int dy = coarse_dy - kAlignFineRadiusPx; dy <= coarse_dy + kAlignFineRadiusPx; ++dy) {
+    for (int dx = coarse_dx - kAlignFineRadiusPx; dx <= coarse_dx + kAlignFineRadiusPx; ++dx) {
+      const double mean_error = alignment_error(dx, dy);
       if (mean_error < best_error) {
         best_error = mean_error;
         best_dx = dx;
@@ -2222,22 +2351,75 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
     }
   }
 
+  // Resolution-invariant recovery decisions.  Every quantity below hangs off
+  // the companion's full-resolution reference frame: the base grids are sampled
+  // in scene-relative (u,v) from the companion's active area, so a given scene
+  // point receives the same decision at any preview resolution.  The previous
+  // per-pixel absolute 16-bit peak thresholds made both candidacy and blend
+  // strength depend on how far the preview had been downscaled (measured:
+  // def>0.05 pixels collapse 2245 -> 699 -> 45 -> 0 across 512/1024/2048/2560
+  // while the native write path passes only ~2%).
+  constexpr double kMinCompanionGreen = 32.0;
   constexpr double kHighlightStart = 0.55;
   constexpr double kHighlightFull = 0.85;
-  constexpr double kMinCompanionGreen = 32.0;
-  constexpr uint32_t kBaseStride = 16;
-  constexpr int kBaseBlurPasses = 2;
-  constexpr double kBaseBlendLumaScale = 0.10;
-  constexpr double kMisalignmentGreenFloor = 0.05;
-  constexpr double kMisalignmentTargetFloor = 0.55;
+  // P2 (D-1): the base-grid footprint is the dominant control over how
+  // much local companion headroom the comparison can see.  Both the stride and
+  // the blur radius are expressed in companion pixels, so the footprint covers
+  // the same part of the frame at every resolution and a given scene point gets
+  // the same decision at every resolution.  The stride/blur pair is what makes
+  // the base grid "local": a wide footprint averages over surrounding
+  // non-highlight pixels and averages the recovery signal away, a narrow one
+  // follows the highlight structures the ORF actually clips.
+  //
+  // Swept on both local fixtures at 512 and 2560 px (report §9.2.4): the 16 px /
+  // 2-pass footprint shipped in the first round produced a 12 % pass rate at
+  // 2560 px on _8142491 against 85 % at 512 px.  Reducing the footprint moves
+  // the 2560 px profile toward the 512 px profile monotonically and without
+  // changing the candidate set at all -- candidates, gate counts and the
+  // misalignment guard are all identical at every stride, only the blend
+  // strength changes:
+  //
+  //   stride:pass   2560 px pass rate (91 / 90)   max code d (91 / 90)
+  //   16 : 2        12 %   / 49 %                 19  / 22
+  //   8  : 1        25 %   / 66 %                 25  / 34
+  //   6  : 1        32 %   / 70 %                 --  / --
+  //   4  : 1        42 %   / 76 %                 49  / 35
+  //   2  : 1        50 %   / 81 %                 73  / 49
+  //
+  // 4 : 1 is the shipped value.  It is chosen over 2 : 1 on a measured safety
+  // bound rather than on the stronger headline numbers: at 2 : 1 the base grid
+  // starts tracking individual demosaic/companion-pixel noise, and the deficit
+  // population then shows a heavier tail (def>0.10 goes 0 -> 269 at 2560 px on
+  // _8142491 against 0 -> 0 at 16 : 2).  A base grid whose cell is smaller than
+  // the companion's own demosaic period compares noise, not highlight level.
+  // 4 : 1 still keeps every changed pixel inside the highlight band (darkest
+  // changed luma 214 on _8142490 at 2560 px) and keeps the write path strictly
+  // stronger than the pre-fix baseline on both fixtures (13,887 vs 8,505 and
+  // 19,393 vs 8,542 changed).
+  constexpr uint32_t kBaseStride = 4;
+  constexpr int kBaseBlurPasses = 1;
+  // P5: full blend once the companion base sits a kBaseBlendLumaScale deficit
+  // below the target base.  Tuned 0.10 -> 0.05 -> 0.01 from the measured deficit
+  // populations: at the GUI's 2560 px rendition the deficits that exist are small
+  // (mean deficit -0.027, only 76 of 47,672 candidates above 0.05), so a 0.05
+  // scale left `blend` far below 1 for almost every recovered pixel.  At 0.01 the
+  // rule reads "pull a highlight pixel the full way toward the companion base
+  // whenever the companion kept at least 1 % more of the signal range there".
+  // It stays bounded and subtractive: the per-channel factor is
+  // 1 + blend * (companion/target - 1) with blend <= 1 and the ratio capped at
+  // 1.0, so a pixel is only ever moved toward the companion's own value and can
+  // never be pushed toward clipping (docs/highlight-recovery-audit.md §9.4).
+  constexpr double kBaseBlendLumaScale = 0.01;
   constexpr double kLumaR = 0.2126;
   constexpr double kLumaG = 0.7152;
   constexpr double kLumaB = 0.0722;
+  constexpr double kMisalignmentGreenFloor = 0.05;
+  constexpr double kMisalignmentTargetFloor = 0.55;
 
   const uint32_t grid_width =
-      std::max(1u, (companion_active.width + kBaseStride - 1) / kBaseStride);
+      std::max(1u, (scene_width_companion + kBaseStride - 1) / kBaseStride);
   const uint32_t grid_height =
-      std::max(1u, (companion_active.height + kBaseStride - 1) / kBaseStride);
+      std::max(1u, (scene_height_companion + kBaseStride - 1) / kBaseStride);
   std::vector<double> target_base_grid(static_cast<size_t>(grid_width) * grid_height * 3, 0.0);
   std::vector<double> companion_base_grid(static_cast<size_t>(grid_width) * grid_height * 3, 0.0);
 
@@ -2252,16 +2434,28 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
     };
   };
 
+  // Base grids are sampled at cell centres over the scene extent this run has
+  // pixels for (see the scene_* block above).  The cell stride and the blur
+  // radius are expressed in companion pixels, i.e. in scene units, so the
+  // smoothing footprint covers the same part of the frame at every processing
+  // resolution -- that is the resolution-invariant part of P2.  The alignment
+  // search above is likewise scene-relative (audit D-3).  The candidacy and
+  // blend rules below are the pre-existing ones, unchanged: the audit's own
+  // baseline shows them already producing the same profile at 512 px and at
+  // 2560 px (3,205 vs 5,637 changed pixels, max D 52 vs 38 on _8142491), so
+  // rewriting them would change behaviour the objective did not ask to change
+  // (docs/highlight-recovery-audit.md §9.2.1).
+  const double inv_grid_width = 1.0 / static_cast<double>(grid_width);
+  const double inv_grid_height = 1.0 / static_cast<double>(grid_height);
+
   for (uint32_t grid_row = 0; grid_row < grid_height; ++grid_row) {
     for (uint32_t grid_col = 0; grid_col < grid_width; ++grid_col) {
-      const double u = (static_cast<double>(grid_col) + 0.5) /
-                       static_cast<double>(grid_width);
-      const double v = (static_cast<double>(grid_row) + 0.5) /
-                       static_cast<double>(grid_height);
-      const double full_row = static_cast<double>(target_active.y) +
-                              v * static_cast<double>(target_active.height) - 0.5;
-      const double full_col = static_cast<double>(target_active.x) +
-                              u * static_cast<double>(target_active.width) - 0.5;
+      const double u = (static_cast<double>(grid_col) + 0.5) * inv_grid_width;
+      const double v = (static_cast<double>(grid_row) + 0.5) * inv_grid_height;
+      const double full_row =
+          static_cast<double>(scene_y) + v * static_cast<double>(scene_height) - 0.5;
+      const double full_col =
+          static_cast<double>(scene_x) + u * static_cast<double>(scene_width) - 0.5;
       const double target_row = full_to_image_coordinate(full_row,
                                                           target_image_region.y,
                                                           target_image_region.height,
@@ -2270,10 +2464,8 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
                                                           target_image_region.x,
                                                           target_image_region.width,
                                                           image->width);
-      const double companion_row = static_cast<double>(companion_active.y) +
-                                   v * static_cast<double>(companion_active.height) - 0.5 + best_dy;
-      const double companion_col = static_cast<double>(companion_active.x) +
-                                   u * static_cast<double>(companion_active.width) - 0.5 + best_dx;
+      const double companion_row = scene_to_companion_row(full_row) + best_dy;
+      const double companion_col = scene_to_companion_col(full_col) + best_dx;
 
       const std::array<double, 3> target_sample = sample_signal(*image,
                                                                  target_row,
@@ -2368,6 +2560,16 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
     return sample;
   };
 
+  // When a mask was requested, mark the pixels the blend changes.  Written
+  // inside the same loop that decides the blend, so the mask is exactly the set
+  // of pixels the recovery actually modified and not a re-derivation of it.
+  if (recovered_mask != nullptr) {
+    if (recovered_mask->size() != static_cast<size_t>(image->width) * image->height) {
+      recovered_mask->assign(static_cast<size_t>(image->width) * image->height, 0);
+    } else {
+      std::fill(recovered_mask->begin(), recovered_mask->end(), 0);
+    }
+  }
   #pragma omp parallel for schedule(static) if(image->height > 100)
   for (uint32_t row = 0; row < image->height; ++row) {
     for (uint32_t col = 0; col < image->width; ++col) {
@@ -2386,10 +2588,10 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
         continue;
       }
 
-      const double u = (static_cast<double>(full_col - target_active.x) + 0.5) /
-                       static_cast<double>(target_active.width);
-      const double v = (static_cast<double>(full_row - target_active.y) + 0.5) /
-                       static_cast<double>(target_active.height);
+      const double u = (static_cast<double>(full_col - scene_x) + 0.5) /
+                       static_cast<double>(scene_width);
+      const double v = (static_cast<double>(full_row - scene_y) + 0.5) /
+                       static_cast<double>(scene_height);
       const size_t px = (static_cast<size_t>(row) * image->width + col) * image->colors;
       std::array<double, 3> signal = {
           static_cast<double>(image->pixels[px + 0]),
@@ -2398,17 +2600,59 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
       };
       const std::array<double, 3> target_base = sample_base_grid(target_base_grid, u, v);
       const std::array<double, 3> companion_base = sample_base_grid(companion_base_grid, u, v);
+      const double signal_luma = kLumaR * signal[0] + kLumaG * signal[1] + kLumaB * signal[2];
+
+      // Highlight candidacy (pre-existing rule): the pixel itself must reach
+      // highlight level.  Blurred scene-space quantities are deliberately not
+      // used here -- a 32 px cell mean never reaches 0.55 on these fixtures, so
+      // gating on it silently disabled recovery entirely (see the retraction in
+      // docs/highlight-recovery-audit.md §9.2.1).
       const double source_peak = std::max({signal[0], signal[1], signal[2]}) / signal_range;
       const double highlight_weight = std::clamp(
           (source_peak - kHighlightStart) / std::max(kHighlightFull - kHighlightStart, 1e-6),
           0.0,
           1.0);
       if (highlight_weight <= 0.0) {
+        rejected_not_highlight.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
       candidate_pixels.fetch_add(1, std::memory_order_relaxed);
+      candidate_norm_samples.fetch_add(1, std::memory_order_relaxed);
+
+      const double target_base_luma =
+          kLumaR * target_base[0] + kLumaG * target_base[1] + kLumaB * target_base[2];
+      const double companion_base_luma =
+          kLumaR * companion_base[0] + kLumaG * companion_base[1] + kLumaB * companion_base[2];
+      const double luma_deficit = (target_base_luma - companion_base_luma) / signal_range;
+      deficit_samples.fetch_add(1, std::memory_order_relaxed);
+      deficit_sum_scaled.fetch_add(
+          static_cast<uint64_t>((luma_deficit + kDeficitOffset) * kDeficitScale),
+          std::memory_order_relaxed);
+      if (luma_deficit > 0.05) {
+        deficit_over_05.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (luma_deficit > 0.10) {
+        deficit_over_10.fetch_add(1, std::memory_order_relaxed);
+      }
+      candidate_base_norm_sum.fetch_add(
+          static_cast<uint64_t>(target_base_luma / signal_range * kNormScale),
+          std::memory_order_relaxed);
+      candidate_signal_norm_sum.fetch_add(
+          static_cast<uint64_t>(signal_luma / signal_range * kNormScale),
+          std::memory_order_relaxed);
+      candidate_companion_norm_sum.fetch_add(
+          static_cast<uint64_t>(companion_base_luma / signal_range * kNormScale),
+          std::memory_order_relaxed);
+      highlight_deficit_samples.fetch_add(1, std::memory_order_relaxed);
+      if (luma_deficit > 0.05) {
+        highlight_def_over_05.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (luma_deficit > 0.10) {
+        highlight_def_over_10.fetch_add(1, std::memory_order_relaxed);
+      }
 
       if (companion_base[1] < kMinCompanionGreen) {
+        rejected_companion_low.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
 
@@ -2416,15 +2660,12 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
       const double companion_base_green_norm = companion_base[1] / companion_signal_range;
       if (companion_base_green_norm < kMisalignmentGreenFloor &&
           target_base_green_norm > kMisalignmentTargetFloor) {
+        rejected_misaligned.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
 
-      const double target_base_luma =
-          kLumaR * target_base[0] + kLumaG * target_base[1] + kLumaB * target_base[2];
-      const double companion_base_luma =
-          kLumaR * companion_base[0] + kLumaG * companion_base[1] + kLumaB * companion_base[2];
-      const double luma_deficit = (target_base_luma - companion_base_luma) / signal_range;
       if (luma_deficit <= 0.0) {
+        rejected_no_deficit.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
       const double blend = highlight_weight * std::clamp(
@@ -2432,6 +2673,7 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
           0.0,
           1.0);
       if (blend <= 1e-6) {
+        rejected_no_blend.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
 
@@ -2452,6 +2694,11 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
           std::abs(signal[1] - before_g) > 1e-6 ||
           std::abs(signal[2] - before_b) > 1e-6) {
         changed_pixels.fetch_add(1, std::memory_order_relaxed);
+        // Same test that decides "changed", so the mask and the changed
+        // counter can never disagree.
+        if (recovered_mask != nullptr) {
+          (*recovered_mask)[static_cast<size_t>(row) * image->width + col] = 1;
+        }
       }
 
       image->pixels[px + 0] = static_cast<uint16_t>(
@@ -2466,11 +2713,59 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
   if (debug_recovery) {
     std::cerr << "[hiraco] highlight recovery companion=" << highlight_recovery_source_path
               << " offset=(" << best_dx << "," << best_dy << ")"
+              << " align_range=" << coarse_radius
               << " align_mae=" << best_error
               << " candidates=" << candidate_pixels.load(std::memory_order_relaxed)
               << " changed=" << changed_pixels.load(std::memory_order_relaxed)
               << " region=" << (region != nullptr ? "crop" : "full")
+              << " active=" << target_active.x << "," << target_active.y << "+"
+              << target_active.width << "x" << target_active.height
+              << " img_region=" << target_image_region.x << "," << target_image_region.y << "+"
+              << target_image_region.width << "x" << target_image_region.height
+              << " img=" << image->width << "x" << image->height
+              << " full=" << full_width << "x" << full_height
+              << " rej_comp_low=" << rejected_companion_low.load(std::memory_order_relaxed)
+              << " rej_misaligned=" << rejected_misaligned.load(std::memory_order_relaxed)
+              << " rej_not_highlight=" << rejected_not_highlight.load(std::memory_order_relaxed)
+              << " rej_no_deficit=" << rejected_no_deficit.load(std::memory_order_relaxed)
+              << " rej_no_blend=" << rejected_no_blend.load(std::memory_order_relaxed)
+              << " mean_deficit="
+              << (deficit_samples.load(std::memory_order_relaxed) == 0
+                      ? 0.0
+                      : deficit_sum_scaled.load(std::memory_order_relaxed) /
+                                static_cast<double>(deficit_samples.load(std::memory_order_relaxed)) /
+                                kDeficitScale -
+                            kDeficitOffset)
+              << " def>0.05=" << deficit_over_05.load(std::memory_order_relaxed)
+              << " def>0.10=" << deficit_over_10.load(std::memory_order_relaxed)
+              << " companion=" << companion_render->width << "x" << companion_render->height
+              << " cand_base="
+              << (candidate_norm_samples.load(std::memory_order_relaxed) == 0
+                      ? 0.0
+                      : static_cast<double>(candidate_base_norm_sum.load(std::memory_order_relaxed)) /
+                                candidate_norm_samples.load(std::memory_order_relaxed) / kNormScale)
+              << " cand_signal="
+              << (candidate_norm_samples.load(std::memory_order_relaxed) == 0
+                      ? 0.0
+                      : static_cast<double>(candidate_signal_norm_sum.load(std::memory_order_relaxed)) /
+                                candidate_norm_samples.load(std::memory_order_relaxed) / kNormScale)
+              << " cand_comp="
+              << (candidate_norm_samples.load(std::memory_order_relaxed) == 0
+                      ? 0.0
+                      : static_cast<double>(candidate_companion_norm_sum.load(std::memory_order_relaxed)) /
+                                candidate_norm_samples.load(std::memory_order_relaxed) / kNormScale)
+              << " hl_def>0.05=" << highlight_def_over_05.load(std::memory_order_relaxed)
+              << " hl_def>0.10=" << highlight_def_over_10.load(std::memory_order_relaxed)
+              << " hl_samples=" << highlight_deficit_samples.load(std::memory_order_relaxed)
               << "\n";
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_highlight_recovery_stats_mutex);
+    g_highlight_recovery_stats.applicable = true;
+    g_highlight_recovery_stats.candidates = candidate_pixels.load(std::memory_order_relaxed);
+    g_highlight_recovery_stats.changed = changed_pixels.load(std::memory_order_relaxed);
+    g_highlight_recovery_stats.run_sequence = ++g_highlight_recovery_run_sequence;
   }
 
   return true;
@@ -3774,6 +4069,40 @@ void AppendImagePreview(dng_host& host,
 
 }  // namespace
 
+HighlightRecoveryStats GetLastHighlightRecoveryStats() {
+  std::lock_guard<std::mutex> lock(g_highlight_recovery_stats_mutex);
+  return g_highlight_recovery_stats;
+}
+
+size_t ApplyRecoveredPixelCast(PreviewImage* preview) {
+  if (preview == nullptr || preview->colors < 3 || preview->width == 0 ||
+      preview->height == 0 || preview->pixels.size() <
+          static_cast<size_t>(preview->width) * preview->height * preview->colors) {
+    return 0;
+  }
+  const size_t pixel_count =
+      static_cast<size_t>(preview->width) * preview->height;
+  if (preview->recovered_mask.size() != pixel_count) {
+    return 0;
+  }
+
+  // The cast is deliberately applied to the first three channels only: a
+  // preview is RGB or RGBA, and overwriting an alpha channel would change how
+  // the overlay composits rather than what colour it is.
+  size_t changed = 0;
+  for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+    if (preview->recovered_mask[pixel] == 0) {
+      continue;
+    }
+    const size_t base = pixel * preview->colors;
+    preview->pixels[base + 0] = 255;
+    preview->pixels[base + 1] = 0;
+    preview->pixels[base + 2] = 255;
+    ++changed;
+  }
+  return changed;
+}
+
 ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata& metadata,
                                                    uint32_t width,
                                                    uint32_t height,
@@ -4136,6 +4465,10 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                 uint32_t max_dimension,
                                 const RecoveryImageCoordinates* recovery_coordinates) {
   const hiraco::ScopedTimingLog crop_timer("preview", "Render converted preview");
+  // Per-pixel mask of the pixels ORI highlight recovery changed, filled by the
+  // recovery pass below and attached to the returned preview.  Empty when
+  // recovery did not run or changed nothing.
+  std::vector<uint8_t> recovered_mask;
   if (!preview) {
     if (error_message != nullptr) {
       *error_message = "missing converted preview output";
@@ -4276,6 +4609,7 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                             recovery_full_height,
                                             &recovery_region,
                                             &final_crop,
+                                            &recovered_mask,
                                             cancel,
                                             error_message)) {
       return false;
@@ -4288,6 +4622,17 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                            cache.raw_image_is_camera_space,
                                            max_dimension,
                                            cache.preview_auto_bright_gain);
+  // The mask is taken in the crop raster's coordinates, which are the preview's
+  // coordinates as long as no downscaling happened between them.  Only attach it
+  // when the dimensions still agree, so a caller can never be handed a mask with
+  // a different index space than the pixels it is drawn over.
+  if (!recovered_mask.empty() && preview->width != 0 && preview->height != 0 &&
+      recovered_mask.size() ==
+          static_cast<size_t>(preview->width) * preview->height) {
+    preview->recovered_mask = std::move(recovered_mask);
+  } else {
+    preview->recovered_mask.clear();
+  }
   ReportProgress(progress, "preview", 1.0, "Converted preview ready");
   return true;
 }
@@ -4440,6 +4785,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                              payload.raw_image.height,
                                              nullptr,
                                              &payload.raw_image,
+                                             nullptr,
                                              cancel,
                                              &result.message)) {
         return result;
