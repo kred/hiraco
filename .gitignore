@@ -33,6 +33,15 @@ bin/
 obj/
 .vscode/
 
+# Local tooling state: the pi agent's own goal ledger and session bookkeeping.
+.pi/
+
+# Scratch artefacts from local recovery runs.
+recovery_debug.txt
+
+# Sidecar files next to the gitignored *.ORF / *.ORI fixtures.
+*.dop
+
 # Patch leftovers from the DNG SDK patch machinery in CMakeLists.txt.
 *.rej
 *.orig
