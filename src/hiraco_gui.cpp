@@ -1917,13 +1917,12 @@ class HiracoMainFrame final : public wxFrame {
     const bool requested =
         has_selection && queue_[selected_row_].show_recovered_pixels;
     show_recovered_pixels_checkbox_->Enable(has_selection && has_mask);
-    // SetValue can re-enter the event handler, so guard on the actual value.
+    // SetValue can re-enter the event handler, so only touch it when the value
+    // actually differs; the canvas is synced either way.
     if (show_recovered_pixels_checkbox_->GetValue() != requested) {
       show_recovered_pixels_checkbox_->SetValue(requested);
-      compare_canvas_->SetShowRecoveredPixels(requested && has_mask);
-    } else {
-      compare_canvas_->SetShowRecoveredPixels(requested && has_mask);
     }
+    compare_canvas_->SetShowRecoveredPixels(requested && has_mask);
   }
 
   void BeginStatusActivity(const wxString& message) {

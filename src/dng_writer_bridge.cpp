@@ -2235,33 +2235,41 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
   const double signal_range = std::max(65535.0 - pedestal, 1.0);
   const double companion_signal_range = std::max(65535.0 - companion_pedestal, 1.0);
   const bool debug_recovery = std::getenv("HIRACO_DEBUG_HL_RECOVERY") != nullptr;
-  std::atomic<uint64_t> candidate_pixels = 0;
-  std::atomic<uint64_t> changed_pixels = 0;
-  // Per-filter rejection diagnostics (used by HIRACO_DEBUG_HL_RECOVERY and the
-  // GUI recovery status); cheap atomics, always tracked.
-  std::atomic<uint64_t> rejected_companion_low = 0;
-  std::atomic<uint64_t> rejected_misaligned = 0;
-  std::atomic<uint64_t> rejected_no_deficit = 0;
-  std::atomic<uint64_t> rejected_no_blend = 0;
-  std::atomic<uint64_t> deficit_samples = 0;
-  // Deficit accumulator: std::atomic<double> has no fetch_add pre-C++20, so
-  // accumulate (deficit + kDeficitOffset) * 2^20 as integers.
+  // Recovery counters.  They are accumulated per thread by the OpenMP
+  // reduction clause on the pixel loop below and merged once after it, so the
+  // hot path never touches shared memory.  They used to be std::atomic, which
+  // made every candidate pixel pay a cross-core cache-line transfer -- and
+  // false sharing between the adjacent counters -- on every recovered image,
+  // even though only candidates/changed are read outside the debug line.
+  uint64_t candidate_pixels = 0;
+  uint64_t changed_pixels = 0;
+  // Per-filter rejection diagnostics.  Read by the HIRACO_DEBUG_HL_RECOVERY
+  // line only; the GUI recovery status reports candidates/changed.
+  uint64_t rejected_companion_low = 0;
+  uint64_t rejected_misaligned = 0;
+  uint64_t rejected_no_deficit = 0;
+  uint64_t rejected_no_blend = 0;
+  uint64_t rejected_not_highlight = 0;
+  // Deficit accumulator.  The sum is kept as a scaled integer so the
+  // reduction is exact and run-to-run deterministic (a floating-point
+  // reduction would sum in an unspecified order across threads) and so every
+  // term stays positive, which keeps the cast to uint64_t well-defined.
   constexpr double kDeficitOffset = 16.0;
   constexpr double kDeficitScale = 1048576.0;
   constexpr double kNormScale = 1048576.0;
-  std::atomic<uint64_t> deficit_sum_scaled = 0;
-  std::atomic<uint64_t> deficit_over_05 = 0;
-  std::atomic<uint64_t> deficit_over_10 = 0;
-  std::atomic<uint64_t> rejected_not_highlight = 0;
+  uint64_t deficit_sum_scaled = 0;
+  uint64_t deficit_over_05 = 0;
+  uint64_t deficit_over_10 = 0;
   // Scene-space value distributions over candidates (diagnostics only).
-  std::atomic<uint64_t> candidate_base_norm_sum = 0;
-  std::atomic<uint64_t> candidate_signal_norm_sum = 0;
-  std::atomic<uint64_t> candidate_companion_norm_sum = 0;
-  std::atomic<uint64_t> candidate_norm_samples = 0;
-  // Deficit histogram restricted to the scene-space highlight population.
-  std::atomic<uint64_t> highlight_deficit_samples = 0;
-  std::atomic<uint64_t> highlight_def_over_05 = 0;
-  std::atomic<uint64_t> highlight_def_over_10 = 0;
+  uint64_t candidate_base_norm_sum = 0;
+  uint64_t candidate_signal_norm_sum = 0;
+  uint64_t candidate_companion_norm_sum = 0;
+  // Number of candidates that reached the deficit computation.  The deficit is
+  // only computed for candidates, so the "highlight population" histogram the
+  // debug line reports is the same population: it reads this counter and the
+  // two deficit_over_* counters above rather than keeping a second copy of
+  // each number.
+  uint64_t candidate_norm_samples = 0;
 
   // Resolution-invariant alignment search (audit D-3).  Target and companion are
   // both sampled in scene coordinates, so the registration offset lives in
@@ -2570,7 +2578,14 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
       std::fill(recovered_mask->begin(), recovered_mask->end(), 0);
     }
   }
-  #pragma omp parallel for schedule(static) if(image->height > 100)
+  #pragma omp parallel for schedule(static) if(image->height > 100) \
+      reduction(+:candidate_pixels, changed_pixels, \
+                rejected_companion_low, rejected_misaligned, \
+                rejected_no_deficit, rejected_no_blend, \
+                rejected_not_highlight, deficit_sum_scaled, \
+                deficit_over_05, deficit_over_10, \
+                candidate_base_norm_sum, candidate_signal_norm_sum, \
+                candidate_companion_norm_sum, candidate_norm_samples)
   for (uint32_t row = 0; row < image->height; ++row) {
     for (uint32_t col = 0; col < image->width; ++col) {
       const double full_row = image_to_full_coordinate(row,
@@ -2613,46 +2628,34 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
           0.0,
           1.0);
       if (highlight_weight <= 0.0) {
-        rejected_not_highlight.fetch_add(1, std::memory_order_relaxed);
+        rejected_not_highlight += 1;
         continue;
       }
-      candidate_pixels.fetch_add(1, std::memory_order_relaxed);
-      candidate_norm_samples.fetch_add(1, std::memory_order_relaxed);
+      candidate_pixels += 1;
+      candidate_norm_samples += 1;
 
       const double target_base_luma =
           kLumaR * target_base[0] + kLumaG * target_base[1] + kLumaB * target_base[2];
       const double companion_base_luma =
           kLumaR * companion_base[0] + kLumaG * companion_base[1] + kLumaB * companion_base[2];
       const double luma_deficit = (target_base_luma - companion_base_luma) / signal_range;
-      deficit_samples.fetch_add(1, std::memory_order_relaxed);
-      deficit_sum_scaled.fetch_add(
-          static_cast<uint64_t>((luma_deficit + kDeficitOffset) * kDeficitScale),
-          std::memory_order_relaxed);
+      deficit_sum_scaled +=
+          static_cast<uint64_t>((luma_deficit + kDeficitOffset) * kDeficitScale);
       if (luma_deficit > 0.05) {
-        deficit_over_05.fetch_add(1, std::memory_order_relaxed);
+        deficit_over_05 += 1;
       }
       if (luma_deficit > 0.10) {
-        deficit_over_10.fetch_add(1, std::memory_order_relaxed);
+        deficit_over_10 += 1;
       }
-      candidate_base_norm_sum.fetch_add(
-          static_cast<uint64_t>(target_base_luma / signal_range * kNormScale),
-          std::memory_order_relaxed);
-      candidate_signal_norm_sum.fetch_add(
-          static_cast<uint64_t>(signal_luma / signal_range * kNormScale),
-          std::memory_order_relaxed);
-      candidate_companion_norm_sum.fetch_add(
-          static_cast<uint64_t>(companion_base_luma / signal_range * kNormScale),
-          std::memory_order_relaxed);
-      highlight_deficit_samples.fetch_add(1, std::memory_order_relaxed);
-      if (luma_deficit > 0.05) {
-        highlight_def_over_05.fetch_add(1, std::memory_order_relaxed);
-      }
-      if (luma_deficit > 0.10) {
-        highlight_def_over_10.fetch_add(1, std::memory_order_relaxed);
-      }
+      candidate_base_norm_sum +=
+          static_cast<uint64_t>(target_base_luma / signal_range * kNormScale);
+      candidate_signal_norm_sum +=
+          static_cast<uint64_t>(signal_luma / signal_range * kNormScale);
+      candidate_companion_norm_sum +=
+          static_cast<uint64_t>(companion_base_luma / signal_range * kNormScale);
 
       if (companion_base[1] < kMinCompanionGreen) {
-        rejected_companion_low.fetch_add(1, std::memory_order_relaxed);
+        rejected_companion_low += 1;
         continue;
       }
 
@@ -2660,12 +2663,12 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
       const double companion_base_green_norm = companion_base[1] / companion_signal_range;
       if (companion_base_green_norm < kMisalignmentGreenFloor &&
           target_base_green_norm > kMisalignmentTargetFloor) {
-        rejected_misaligned.fetch_add(1, std::memory_order_relaxed);
+        rejected_misaligned += 1;
         continue;
       }
 
       if (luma_deficit <= 0.0) {
-        rejected_no_deficit.fetch_add(1, std::memory_order_relaxed);
+        rejected_no_deficit += 1;
         continue;
       }
       const double blend = highlight_weight * std::clamp(
@@ -2673,7 +2676,7 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
           0.0,
           1.0);
       if (blend <= 1e-6) {
-        rejected_no_blend.fetch_add(1, std::memory_order_relaxed);
+        rejected_no_blend += 1;
         continue;
       }
 
@@ -2693,7 +2696,7 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
       if (std::abs(signal[0] - before_r) > 1e-6 ||
           std::abs(signal[1] - before_g) > 1e-6 ||
           std::abs(signal[2] - before_b) > 1e-6) {
-        changed_pixels.fetch_add(1, std::memory_order_relaxed);
+        changed_pixels += 1;
         // Same test that decides "changed", so the mask and the changed
         // counter can never disagree.
         if (recovered_mask != nullptr) {
@@ -2715,8 +2718,8 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
               << " offset=(" << best_dx << "," << best_dy << ")"
               << " align_range=" << coarse_radius
               << " align_mae=" << best_error
-              << " candidates=" << candidate_pixels.load(std::memory_order_relaxed)
-              << " changed=" << changed_pixels.load(std::memory_order_relaxed)
+              << " candidates=" << candidate_pixels
+              << " changed=" << changed_pixels
               << " region=" << (region != nullptr ? "crop" : "full")
               << " active=" << target_active.x << "," << target_active.y << "+"
               << target_active.width << "x" << target_active.height
@@ -2724,47 +2727,48 @@ bool ApplyOriAssistedHighlightRecovery(const std::string& highlight_recovery_sou
               << target_image_region.width << "x" << target_image_region.height
               << " img=" << image->width << "x" << image->height
               << " full=" << full_width << "x" << full_height
-              << " rej_comp_low=" << rejected_companion_low.load(std::memory_order_relaxed)
-              << " rej_misaligned=" << rejected_misaligned.load(std::memory_order_relaxed)
-              << " rej_not_highlight=" << rejected_not_highlight.load(std::memory_order_relaxed)
-              << " rej_no_deficit=" << rejected_no_deficit.load(std::memory_order_relaxed)
-              << " rej_no_blend=" << rejected_no_blend.load(std::memory_order_relaxed)
+              << " rej_comp_low=" << rejected_companion_low
+              << " rej_misaligned=" << rejected_misaligned
+              << " rej_not_highlight=" << rejected_not_highlight
+              << " rej_no_deficit=" << rejected_no_deficit
+              << " rej_no_blend=" << rejected_no_blend
               << " mean_deficit="
-              << (deficit_samples.load(std::memory_order_relaxed) == 0
+              << (candidate_norm_samples == 0
                       ? 0.0
-                      : deficit_sum_scaled.load(std::memory_order_relaxed) /
-                                static_cast<double>(deficit_samples.load(std::memory_order_relaxed)) /
-                                kDeficitScale -
+                      : static_cast<double>(deficit_sum_scaled) /
+                                static_cast<double>(candidate_norm_samples) / kDeficitScale -
                             kDeficitOffset)
-              << " def>0.05=" << deficit_over_05.load(std::memory_order_relaxed)
-              << " def>0.10=" << deficit_over_10.load(std::memory_order_relaxed)
+              << " def>0.05=" << deficit_over_05
+              << " def>0.10=" << deficit_over_10
               << " companion=" << companion_render->width << "x" << companion_render->height
               << " cand_base="
-              << (candidate_norm_samples.load(std::memory_order_relaxed) == 0
+              << (candidate_norm_samples == 0
                       ? 0.0
-                      : static_cast<double>(candidate_base_norm_sum.load(std::memory_order_relaxed)) /
-                                candidate_norm_samples.load(std::memory_order_relaxed) / kNormScale)
+                      : static_cast<double>(candidate_base_norm_sum) /
+                                static_cast<double>(candidate_norm_samples) / kNormScale)
               << " cand_signal="
-              << (candidate_norm_samples.load(std::memory_order_relaxed) == 0
+              << (candidate_norm_samples == 0
                       ? 0.0
-                      : static_cast<double>(candidate_signal_norm_sum.load(std::memory_order_relaxed)) /
-                                candidate_norm_samples.load(std::memory_order_relaxed) / kNormScale)
+                      : static_cast<double>(candidate_signal_norm_sum) /
+                                static_cast<double>(candidate_norm_samples) / kNormScale)
               << " cand_comp="
-              << (candidate_norm_samples.load(std::memory_order_relaxed) == 0
+              << (candidate_norm_samples == 0
                       ? 0.0
-                      : static_cast<double>(candidate_companion_norm_sum.load(std::memory_order_relaxed)) /
-                                candidate_norm_samples.load(std::memory_order_relaxed) / kNormScale)
-              << " hl_def>0.05=" << highlight_def_over_05.load(std::memory_order_relaxed)
-              << " hl_def>0.10=" << highlight_def_over_10.load(std::memory_order_relaxed)
-              << " hl_samples=" << highlight_deficit_samples.load(std::memory_order_relaxed)
+                      : static_cast<double>(candidate_companion_norm_sum) /
+                                static_cast<double>(candidate_norm_samples) / kNormScale)
+              // The deficit is only computed for candidates, so the highlight
+              // population is the candidate population.
+              << " hl_def>0.05=" << deficit_over_05
+              << " hl_def>0.10=" << deficit_over_10
+              << " hl_samples=" << candidate_norm_samples
               << "\n";
   }
 
   {
     std::lock_guard<std::mutex> lock(g_highlight_recovery_stats_mutex);
     g_highlight_recovery_stats.applicable = true;
-    g_highlight_recovery_stats.candidates = candidate_pixels.load(std::memory_order_relaxed);
-    g_highlight_recovery_stats.changed = changed_pixels.load(std::memory_order_relaxed);
+    g_highlight_recovery_stats.candidates = candidate_pixels;
+    g_highlight_recovery_stats.changed = changed_pixels;
     g_highlight_recovery_stats.run_sequence = ++g_highlight_recovery_run_sequence;
   }
 

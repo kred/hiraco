@@ -4,8 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -426,17 +426,11 @@ struct RecoveryVisibilitySample {
   size_t bright = 0;
   size_t darkest_changed_luma = 255;
   size_t max_code_delta = 0;
-  double mean_code_delta = 0.0;
-  size_t brighter = 0;
-  uint64_t internal_changed = 0;
-  bool applicable = false;
 };
 
 RecoveryVisibilitySample MeasureRecoveryVisibility(const PreviewImage& normal_preview,
                                                    const PreviewImage& recovery_preview) {
   RecoveryVisibilitySample sample;
-  size_t total_delta = 0;
-  size_t pixels = 0;
   for (size_t pixel = 0; pixel + 2 < normal_preview.pixels.size() &&
                          pixel + 2 < recovery_preview.pixels.size();
        pixel += 3) {
@@ -449,7 +443,6 @@ RecoveryVisibilitySample MeasureRecoveryVisibility(const PreviewImage& normal_pr
         sample.max_code_delta =
             std::max(sample.max_code_delta, static_cast<size_t>(std::abs(delta)));
       }
-      total_delta += static_cast<size_t>(std::abs(delta));
     }
     if (!pixel_changed) {
       continue;
@@ -464,9 +457,6 @@ RecoveryVisibilitySample MeasureRecoveryVisibility(const PreviewImage& normal_pr
       ++sample.bright;
     }
   }
-  pixels = std::max<size_t>(normal_preview.pixels.size() / 3, 1);
-  sample.mean_code_delta = static_cast<double>(total_delta) /
-                           static_cast<double>(pixels);
   return sample;
 }
 
@@ -539,7 +529,7 @@ void TestLocalOm3RecoveryFullPreviewSmoke() {
       // change in the displayed preview at BOTH preview resolutions on BOTH local
       // fixtures, and the GUI-facing stats must report it.  Measured on the
       // sample pairs with the shipped implementation
-      // (docs/highlight-recovery-audit.md §9.2.3):
+      // (docs/highlight-recovery-audit.md §9.5):
       //   512 px  _8142491 -> candidates 3763, changed 3210, 2125 px visibly
       //              (all at luma >= 224), max delta 29 codes
       //   2560 px _8142491 -> candidates 47672, changed 5805, 2115 px visibly
