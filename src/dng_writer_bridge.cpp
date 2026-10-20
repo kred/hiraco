@@ -1,10 +1,19 @@
+#include <algorithm>
 #include <iostream>
 
 #include "hiraco_core.h"
 #include "dng_writer_bridge.h"
 #include "hiraco_timing.h"
 
-#if defined(HIRACO_ENABLE_DNG_SDK) && HIRACO_ENABLE_DNG_SDK
+constexpr float kStage2GainMin = 0.25f;
+constexpr float kStage2GainMax = 4.0f;
+constexpr float kStage2FineFromSmallScale = 1.6f;
+
+inline float ClampStage2Gain(float gain) {
+  return std::clamp(gain, kStage2GainMin, kStage2GainMax);
+}
+
+#if defined(HIRACO_ENABLE_DNG_SDK) && HIRACO_ENABLE_DNG_SDK && !defined(__EMSCRIPTEN__)
 
 #include "dng_auto_ptr.h"
 #include "dng_abort_sniffer.h"
@@ -116,14 +125,6 @@ void ReportProgress(const ProgressCallback& progress,
   update.fraction = fraction;
   update.message = message;
   progress(update);
-}
-
-constexpr float kStage2GainMin = 0.25f;
-constexpr float kStage2GainMax = 4.0f;
-constexpr float kStage2FineFromSmallScale = 1.6f;
-
-float ClampStage2Gain(float gain) {
-  return std::clamp(gain, kStage2GainMin, kStage2GainMax);
 }
 
 float DeriveFineScaleGainFromSmall(float small_gain) {
@@ -4855,6 +4856,15 @@ DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string&) {
   summary.enabled = false;
   summary.status = "Adobe DNG SDK integration not enabled in this build";
   return summary;
+}
+
+void FinalizeStage2Settings(ResolvedStageSettings* settings) {
+  if (settings == nullptr) {
+    return;
+  }
+  settings->stage2_gain1 = ClampStage2Gain(settings->stage2_gain1);
+  settings->stage2_gain2 = ClampStage2Gain(settings->stage2_gain2);
+  settings->stage2_gain3 = ClampStage2Gain(settings->stage2_gain3);
 }
 
 ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata&,
