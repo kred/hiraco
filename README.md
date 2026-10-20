@@ -2,11 +2,12 @@
 
 `hiraco` is a native C++ toolchain for converting selected Olympus / OM SYSTEM RAW files, with a custom emphasis on high-resolution sensor-shift captures, into rendered Linear DNG files.
 
-The repository builds one shared processing core and exposes it through two frontends:
+The repository builds one shared processing core and exposes it through native and browser-oriented targets:
 - `hiraco-cli` for command-line conversion
 - `hiraco-gui` for interactive preview, tuning, and batch conversion
+- `hiraco-wasm` (experimental) for a non-UI WebAssembly build of the conversion core and DNG SDK integration
 
-The current implementation supports both a custom high-resolution raw-domain reconstruction path and a LibRaw-based render path for other supported inputs.
+The current implementation supports both a custom high-resolution raw-domain reconstruction path and a LibRaw-based render path for other supported inputs. The native desktop stack remains the default, while the WASM target is intended as a browser-facing build path for the conversion layer rather than a direct port of the desktop GUI.
 ![Comparison](contact_sheet.png)
 ## GUI
 
@@ -17,6 +18,7 @@ The current implementation supports both a custom high-resolution raw-domain rec
 - `hiraco-core`: shared static library containing preparation, metadata, preview, full-preview, enhancement, and DNG writing code.
 - `hiraco-cli`: command-line `convert` frontend.
 - `hiraco-gui`: wxWidgets desktop frontend with thumbnail queueing, full-frame comparison, output controls, and conversion.
+- `hiraco-wasm`: experimental browser target built with Emscripten; the GUI is intentionally excluded and the build focuses on the non-visual conversion core and DNG SDK integration.
 - Custom high-resolution raw-domain reconstruction driven by vendor metadata and stack-guidance maps.
 - Optional, per-file ORI-assisted highlight recovery for supported high-resolution
   ORFs when a same-directory companion candidate is detected.  The correction is
@@ -52,6 +54,7 @@ The strongest custom path in the repository today is the high-resolution workflo
 - Zlib
 - OpenMP (optional but strongly recommended)
 - wxWidgets (for `hiraco-gui`)
+- Emscripten toolchain (for `hiraco-wasm`)
 - Adobe DNG SDK 1.7.1 bundle unpacked into `dng_sdk_1_7_1/`
 
 The repository also expects the bundled Adobe libjxl and XMP toolkit that ship with the DNG SDK bundle under `dng_sdk_1_7_1/`.
@@ -75,9 +78,22 @@ sudo apt install build-essential cmake libraw-dev libfftw3-dev libhalide-dev lib
 vcpkg install libraw fftw3 halide zlib wxwidgets:x64-windows
 ```
 
+### WebAssembly (Emscripten)
+
+For the browser target, install the Emscripten toolchain first:
+
+```bash
+brew install emscripten
+# or follow the official emsdk install flow if you prefer managing a specific version
+```
+
+After installation, configure the browser build with `emcmake` as shown below.
+
 ## Building
 
 ### Configure And Build
+
+#### Native build (default)
 
 ```bash
 cmake --preset release
@@ -89,6 +105,21 @@ This produces:
 - `build/release/hiraco-cli`
 - `build/release/hiraco-gui`
 - `build/release/libhiraco-core.a`
+
+#### WebAssembly target (experimental)
+
+```bash
+# install Emscripten first, then configure the browser target
+emcmake cmake -S . -B build-wasm -DHIRACO_BUILD_WASM=ON -DHIRACO_BUILD_GUI=OFF -DHIRACO_BUILD_TESTS=OFF
+cmake --build build-wasm --target hiraco-wasm
+```
+
+This produces a browser build under `build-wasm/` with the WebAssembly module and JavaScript wrapper:
+
+- `build-wasm/hiraco-wasm.js`
+- `build-wasm/hiraco-wasm.wasm`
+
+The browser target intentionally disables the desktop GUI and is aimed at the non-UI conversion core and Adobe DNG SDK integration. The native desktop build remains the default and continues to work unchanged.
 
 If `wx-config` is not on `PATH` on macOS, point CMake at it explicitly:
 
@@ -104,6 +135,9 @@ cmake --build --preset release
 cmake -S . -B build -DHIRACO_BUILD_GUI=OFF
 cmake -S . -B build -DHIRACO_BUILD_CLI=OFF
 cmake -S . -B build -DHIRACO_BUILD_TESTS=ON
+
+# WebAssembly / browser build
+emcmake cmake -S . -B build-wasm -DHIRACO_BUILD_WASM=ON -DHIRACO_BUILD_GUI=OFF -DHIRACO_BUILD_TESTS=OFF
 ```
 
 ## Running
