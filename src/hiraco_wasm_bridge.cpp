@@ -2,6 +2,7 @@
 
 #include "dng_sdk_bridge.h"
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 

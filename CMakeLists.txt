@@ -10,6 +10,7 @@ option(HIRACO_BUILD_CLI "Build the hiraco-cli binary" ON)
 option(HIRACO_BUILD_GUI "Build the hiraco-gui binary" ON)
 option(HIRACO_BUILD_TESTS "Build hiraco core tests" ON)
 option(HIRACO_BUILD_WASM "Build a browser/WebAssembly target without the wxWidgets GUI" OFF)
+set(HIRACO_BOOST_INCLUDE_DIR "" CACHE PATH "Override the path to Boost headers for the Adobe XMP toolkit")
 
 if(HIRACO_BUILD_WASM)
   if(NOT EMSCRIPTEN)
@@ -251,6 +252,37 @@ if(NOT HIRACO_BUILD_WASM)
   find_package(Halide REQUIRED)
 endif()
 
+function(hiraco_resolve_emscripten_sysroot_include_dir out_var)
+  if(DEFINED EMSCRIPTEN_SYSROOT AND EMSCRIPTEN_SYSROOT)
+    set(${out_var} "${EMSCRIPTEN_SYSROOT}/include" PARENT_SCOPE)
+    return()
+  endif()
+
+  if(DEFINED CMAKE_SYSROOT AND CMAKE_SYSROOT)
+    set(${out_var} "${CMAKE_SYSROOT}/include" PARENT_SCOPE)
+    return()
+  endif()
+
+  execute_process(
+    COMMAND "${CMAKE_CXX_COMPILER}" -print-sysroot
+    OUTPUT_VARIABLE HIRACO_EMSCRIPTEN_SYSROOT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+
+  if(HIRACO_EMSCRIPTEN_SYSROOT)
+    set(${out_var} "${HIRACO_EMSCRIPTEN_SYSROOT}/include" PARENT_SCOPE)
+  else()
+    set(${out_var} "" PARENT_SCOPE)
+  endif()
+endfunction()
+
+if(EMSCRIPTEN)
+  hiraco_resolve_emscripten_sysroot_include_dir(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR)
+  if(NOT HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR)
+    message(FATAL_ERROR "Could not determine the Emscripten sysroot include directory. Ensure the toolchain is configured correctly.")
+  endif()
+endif()
+
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(JPEGXL_ENABLE_TOOLS OFF CACHE BOOL "" FORCE)
@@ -329,59 +361,46 @@ else()
   target_compile_definitions(hiraco-xmp-core PRIVATE XMP_64=0)
 endif()
 set(BOOST_INCLUDE_DIRS "")
-find_package(Boost QUIET)
-if(Boost_FOUND AND Boost_INCLUDE_DIRS)
-  set(BOOST_INCLUDE_DIRS "${Boost_INCLUDE_DIRS}")
+if(HIRACO_BOOST_INCLUDE_DIR)
+  set(BOOST_INCLUDE_DIRS "${HIRACO_BOOST_INCLUDE_DIR}")
 else()
-  set(_hiraco_boost_hint_roots)
-  if(DEFINED ENV{BOOST_ROOT})
-    list(APPEND _hiraco_boost_hint_roots "$ENV{BOOST_ROOT}")
-  endif()
-  if(DEFINED ENV{BOOST_INCLUDEDIR})
-    list(APPEND _hiraco_boost_hint_roots "$ENV{BOOST_INCLUDEDIR}")
-  endif()
-  list(APPEND _hiraco_boost_hint_roots
-    /opt/homebrew/include
-    /opt/homebrew/opt/boost/include
-    /usr/local/include
-    /usr/include
-  )
-  foreach(_hiraco_boost_root IN LISTS CMAKE_PREFIX_PATH)
-    list(APPEND _hiraco_boost_hint_roots "${_hiraco_boost_root}/include")
-  endforeach()
-  foreach(_hiraco_boost_root IN LISTS _hiraco_boost_hint_roots)
-    if(EXISTS "${_hiraco_boost_root}/boost/uuid/uuid.hpp")
-      set(BOOST_INCLUDE_DIRS "${_hiraco_boost_root}")
-      break()
-    elseif(EXISTS "${_hiraco_boost_root}/boost/version.hpp")
-      set(BOOST_INCLUDE_DIRS "${_hiraco_boost_root}")
-      break()
+  find_package(Boost QUIET)
+  if(Boost_FOUND AND Boost_INCLUDE_DIRS)
+    set(BOOST_INCLUDE_DIRS "${Boost_INCLUDE_DIRS}")
+  else()
+    set(_hiraco_boost_hint_roots)
+    if(DEFINED ENV{BOOST_ROOT})
+      list(APPEND _hiraco_boost_hint_roots "$ENV{BOOST_ROOT}")
     endif()
-  endforeach()
+    if(DEFINED ENV{BOOST_INCLUDEDIR})
+      list(APPEND _hiraco_boost_hint_roots "$ENV{BOOST_INCLUDEDIR}")
+    endif()
+    list(APPEND _hiraco_boost_hint_roots
+      /opt/homebrew/include
+      /opt/homebrew/opt/boost/include
+      /usr/local/include
+      /usr/include
+    )
+    foreach(_hiraco_boost_root IN LISTS CMAKE_PREFIX_PATH)
+      list(APPEND _hiraco_boost_hint_roots "${_hiraco_boost_root}/include")
+    endforeach()
+    foreach(_hiraco_boost_root IN LISTS _hiraco_boost_hint_roots)
+      if(EXISTS "${_hiraco_boost_root}/boost/uuid/uuid.hpp")
+        set(BOOST_INCLUDE_DIRS "${_hiraco_boost_root}")
+        break()
+      elseif(EXISTS "${_hiraco_boost_root}/boost/version.hpp")
+        set(BOOST_INCLUDE_DIRS "${_hiraco_boost_root}")
+        break()
+      endif()
+    endforeach()
+  endif()
 endif()
 if(NOT BOOST_INCLUDE_DIRS)
-  message(FATAL_ERROR "Boost headers not found; required by the Adobe XMP toolkit used by the DNG SDK.")
+  message(FATAL_ERROR "Boost headers not found; required by the Adobe XMP toolkit used by the DNG SDK. Set HIRACO_BOOST_INCLUDE_DIR or install Boost in a standard location.")
 endif()
 target_include_directories(hiraco-xmp-core PRIVATE ${BOOST_INCLUDE_DIRS})
 
 if(EMSCRIPTEN)
-  if(DEFINED EMSCRIPTEN_SYSROOT AND EMSCRIPTEN_SYSROOT)
-    set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${EMSCRIPTEN_SYSROOT}/include")
-  elseif(DEFINED CMAKE_SYSROOT AND CMAKE_SYSROOT)
-    set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${CMAKE_SYSROOT}/include")
-  else()
-    execute_process(
-      COMMAND "${CMAKE_CXX_COMPILER}" -print-sysroot
-      OUTPUT_VARIABLE HIRACO_EMSCRIPTEN_SYSROOT
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      ERROR_QUIET)
-    if(HIRACO_EMSCRIPTEN_SYSROOT)
-      set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${HIRACO_EMSCRIPTEN_SYSROOT}/include")
-    endif()
-  endif()
-  if(NOT HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR)
-    message(FATAL_ERROR "Could not determine the Emscripten sysroot include directory. Ensure the toolchain is configured correctly.")
-  endif()
   target_include_directories(hiraco-xmp-core PRIVATE ${HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR})
 endif()
 
@@ -446,26 +465,6 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
 else()
   target_compile_definitions(hiraco-dng-sdk PRIVATE XMP_64=0)
 endif()
-if(EMSCRIPTEN)
-  if(DEFINED EMSCRIPTEN_SYSROOT AND EMSCRIPTEN_SYSROOT)
-    set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${EMSCRIPTEN_SYSROOT}/include")
-  elseif(DEFINED CMAKE_SYSROOT AND CMAKE_SYSROOT)
-    set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${CMAKE_SYSROOT}/include")
-  else()
-    execute_process(
-      COMMAND "${CMAKE_CXX_COMPILER}" -print-sysroot
-      OUTPUT_VARIABLE HIRACO_EMSCRIPTEN_SYSROOT
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      ERROR_QUIET)
-    if(HIRACO_EMSCRIPTEN_SYSROOT)
-      set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${HIRACO_EMSCRIPTEN_SYSROOT}/include")
-    endif()
-  endif()
-  if(NOT HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR)
-    message(FATAL_ERROR "Could not determine the Emscripten sysroot include directory. Ensure the toolchain is configured correctly.")
-  endif()
-endif()
-
 target_include_directories(hiraco-dng-sdk PRIVATE
   ${HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR}
   ${HIRACO_DNG_SDK_ROOT}/dng_sdk/source

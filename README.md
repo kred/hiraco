@@ -52,6 +52,7 @@ The strongest custom path in the repository today is the high-resolution workflo
 - FFTW3 and `fftw3_threads`
 - Halide
 - Zlib
+- Boost headers (required by the Adobe XMP toolkit bundled with the DNG SDK)
 - OpenMP (optional but strongly recommended)
 - wxWidgets (for `hiraco-gui`)
 - Emscripten toolchain (for `hiraco-wasm`)
@@ -75,7 +76,7 @@ sudo apt install build-essential cmake libraw-dev libfftw3-dev libhalide-dev lib
 ### Windows (vcpkg)
 
 ```powershell
-vcpkg install libraw fftw3 halide zlib wxwidgets:x64-windows
+vcpkg install boost libraw fftw3 halide zlib wxwidgets:x64-windows
 ```
 
 ### WebAssembly (Emscripten)
