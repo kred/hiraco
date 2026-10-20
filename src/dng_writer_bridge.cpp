@@ -4,7 +4,7 @@
 #include "dng_writer_bridge.h"
 #include "hiraco_timing.h"
 
-#if defined(HIRACO_ENABLE_DNG_SDK) && HIRACO_ENABLE_DNG_SDK
+#if defined(HIRACO_ENABLE_DNG_SDK) && HIRACO_ENABLE_DNG_SDK && !defined(__EMSCRIPTEN__)
 
 #include "dng_auto_ptr.h"
 #include "dng_abort_sniffer.h"
@@ -4505,6 +4505,15 @@ DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string&) {
   summary.enabled = false;
   summary.status = "Adobe DNG SDK integration not enabled in this build";
   return summary;
+}
+
+void FinalizeStage2Settings(ResolvedStageSettings* settings) {
+  if (settings == nullptr) {
+    return;
+  }
+  settings->stage2_gain1 = std::clamp(settings->stage2_gain1, 0.25f, 4.0f);
+  settings->stage2_gain2 = std::clamp(settings->stage2_gain2, 0.25f, 4.0f);
+  settings->stage2_gain3 = std::clamp(settings->stage2_gain3, 0.25f, 4.0f);
 }
 
 ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata&,

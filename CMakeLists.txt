@@ -9,15 +9,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(HIRACO_BUILD_CLI "Build the hiraco-cli binary" ON)
 option(HIRACO_BUILD_GUI "Build the hiraco-gui binary" ON)
 option(HIRACO_BUILD_TESTS "Build hiraco core tests" ON)
-option(HIRACO_BUILD_WASM "Build a browser/WebAssembly target without the WxWidgets GUI" OFF)
-set(HIRACO_WASM_BUILD OFF)
+option(HIRACO_BUILD_WASM "Build a browser/WebAssembly target without the wxWidgets GUI" OFF)
 
 if(HIRACO_BUILD_WASM)
   if(NOT EMSCRIPTEN)
     message(FATAL_ERROR
       "HIRACO_BUILD_WASM requires an Emscripten toolchain. Configure with emcmake cmake -DHIRACO_BUILD_WASM=ON ...")
   endif()
-  set(HIRACO_WASM_BUILD ON)
   set(HIRACO_BUILD_CLI OFF CACHE BOOL "WebAssembly builds do not include the desktop CLI target" FORCE)
   set(HIRACO_BUILD_GUI OFF CACHE BOOL "WebAssembly builds are non-visual" FORCE)
   set(HIRACO_BUILD_TESTS OFF CACHE BOOL "WebAssembly builds skip desktop test binaries" FORCE)
@@ -40,7 +38,7 @@ endif()
 # The Adobe DNG SDK is treated as a core conversion dependency rather than as a
 # desktop GUI dependency. That keeps the native desktop build unchanged while
 # allowing a separate Emscripten/WebAssembly target to reuse the same conversion
-# implementation without WxWidgets.
+# implementation without wxWidgets.
 set(HIRACO_DNG_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/dng_sdk_1_7_1" CACHE PATH "Path to the Adobe DNG SDK bundle root")
 
 if(NOT EXISTS "${HIRACO_DNG_SDK_ROOT}/dng_sdk/source")
@@ -330,24 +328,61 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
 else()
   target_compile_definitions(hiraco-xmp-core PRIVATE XMP_64=0)
 endif()
-set(BOOST_INCLUDE_DIR "")
-if(EXISTS "/opt/homebrew/include/boost/uuid/uuid.hpp")
-  set(BOOST_INCLUDE_DIR "/opt/homebrew/include")
-elseif(EXISTS "/usr/local/include/boost/uuid/uuid.hpp")
-  set(BOOST_INCLUDE_DIR "/usr/local/include")
-elseif(EXISTS "/usr/include/boost/uuid/uuid.hpp")
-  set(BOOST_INCLUDE_DIR "/usr/include")
+set(BOOST_INCLUDE_DIRS "")
+find_package(Boost QUIET)
+if(Boost_FOUND AND Boost_INCLUDE_DIRS)
+  set(BOOST_INCLUDE_DIRS "${Boost_INCLUDE_DIRS}")
+else()
+  set(_hiraco_boost_hint_roots)
+  if(DEFINED ENV{BOOST_ROOT})
+    list(APPEND _hiraco_boost_hint_roots "$ENV{BOOST_ROOT}")
+  endif()
+  if(DEFINED ENV{BOOST_INCLUDEDIR})
+    list(APPEND _hiraco_boost_hint_roots "$ENV{BOOST_INCLUDEDIR}")
+  endif()
+  list(APPEND _hiraco_boost_hint_roots
+    /opt/homebrew/include
+    /opt/homebrew/opt/boost/include
+    /usr/local/include
+    /usr/include
+  )
+  foreach(_hiraco_boost_root IN LISTS CMAKE_PREFIX_PATH)
+    list(APPEND _hiraco_boost_hint_roots "${_hiraco_boost_root}/include")
+  endforeach()
+  foreach(_hiraco_boost_root IN LISTS _hiraco_boost_hint_roots)
+    if(EXISTS "${_hiraco_boost_root}/boost/uuid/uuid.hpp")
+      set(BOOST_INCLUDE_DIRS "${_hiraco_boost_root}")
+      break()
+    elseif(EXISTS "${_hiraco_boost_root}/boost/version.hpp")
+      set(BOOST_INCLUDE_DIRS "${_hiraco_boost_root}")
+      break()
+    endif()
+  endforeach()
 endif()
-if(NOT BOOST_INCLUDE_DIR)
+if(NOT BOOST_INCLUDE_DIRS)
   message(FATAL_ERROR "Boost headers not found; required by the Adobe XMP toolkit used by the DNG SDK.")
 endif()
-target_include_directories(hiraco-xmp-core PRIVATE ${BOOST_INCLUDE_DIR})
+target_include_directories(hiraco-xmp-core PRIVATE ${BOOST_INCLUDE_DIRS})
 
 if(EMSCRIPTEN)
-  get_filename_component(EMSCRIPTEN_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-  get_filename_component(EMSCRIPTEN_CELLAR_DIR "${EMSCRIPTEN_BIN_DIR}/.." ABSOLUTE)
-  set(EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${EMSCRIPTEN_CELLAR_DIR}/libexec/cache/sysroot/include")
-  target_include_directories(hiraco-xmp-core PRIVATE ${EMSCRIPTEN_SYSROOT_INCLUDE_DIR})
+  if(DEFINED EMSCRIPTEN_SYSROOT AND EMSCRIPTEN_SYSROOT)
+    set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${EMSCRIPTEN_SYSROOT}/include")
+  elseif(DEFINED CMAKE_SYSROOT AND CMAKE_SYSROOT)
+    set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${CMAKE_SYSROOT}/include")
+  else()
+    execute_process(
+      COMMAND "${CMAKE_CXX_COMPILER}" -print-sysroot
+      OUTPUT_VARIABLE HIRACO_EMSCRIPTEN_SYSROOT
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    if(HIRACO_EMSCRIPTEN_SYSROOT)
+      set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${HIRACO_EMSCRIPTEN_SYSROOT}/include")
+    endif()
+  endif()
+  if(NOT HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR)
+    message(FATAL_ERROR "Could not determine the Emscripten sysroot include directory. Ensure the toolchain is configured correctly.")
+  endif()
+  target_include_directories(hiraco-xmp-core PRIVATE ${HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR})
 endif()
 
 target_include_directories(hiraco-xmp-core PRIVATE
@@ -412,13 +447,27 @@ else()
   target_compile_definitions(hiraco-dng-sdk PRIVATE XMP_64=0)
 endif()
 if(EMSCRIPTEN)
-  get_filename_component(EMSCRIPTEN_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-  get_filename_component(EMSCRIPTEN_CELLAR_DIR "${EMSCRIPTEN_BIN_DIR}/.." ABSOLUTE)
-  set(EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${EMSCRIPTEN_CELLAR_DIR}/libexec/cache/sysroot/include")
+  if(DEFINED EMSCRIPTEN_SYSROOT AND EMSCRIPTEN_SYSROOT)
+    set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${EMSCRIPTEN_SYSROOT}/include")
+  elseif(DEFINED CMAKE_SYSROOT AND CMAKE_SYSROOT)
+    set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${CMAKE_SYSROOT}/include")
+  else()
+    execute_process(
+      COMMAND "${CMAKE_CXX_COMPILER}" -print-sysroot
+      OUTPUT_VARIABLE HIRACO_EMSCRIPTEN_SYSROOT
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    if(HIRACO_EMSCRIPTEN_SYSROOT)
+      set(HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR "${HIRACO_EMSCRIPTEN_SYSROOT}/include")
+    endif()
+  endif()
+  if(NOT HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR)
+    message(FATAL_ERROR "Could not determine the Emscripten sysroot include directory. Ensure the toolchain is configured correctly.")
+  endif()
 endif()
 
 target_include_directories(hiraco-dng-sdk PRIVATE
-  ${EMSCRIPTEN_SYSROOT_INCLUDE_DIR}
+  ${HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR}
   ${HIRACO_DNG_SDK_ROOT}/dng_sdk/source
   ${HIRACO_DNG_SDK_ROOT}/libjxl/libjxl/lib/include
   ${HIRACO_DNG_SDK_ROOT}/libjpeg
@@ -539,7 +588,7 @@ else()
     target_link_libraries(hiraco-cli PRIVATE hiraco-core)
   endif()
 
-  if(HIRACO_BUILD_GUI AND NOT HIRACO_WASM_BUILD)
+  if(HIRACO_BUILD_GUI AND NOT HIRACO_BUILD_WASM)
     find_package(wxWidgets REQUIRED COMPONENTS core base adv)
     include(${wxWidgets_USE_FILE})
 
@@ -549,7 +598,7 @@ else()
     target_link_libraries(hiraco-gui PRIVATE hiraco-core ${wxWidgets_LIBRARIES})
   endif()
 
-  if(HIRACO_BUILD_TESTS AND NOT HIRACO_WASM_BUILD)
+  if(HIRACO_BUILD_TESTS AND NOT HIRACO_BUILD_WASM)
     enable_testing()
     add_executable(hiraco-core-tests
       tests/hiraco_core_tests.cpp
