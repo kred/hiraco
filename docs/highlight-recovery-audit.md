@@ -347,10 +347,10 @@ Verified at API level by the probe (stats increment per render and match the int
 
 ### 9.5 P3 — preview-visibility regression test — DONE
 
-`TestLocalOm3RecoveryFullPreviewSmoke` (`tests/hiraco_core_tests.cpp`) pins *visible recovery at both preview resolutions* (it fails loudly on the gitignored fixture, per repo convention):
+`TestLocalOm3RecoveryFullPreviewSmoke` (`tests/hiraco_core_tests.cpp`) pins *visible recovery at both preview resolutions* (it fails loudly on the gitignored fixture, per repo convention). The measured figures are the shipped 4 : 1 base-grid footprint profile of §9.2.4, on _8142491:
 
-- **512 px:** `applicable`, `changed >= 1000` (measured 3,210), `>= 1000` pixels differing by `>= 1` code (measured 2,125), `max Δ >= 15` (measured 29), nothing below luma 192 touched, `>= 3/4` of the changed pixels in the lum ≥ 224 band.
-- **2560 px (the GUI resolution):** `applicable`, `changed >= 1000` (measured 5,805), `>= 400` pixels differing by `>= 1` code (measured 2,115), `max Δ >= 10` (measured 19), same two highlight-gating pins (measured: every changed pixel at luma ≥ 224).
+- **512 px:** `applicable`, `changed >= 1000` (measured 3,393), `>= 1000` pixels differing by `>= 1` code (measured 2,534), `max Δ >= 20` (measured 80), nothing below luma 192 touched (measured darkest 236), `>= 3/4` of the changed pixels in the lum ≥ 224 band (measured: all 2,534 of them).
+- **2560 px (the GUI resolution):** `applicable`, `changed >= 1000` (measured 20,066), `>= 1000` pixels differing by `>= 1` code (measured 12,904), `max Δ >= 20` (measured 49), same two highlight-gating pins (measured darkest 235; every changed pixel at luma ≥ 224).
 
 The thresholds are set so that a near-inert implementation fails: an implementation that recovered a few dozen pixels by two codes would have passed the previous version of these pins, and does not pass these.
 

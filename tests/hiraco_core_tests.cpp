@@ -528,12 +528,12 @@ void TestLocalOm3RecoveryFullPreviewSmoke() {
       // Preview-visibility pin (P3): recovery must produce a real, highlight-gated
       // change in the displayed preview at BOTH preview resolutions on BOTH local
       // fixtures, and the GUI-facing stats must report it.  Measured on the
-      // sample pairs with the shipped implementation
-      // (docs/highlight-recovery-audit.md §9.5):
-      //   512 px  _8142491 -> candidates 3763, changed 3210, 2125 px visibly
-      //              (all at luma >= 224), max delta 29 codes
-      //   2560 px _8142491 -> candidates 47672, changed 5805, 2115 px visibly
-      //              (all at luma >= 224), max delta 19 codes
+      // sample pairs with the shipped 4 : 1 base-grid footprint
+      // (docs/highlight-recovery-audit.md §9.2.4):
+      //   512 px  _8142491 -> candidates 3763, changed 3393, 2534 px visibly
+      //              (all at luma >= 224), max delta 80 codes
+      //   2560 px _8142491 -> candidates 47672, changed 20066, 12904 px visibly
+      //              (all at luma >= 224), max delta 49 codes
       // Recovery must stay highlight-gated: nothing below luma 192 is touched on
       // either fixture at any resolution, and the bulk of the changes sit in the
       // lum >= 224 band.

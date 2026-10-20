@@ -109,7 +109,7 @@ the Adobe DNG SDK 1.7.1 bundle is present under `dng_sdk_1_7_1/`.
 `:515-552`).
 
 1. `ReadVendorMakerNote` (`src/vendor_makernote.cpp`) parses the TIFF IFD chain
-   to the MakerNote and extracts: TIFF make/model (overriding LibLibRaw's),
+   to the MakerNote and extracts: TIFF make/model (overriding LibRaw's),
    `StackedImage` label, `UnknownBlock1` (working geometry at offset 23), and
    `UnknownBlock3`.
 2. Working geometry is taken from `UnknownBlock1` when present.
