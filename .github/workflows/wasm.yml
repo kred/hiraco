@@ -64,7 +64,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config \
-            libjpeg-dev libpng-dev zlib1g-dev libomp-dev libtiff-dev
+            libjpeg-dev libpng-dev zlib1g-dev libomp-dev libtiff-dev \
+            libraw-dev libfftw3-dev libboost-dev liblcms2-dev
 
       - name: Install Halide
         run: |
