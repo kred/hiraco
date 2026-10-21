@@ -3,11 +3,11 @@
 `hiraco` is a native C++ toolchain for converting selected Olympus / OM SYSTEM RAW files, with a custom emphasis on high-resolution sensor-shift captures, into rendered Linear DNG files.
 
 The repository builds one shared processing core and exposes it through native and browser-oriented targets:
-- `hiraco-cli` for command-line conversion
+- `hiraco-cli` for the full desktop command-line conversion pipeline
 - `hiraco-gui` for interactive preview, tuning, and batch conversion
-- `hiraco-wasm` (experimental) for a non-UI WebAssembly build of the conversion core and DNG SDK integration
+- `hiraco-wasm` (experimental) for the browser-facing conversion module
 
-The current implementation supports both a custom high-resolution raw-domain reconstruction path and a LibRaw-based render path for other supported inputs. The native desktop stack remains the default, while the WASM target is intended as a browser-facing build path for the conversion layer rather than a direct port of the desktop GUI.
+The current implementation supports both a custom high-resolution raw-domain reconstruction path and a LibRaw-based render path for other supported inputs. The native desktop stack remains the default. The WebAssembly build carries the *same* conversion core: the DNG SDK writer, the image processing stages and the RAW decoder are all compiled for WebAssembly, so `hiraco-cli.js` really converts ORF and ORI files. The two builds do not produce bit-identical files, because aarch64 contracts `a * b + c` into a fused multiply-add and WebAssembly has no such instruction; see `docs/wasm-verification.md` for the measured difference.
 ![Comparison](contact_sheet.png)
 ## GUI
 
@@ -18,7 +18,7 @@ The current implementation supports both a custom high-resolution raw-domain rec
 - `hiraco-core`: shared static library containing preparation, metadata, preview, full-preview, enhancement, and DNG writing code.
 - `hiraco-cli`: command-line `convert` frontend.
 - `hiraco-gui`: wxWidgets desktop frontend with thumbnail queueing, full-frame comparison, output controls, and conversion.
-- `hiraco-wasm`: experimental browser target built with Emscripten; the GUI is intentionally excluded and the build focuses on the non-visual conversion core and DNG SDK integration.
+- `hiraco-wasm`: experimental browser target built with Emscripten; the GUI is intentionally excluded, and the module carries the same conversion core as the native build and converts RAW buffers into DNG buffers.
 - Custom high-resolution raw-domain reconstruction driven by vendor metadata and stack-guidance maps.
 - Optional, per-file ORI-assisted highlight recovery for supported high-resolution
   ORFs when a same-directory companion candidate is detected.  The correction is
@@ -81,10 +81,14 @@ vcpkg install boost libraw fftw3 halide zlib wxwidgets:x64-windows
 
 ### WebAssembly (Emscripten)
 
-For the browser target, install the Emscripten toolchain first:
+For the browser target, install the Emscripten toolchain and the Halide host
+tool first:
 
 ```bash
 brew install emscripten
+# Halide is a host tool: its generator runs on the build machine and emits
+# the WebAssembly pipeline code.
+brew install halide
 # or follow the official emsdk install flow if you prefer managing a specific version
 ```
 
@@ -110,17 +114,45 @@ This produces:
 #### WebAssembly target (experimental)
 
 ```bash
-# install Emscripten first, then configure the browser target
-emcmake cmake -S . -B build-wasm -DHIRACO_BUILD_WASM=ON -DHIRACO_BUILD_GUI=OFF -DHIRACO_BUILD_TESTS=OFF
-cmake --build build-wasm --target hiraco-wasm
+# install Emscripten and the Halide host tool first, then:
+./scripts/build_wasm.sh
 ```
 
-This produces a browser build under `build-wasm/` with the WebAssembly module and JavaScript wrapper:
+The script configures the `wasm` CMake preset and builds the WebAssembly
+targets.  It finds the Emscripten toolchain file from `emcc`; set
+`EMSCRIPTEN_TOOLCHAIN_FILE` to override that.  The equivalent explicit
+invocation is:
 
-- `build-wasm/hiraco-wasm.js`
-- `build-wasm/hiraco-wasm.wasm`
+```bash
+emcmake cmake -S . -B build-wasm -DHIRACO_BUILD_WASM=ON -DHIRACO_BUILD_GUI=OFF -DHIRACO_BUILD_TESTS=ON
+cmake --build build-wasm --target hiraco-cli hiraco-wasm
+```
 
-The browser target intentionally disables the desktop GUI and is aimed at the non-UI conversion core and Adobe DNG SDK integration. The native desktop build remains the default and continues to work unchanged.
+This produces:
+
+- `build-wasm/hiraco-cli.js` and `build-wasm/hiraco-cli.wasm`, the command line converter running under Node
+- `build-wasm/hiraco-wasm.js` and `build-wasm/hiraco-wasm.wasm`, the browser module
+
+The WebAssembly build needs a host installation of Halide, because the Halide
+generator runs on the build machine and emits the WebAssembly pipeline code.
+Point CMake at it with `-DHIRACO_HALIDE_DIR=/path/to/lib/cmake/Halide` if it
+is not found automatically.
+
+Two dependencies are built from source for the WebAssembly target, because
+neither has a WebAssembly build:
+
+- **FFTW3** is fetched, checksummed and compiled with its generic codelets.
+- **LibRaw** is fetched, checksummed and compiled against the Emscripten zlib
+  and libjpeg ports.
+
+The native build keeps using the system FFTW and LibRaw, which are built with
+SIMD and OpenMP and are therefore faster.  `HIRACO_USE_BUNDLED_FFTW` and
+`HIRACO_USE_BUNDLED_LIBRAW` switch the native build over to the same source
+builds the WebAssembly target uses.
+
+The WebAssembly target is 64 bit.  A 10386 x 7792 sensor-shift capture peaks at
+about 8 GB of resident memory in the native build, which does not fit in the
+4 GB address space of a 32 bit WebAssembly module.
 
 If `wx-config` is not on `PATH` on macOS, point CMake at it explicitly:
 
@@ -138,7 +170,7 @@ cmake -S . -B build -DHIRACO_BUILD_CLI=OFF
 cmake -S . -B build -DHIRACO_BUILD_TESTS=ON
 
 # WebAssembly / browser build
-emcmake cmake -S . -B build-wasm -DHIRACO_BUILD_WASM=ON -DHIRACO_BUILD_GUI=OFF -DHIRACO_BUILD_TESTS=OFF
+./scripts/build_wasm.sh
 ```
 
 ## Running
@@ -149,6 +181,12 @@ The CLI currently exposes one command:
 
 ```bash
 ./build/release/hiraco-cli convert <source> <output> [--compression uncompressed|deflate|jpeg-xl] [--hl-rec] [--debug]
+```
+
+The WebAssembly build takes the same arguments and really converts the file:
+
+```bash
+node build-wasm/hiraco-cli.js convert sample/_3210505.ORF output.dng --compression deflate --debug
 ```
 
 Examples:
@@ -163,6 +201,23 @@ Examples:
 `--debug` enables timing logs for the main processing phases.  `--hl-rec`
 enables ORI-assisted highlight recovery when a companion file is detected next to
 the source; it is off by default and has no effect when no companion is found.
+
+The WebAssembly build does not find a companion file, because the conversion
+runs on a buffer rather than on a directory, so `--hl-rec` has no effect there.
+
+The WebAssembly build is slower than the native one - roughly twice as long on
+a 5220 x 3912 capture - because its FFTW has no SIMD codelets and the
+demosaic runs without OpenMP.
+
+The browser module takes the RAW data as a buffer and returns the DNG as a
+buffer, so a page never needs a file system:
+
+```js
+const createModule = await import('./build-wasm/hiraco-wasm.js');
+const module = await createModule();
+// ... fill the heap with the RAW data, call _hiraco_wasm_convert, read the
+// DNG back out of the heap.  See tests/wasm_convert_harness.js.
+```
 
 ### GUI
 
@@ -196,6 +251,26 @@ ctest --test-dir build/relwithdebinfo --output-on-failure
 ```
 
 The test target currently covers core-library behavior rather than full GUI automation.
+
+### Verifying the WebAssembly build
+
+The WebAssembly build is checked against the native build with three tools:
+
+```bash
+# the DNG capability summaries must describe the running build
+./build-wasm/hiraco-capability-check.js
+
+# the two Halide pipelines must agree to the last floating point bit
+.venv/bin/python scripts/compare_halide_pipelines.py \
+    build-native/hiraco-halide-check build-wasm/hiraco-halide-check.js
+
+# convert every fixture with both builds and compare the DNGs
+.venv/bin/python scripts/verify_wasm.py \
+    --native build-native/hiraco-cli --wasm build-wasm/hiraco-cli.js
+```
+
+`docs/wasm-verification.md` describes how the comparison works and how the
+tolerance between the two builds was established.
 
 ## Processing Notes
 
