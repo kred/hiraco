@@ -1,0 +1,147 @@
+name: wasm
+
+# The WebAssembly build is verified against the native build: both are built,
+# and the WebAssembly output is compared with the native output for the same
+# RAW files.
+#
+# Two things are not part of the repository and have to be supplied:
+#
+#   DNG_SDK_URL       The Adobe DNG SDK archive.  The SDK is a mandatory
+#                     dependency of the project - the build refuses to
+#                     configure without it - so this variable is required.
+#                     It should point at the archive of the SDK version the
+#                     project uses (1.7.1).
+#
+#   HIRACO_FIXTURE_URL
+#                     An archive of RAW fixtures.  The camera files in sample/
+#                     are not tracked either.  When this variable is set the
+#                     workflow converts the fixtures with both builds and
+#                     compares the results; when it is not set the
+#                     fixture-independent checks still run and the workflow
+#                     says that the comparison was skipped.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wasm:
+    name: Build and verify the WebAssembly target
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      # The Halide generator runs on the build machine, so the host Halide
+      # installation is needed as well.  The option points at the directory
+      # that holds HalideConfig.cmake.
+      HIRACO_HALIDE_DIR: /usr/local/lib/cmake/Halide
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Emscripten
+        uses: mymindstormz/emsdk@v3
+        with:
+          version: 3.1.74
+          actions: setup
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libjpeg-dev libpng-dev zlib1g-dev libomp-dev libtiff-dev
+
+      - name: Install Halide
+        # Halide is a host tool: its generator runs on the build machine and
+        # emits the WebAssembly pipeline code.  The utility programs are left
+        # enabled because the generator library is installed alongside them.
+        run: |
+          git clone --depth 1 --branch v21.0.0 https://github.com/halide/Halide.git /tmp/halide
+          cmake -S /tmp/halide -B /tmp/halide/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DWITH_TESTS=OFF -DWITH_DOCS=OFF
+          cmake --build /tmp/halide/build --target install
+
+      - name: Fetch the Adobe DNG SDK
+        env:
+          DNG_SDK_URL: ${{ vars.DNG_SDK_URL }}
+        run: |
+          if [ -z "${DNG_SDK_URL}" ]; then
+            echo "::error::DNG_SDK_URL is not set.  The Adobe DNG SDK is a" \
+                 "mandatory dependency and is not part of the repository."
+            exit 1
+          fi
+          curl -sSL --retry 3 -o /tmp/dng-sdk.zip "${DNG_SDK_URL}"
+          mkdir -p dng_sdk_1_7_1
+          unzip -q /tmp/dng-sdk.zip -d /tmp/dng-sdk
+          # The archive unpacks into a directory whose name carries the
+          # version; the build expects dng_sdk_1_7_1.
+          sdk_dir="$(find /tmp/dng-sdk -maxdepth 1 -mindepth 1 -type d | head -1)"
+          cp -R "${sdk_dir}/." dng_sdk_1_7_1/
+
+      - name: Fetch the RAW fixtures
+        env:
+          HIRACO_FIXTURE_URL: ${{ vars.HIRACO_FIXTURE_URL }}
+        run: |
+          mkdir -p sample
+          if [ -n "${HIRACO_FIXTURE_URL}" ]; then
+            curl -sSL --retry 3 -o /tmp/fixtures.tar.gz "${HIRACO_FIXTURE_URL}"
+            tar xzf /tmp/fixtures.tar.gz -C sample
+            echo "fixtures fetched"
+          else
+            echo "::notice::HIRACO_FIXTURE_URL is not set; the RAW fixtures are" \
+                 "not part of the repository, so the WebAssembly-versus-native" \
+                 "comparison will be skipped."
+          fi
+
+      - name: Build the native reference
+        run: |
+          cmake -S . -B build/native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHIRACO_BUILD_GUI=OFF \
+            -DHIRACO_BUILD_TESTS=ON
+          cmake --build build/native
+
+      - name: Run the native tests
+        run: ctest --test-dir build/native --output-on-failure
+
+      - name: Build the WebAssembly target
+        run: |
+          . ./emsdk_env.sh
+          ./scripts/build_wasm.sh
+
+      - name: Check the WebAssembly capability reporting
+        run: |
+          node build-wasm/hiraco-capability-check.js
+
+      - name: Compare the WebAssembly and native Halide pipelines
+        run: |
+          python3 -m venv .venv-ci
+          .venv-ci/bin/pip install --quiet numpy
+          .venv-ci/bin/python scripts/compare_halide_pipelines.py \
+            build/native/hiraco-halide-check \
+            build-wasm/hiraco-halide-check.js
+
+      - name: Compare the WebAssembly and native conversions
+        env:
+          HIRACO_FIXTURE_URL: ${{ vars.HIRACO_FIXTURE_URL }}
+        run: |
+          if [ -z "${HIRACO_FIXTURE_URL}" ]; then
+            echo "::notice::Skipping the conversion comparison: no RAW fixtures."
+            exit 0
+          fi
+          python3 -m venv .venv-ci
+          .venv-ci/bin/pip install --quiet numpy
+          .venv-ci/bin/python scripts/verify_wasm.py \
+            --native build/native/hiraco-cli \
+            --wasm build-wasm/hiraco-cli.js \
+            --reference-dir build/reference \
+            --output-dir build/wasm-verify
