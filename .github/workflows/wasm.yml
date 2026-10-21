@@ -4,13 +4,19 @@ name: wasm
 # and the WebAssembly output is compared with the native output for the same
 # RAW files.
 #
-# Two things are not part of the repository and have to be supplied:
+# Two things are not part of the repository: the Adobe DNG SDK and the RAW
+# fixtures.  The SDK is pinned here, so the workflow needs no configuration
+# to build; the DNG_SDK_URL and DNG_SDK_SHA256 repository variables override
+# the pinned pair, and HIRACO_FIXTURE_URL adds RAW fixtures.  Without
+# fixtures the workflow still builds and checks both targets, and says that
+# the conversion comparison was skipped.
 #
-#   DNG_SDK_URL       The Adobe DNG SDK archive.  The SDK is a mandatory
-#                     dependency of the project - the build refuses to
-#                     configure without it - so this variable is required.
-#                     It should point at the archive of the SDK version the
-#                     project uses (1.7.1).
+#   DNG_SDK_URL       Overrides the pinned Adobe DNG SDK archive.  The SDK is
+#                     a mandatory dependency of the project - the build
+#                     refuses to configure without it.
+#
+#   DNG_SDK_SHA256    Overrides the checksum of that archive.  It has to be
+#                     overridden together with the URL.
 #
 #   HIRACO_FIXTURE_URL
 #                     An archive of RAW fixtures.  The camera files in sample/
@@ -78,20 +84,27 @@ jobs:
 
       - name: Fetch the Adobe DNG SDK
         env:
-          DNG_SDK_URL: ${{ vars.DNG_SDK_URL }}
+          # The Adobe DNG SDK is a mandatory dependency and is not part of
+          # the repository.  The pinned release is the one this project is
+          # developed against; the repository variables override it, and if
+          # the URL is overridden then the checksum has to be as well.
+          DNG_SDK_URL: ${{ vars.DNG_SDK_URL || 'https://download.adobe.com/pub/adobe/dng/dng_sdk_1_7_1_2768_20261013.zip' }}
+          DNG_SDK_SHA256: ${{ vars.DNG_SDK_SHA256 || 'c1d3a545ed45b150e59af2e6aa0695c1551f0e2bed34ad87436898a05194d2b1' }}
         run: |
-          if [ -z "${DNG_SDK_URL}" ]; then
-            echo "::error::DNG_SDK_URL is not set.  The Adobe DNG SDK is a" \
-                 "mandatory dependency and is not part of the repository."
-            exit 1
-          fi
-          curl -sSL --retry 3 -o /tmp/dng-sdk.zip "${DNG_SDK_URL}"
-          mkdir -p dng_sdk_1_7_1
-          unzip -q /tmp/dng-sdk.zip -d /tmp/dng-sdk
-          # The archive unpacks into a directory whose name carries the
-          # version; the build expects dng_sdk_1_7_1.
-          sdk_dir="$(find /tmp/dng-sdk -maxdepth 1 -mindepth 1 -type d | head -1)"
-          cp -R "${sdk_dir}/." dng_sdk_1_7_1/
+          curl -sSL --retry 3 --fail -o /tmp/dng-sdk.zip "${DNG_SDK_URL}"
+          echo "${DNG_SDK_SHA256}  /tmp/dng-sdk.zip" | sha256sum --check --strict
+          # The archive unpacks into dng_sdk_1_7_1, which is the directory
+          # the build expects, so it is extracted in place.  Nothing is copied
+          # out of it: a copy would follow anything in the archive that
+          # points outside it.
+          rm -rf dng_sdk_1_7_1
+          unzip -q /tmp/dng-sdk.zip -d .
+          # The three paths the build needs.  Checking them here means a
+          # changed archive fails here, with a clear message, rather than
+          # somewhere in the configure step.
+          test -f dng_sdk_1_7_1/dng_sdk/source/dng_host.h
+          test -f dng_sdk_1_7_1/libjxl/libjxl/CMakeLists.txt
+          test -f dng_sdk_1_7_1/xmp/toolkit/public/include/XMP.incl_cpp
 
       - name: Fetch the RAW fixtures
         env:
