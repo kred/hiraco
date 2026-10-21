@@ -38,6 +38,7 @@ inline float ClampStage2Gain(float gain) {
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fftw3.h>
@@ -355,9 +356,12 @@ std::shared_ptr<const FftwPlanPair> GetFftwPlanPair(uint32_t width, uint32_t hei
 }
 
 double RawDomainBlackLevel(const LibRaw& processor) {
-  const unsigned black = processor.imgdata.color.black;
+  // LibRaw spells these fields with different integer widths depending on the
+  // platform it was built for, so the values are read through double rather
+  // than through a fixed width integer type.
+  const double black = static_cast<double>(processor.imgdata.color.black);
   if (black > 0) {
-    return static_cast<double>(black);
+    return black;
   }
 
   double sum = 0.0;
@@ -372,22 +376,22 @@ double RawDomainBlackLevel(const LibRaw& processor) {
 }
 
 double RawDomainWhiteLevel(const LibRaw& processor) {
-  const unsigned maximum = processor.imgdata.color.maximum;
+  const double maximum = static_cast<double>(processor.imgdata.color.maximum);
   if (maximum > 0) {
-    return static_cast<double>(maximum);
+    return maximum;
   }
 
-  unsigned linear_max = 0;
+  double linear_max = 0;
   for (int index = 0; index < 4; ++index) {
-    linear_max = std::max(linear_max, processor.imgdata.color.linear_max[index]);
+    linear_max = std::max(linear_max, static_cast<double>(processor.imgdata.color.linear_max[index]));
   }
   if (linear_max > 0) {
-    return static_cast<double>(linear_max);
+    return linear_max;
   }
 
-  const unsigned raw_bps = processor.imgdata.color.raw_bps;
+  const uint64_t raw_bps = static_cast<uint64_t>(processor.imgdata.color.raw_bps);
   if (raw_bps > 0 && raw_bps < 31) {
-    return static_cast<double>((1u << raw_bps) - 1u);
+    return static_cast<double>((uint64_t{1} << raw_bps) - 1u);
   }
 
   return 16383.0;
