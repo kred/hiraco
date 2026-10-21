@@ -37,10 +37,10 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # The Halide generator runs on the build machine, so the host Halide
-      # installation is needed as well.  The option points at the directory
-      # that holds HalideConfig.cmake.
-      HIRACO_HALIDE_DIR: /usr/local/lib/cmake/Halide
+      # The prebuilt Halide release.  Building Halide from source instead
+      # would need the Clang static libraries, which the runner image does
+      # not ship, and the generator is all this build needs.
+      HALIDE_URL: https://github.com/halide/Halide/releases/download/v21.0.0/Halide-21.0.0-x86-64-linux-b629c80de18f1534ec71fddd8b567aa7027a0876.tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -61,16 +61,20 @@ jobs:
             libjpeg-dev libpng-dev zlib1g-dev libomp-dev libtiff-dev
 
       - name: Install Halide
-        # Halide is a host tool: its generator runs on the build machine and
-        # emits the WebAssembly pipeline code.  The utility programs are left
-        # enabled because the generator library is installed alongside them.
         run: |
-          git clone --depth 1 --branch v21.0.0 https://github.com/halide/Halide.git /tmp/halide
-          cmake -S /tmp/halide -B /tmp/halide/build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DWITH_TESTS=OFF -DWITH_DOCS=OFF
-          cmake --build /tmp/halide/build --target install
+          curl -sSL --retry 3 --fail -o /tmp/halide.tar.gz "${HALIDE_URL}"
+          mkdir -p /opt/halide
+          tar xzf /tmp/halide.tar.gz -C /opt/halide --strip-components=1
+          # Point the build at the package, wherever it landed in the archive.
+          halide_cmake_dir="$(dirname "$(find /opt/halide -name HalideConfig.cmake -print -quit)")"
+          if [ -z "${halide_cmake_dir}" ]; then
+            echo "::error::HalideConfig.cmake not found in the Halide archive"
+            ls -R /opt/halide | head -50
+            exit 1
+          fi
+          echo "HIRACO_HALIDE_DIR=${halide_cmake_dir}" >> "${GITHUB_ENV}"
+          # The generator library is what add_halide_generator links against.
+          test -n "$(find /opt/halide -name 'libHalide_GenGen.a' -print -quit)"
 
       - name: Fetch the Adobe DNG SDK
         env:
