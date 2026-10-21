@@ -26,11 +26,22 @@ async function main() {
   const raw = fs.readFileSync(inputPath);
   const rawName = path.basename(inputPath);
 
+  // Two different number representations are in play, and the distinction
+  // matters:
+  //
+  //   * The Emscripten runtime functions (`_malloc`, `_free`, the heap
+  //     views) are ordinary JavaScript and use plain Numbers for sizes and
+  //     offsets.  `_malloc` returns a Number.
+  //   * The exported C functions are compiled for wasm64, so their pointer
+  //     and `size_t` parameters are 64 bit integers and the WebAssembly ABI
+  //     requires a BigInt for them.
+  //
+  // So sizes and offsets stay Numbers, and only the arguments that cross
+  // into the WebAssembly module are converted.
+
   // The export takes the RAW data as a pointer into the module's heap and
   // writes the DNG back through a pointer to a pointer.
-  // The module is built for wasm64, so `size_t` and the pointers are 64 bit
-  // integers and the WebAssembly ABI wants a BigInt for them.
-  const rawPointer = module._malloc(BigInt(raw.length));
+  const rawPointer = module._malloc(raw.length);
   module.HEAPU8.set(raw, rawPointer);
 
   const outPointerPointer = module._malloc(8);

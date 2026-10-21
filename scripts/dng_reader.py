@@ -131,14 +131,26 @@ class DngFile:
             return raw.split(b"\0")[0].decode("latin-1")
         if ttype in (1, 6, 7):
             return raw
+        if ttype in (5, 10):
+            # RATIONAL and SRATIONAL are pairs of 32 bit integers: a
+            # numerator and a denominator per value.  TIFF stores them as
+            # signed LONGs, so they are read as signed values.  The type
+            # sizes are eight bytes each, so the buffer holds two
+            # components per value.
+            components = 2 * count
+            values = list(struct.unpack(self.byte_order + "i" * components,
+                                       raw[:struct.calcsize("i") * components]))
+            fractions = [values[index * 2] / values[index * 2 + 1]
+                         if values[index * 2 + 1] else 0.0
+                         for index in range(count)]
+            if count == 1:
+                return fractions[0]
+            return fractions
         fmt = {1: "B", 3: "H", 4: "I", 8: "h", 9: "i", 11: "f", 12: "d",
                13: "I", 16: "Q", 17: "q"}.get(ttype)
         if fmt is None:
             return raw
         values = list(struct.unpack(self.byte_order + fmt * count, raw[:struct.calcsize(fmt) * count]))
-        if ttype in (5, 10) and values:
-            pairs = [values[i * 2:i * 2 + 2] for i in range(count)]
-            return [p[0] / p[1] if p[1] else 0.0 for p in pairs]
         if count == 1:
             return values[0]
         return values

@@ -302,7 +302,7 @@ if(HIRACO_USE_BUNDLED_LIBRAW)
   set(HIRACO_LIBRAW_ROOT "${CMAKE_CURRENT_BINARY_DIR}/libraw")
   # With SOURCE_SUBDIR set, ExternalProject strips the archive's top level
   # directory and unpacks the contents into the subdirectory it creates.
-  set(HIRACO_LIBRAW_SOURCE_DIR "${HIRACO_LIBRAW_ROOT}/src/heraco_libraw_source")
+  set(HIRACO_LIBRAW_SOURCE_DIR "${HIRACO_LIBRAW_ROOT}/src/hiraco_libraw_source")
   set(HIRACO_LIBRAW_BUILD_DIR "${HIRACO_LIBRAW_ROOT}/build")
 
   if(EMSCRIPTEN)
@@ -350,7 +350,7 @@ if(HIRACO_USE_BUNDLED_LIBRAW)
     endif()
   endif()
 
-  ExternalProject_Add(heraco_libraw_source
+  ExternalProject_Add(hiraco_libraw_source
     URL "https://github.com/LibRaw/LibRaw/archive/refs/tags/${HIRACO_LIBRAW_VERSION}.tar.gz"
     URL_HASH SHA256=${HIRACO_LIBRAW_SHA256}
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
@@ -384,7 +384,7 @@ if(HIRACO_USE_BUNDLED_LIBRAW)
       "${HIRACO_LIBRAW_BUILD_DIR}/lib/.libs/libraw.a"
   )
 
-  add_custom_target(hiraco-libraw-ready DEPENDS heraco_libraw_source)
+  add_custom_target(hiraco-libraw-ready DEPENDS hiraco_libraw_source)
 
   add_library(hiraco-libraw STATIC IMPORTED GLOBAL)
   set_target_properties(hiraco-libraw PROPERTIES

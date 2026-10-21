@@ -46,10 +46,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Emscripten
-        uses: mymindstormz/emsdk@v3
+        # The action puts emcc on PATH, which is what scripts/build_wasm.sh
+        # looks for.  The version is pinned to the one this build was
+        # developed and verified against.
+        uses: emscripten-core/setup-emsdk@v16
         with:
-          version: 3.1.74
-          actions: setup
+          version: 6.0.12
 
       - name: Install the build dependencies
         run: |
@@ -114,9 +116,7 @@ jobs:
         run: ctest --test-dir build/native --output-on-failure
 
       - name: Build the WebAssembly target
-        run: |
-          . ./emsdk_env.sh
-          ./scripts/build_wasm.sh
+        run: ./scripts/build_wasm.sh
 
       - name: Check the WebAssembly capability reporting
         run: |
