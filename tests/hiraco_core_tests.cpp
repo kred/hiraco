@@ -920,6 +920,40 @@ void TestDngWriterConfigSummaryReportsRequestedVersionAndCode() {
          "an unsupported compression mode should not be configurable");
 }
 
+void TestCapabilityReportingMatchesRuntime() {
+  // The summaries describe the running build, so they have to agree with what
+  // the DNG runtime actually does.
+  const DngSdkSupportSummary support = GetDngSdkSupportSummary();
+  Expect(support.enabled,
+         "the DNG SDK runtime should be usable in this build: " + support.status);
+  Expect(!support.status.empty(),
+         "the DNG SDK summary should carry a status message");
+
+  std::string jpeg_xl_reason;
+  const bool jpeg_xl_usable = CanWriteLinearDng("jpeg-xl", &jpeg_xl_reason);
+  Expect(support.jpeg_xl_available == jpeg_xl_usable,
+         std::string("the summary reports JPEG XL as ") +
+             (support.jpeg_xl_available ? "available" : "unavailable") +
+             " but the runtime says " + (jpeg_xl_usable ? "usable" : "unusable"));
+
+  for (const char* mode : {"uncompressed", "deflate", "jpeg-xl"}) {
+    const std::string name(mode);
+    std::string reason;
+    const bool usable = CanWriteLinearDng(name, &reason);
+    Expect(usable, "the writer should be usable for " + name + ": " + reason);
+
+    const DngWriterConfigSummary summary = BuildDngWriterConfigSummary(name);
+    Expect(summary.enabled == usable,
+           std::string("the summary for ") + name + " reports enabled=" +
+               (summary.enabled ? "true" : "false") + " but the runtime says " +
+               (usable ? "usable" : "unusable"));
+    Expect(summary.can_configure_writer == usable,
+           std::string("the summary for ") + name + " reports can_configure_writer=" +
+               (summary.can_configure_writer ? "true" : "false") + " but the runtime says " +
+               (usable ? "usable" : "unusable"));
+  }
+}
+
 void TestCropPreviewMatchesFullImageCrop() {
   const SourceLinearDngMetadata metadata = MakeHighResMetadata();
   ProcessingCache cache;
@@ -1387,6 +1421,7 @@ int main() {
     TestFullPreviewHonoursCancellation();
     TestFullPreviewReusesCachedPreview();
     TestDngWriterConfigSummaryReportsRequestedVersionAndCode();
+    TestCapabilityReportingMatchesRuntime();
     TestCropPreviewMatchesFullImageCrop();
     TestDisplayProcessingCacheScalesBothInputs();
     TestApplyRecoveredPixelCast();
