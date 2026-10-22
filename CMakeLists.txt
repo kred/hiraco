@@ -877,10 +877,37 @@ endif()
 if(NOT BOOST_INCLUDE_DIRS)
   message(FATAL_ERROR "Boost headers not found; required by the Adobe XMP toolkit used by the DNG SDK. Set HIRACO_BOOST_INCLUDE_DIR or install Boost in a standard location.")
 endif()
-target_include_directories(hiraco-xmp-core PRIVATE ${BOOST_INCLUDE_DIRS})
-
 if(EMSCRIPTEN)
+  # The Emscripten sysroot supplies the standard headers.  Adding the host
+  # include root would put a host <inttypes.h> in front of the sysroot one,
+  # and that header pulls in host-only architecture headers such as
+  # <bits/wordsize.h> which the WebAssembly sysroot does not ship.  Expose
+  # the Boost headers through a shim directory that holds a single "boost"
+  # entry instead, so only <boost/...> resolves through the host tree.
+  set(HIRACO_BOOST_INCLUDE_SHIM "${CMAKE_CURRENT_BINARY_DIR}/boost-include")
+  file(MAKE_DIRECTORY "${HIRACO_BOOST_INCLUDE_SHIM}")
+  set(HIRACO_BOOST_INCLUDE_SHIM_READY OFF)
+  foreach(_hiraco_boost_root IN LISTS BOOST_INCLUDE_DIRS)
+    if(EXISTS "${_hiraco_boost_root}/boost/version.hpp")
+      set(_hiraco_boost_tree "${_hiraco_boost_root}/boost")
+    elseif(EXISTS "${_hiraco_boost_root}/version.hpp")
+      set(_hiraco_boost_tree "${_hiraco_boost_root}")
+    else()
+      continue()
+    endif()
+    file(REMOVE "${HIRACO_BOOST_INCLUDE_SHIM}/boost")
+    file(CREATE_LINK "${_hiraco_boost_tree}" "${HIRACO_BOOST_INCLUDE_SHIM}/boost" SYMBOLIC)
+    set(HIRACO_BOOST_INCLUDE_SHIM_READY ON)
+    message(STATUS "Boost include shim: ${HIRACO_BOOST_INCLUDE_SHIM}/boost -> ${_hiraco_boost_tree}")
+    break()
+  endforeach()
+  if(NOT HIRACO_BOOST_INCLUDE_SHIM_READY)
+    message(FATAL_ERROR "Could not expose the Boost headers for the WebAssembly build; set HIRACO_BOOST_INCLUDE_DIR to a directory that contains a boost/ subdirectory.")
+  endif()
+  target_include_directories(hiraco-xmp-core PRIVATE "${HIRACO_BOOST_INCLUDE_SHIM}")
   target_include_directories(hiraco-xmp-core PRIVATE ${HIRACO_EMSCRIPTEN_SYSROOT_INCLUDE_DIR})
+else()
+  target_include_directories(hiraco-xmp-core PRIVATE ${BOOST_INCLUDE_DIRS})
 endif()
 
 target_include_directories(hiraco-xmp-core PRIVATE
