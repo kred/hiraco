@@ -36,21 +36,26 @@ if [[ -z "${EMSCRIPTEN_TOOLCHAIN_FILE:-}" ]]; then
     echo "error: emcc is not on PATH; install and activate Emscripten first" >&2
     exit 2
   fi
-  # The toolchain file ships inside the Emscripten installation, which is
-  # the parent of the directory holding the emcc driver.  The driver is often
-  # a symlink into a versioned directory, so it is resolved first.
-  emscripten_root="$(cd "$(dirname "$(readlink_f "$(command -v emcc)")")/.." && pwd)"
-  for candidate in \
-      "${emscripten_root}/libexec/cmake/Modules/Platform/Emscripten.cmake" \
-      "${emscripten_root}/cmake/Modules/Platform/Emscripten.cmake" \
-      "${emscripten_root}/share/emscripten/cmake/Modules/Platform/Emscripten.cmake"; do
+  # The driver is often a symlink into a versioned directory, so it is
+  # resolved first.
+  emcc_root="$(dirname "$(readlink_f "${emcc_path}")")"
+
+  # The layout differs between the emsdk and a distribution package: the
+  # emsdk keeps the toolchain file under the emcc directory, while a
+  # distribution package keeps it next to the bin directory.  Both are
+  # searched rather than guessed.
+  if [[ -n "${EMSDK:-}" ]]; then
+    candidate="${EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake"
     if [[ -f "${candidate}" ]]; then
       EMSCRIPTEN_TOOLCHAIN_FILE="${candidate}"
-      break
     fi
-  done
+  fi
   if [[ -z "${EMSCRIPTEN_TOOLCHAIN_FILE:-}" ]]; then
-    echo "error: could not locate the Emscripten toolchain file under ${emscripten_root}" >&2
+    EMSCRIPTEN_TOOLCHAIN_FILE="$(find "${emcc_root}" "${emcc_root}/.." \
+        -maxdepth 5 -path '*/Platform/Emscripten.cmake' -print -quit 2>/dev/null || true)"
+  fi
+  if [[ -z "${EMSCRIPTEN_TOOLCHAIN_FILE:-}" ]]; then
+    echo "error: could not locate the Emscripten toolchain file near ${emcc_root}" >&2
     echo "       set EMSCRIPTEN_TOOLCHAIN_FILE to it explicitly" >&2
     exit 2
   fi
