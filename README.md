@@ -295,3 +295,17 @@ limitations.
 ## Legal Disclaimer
 
 *OM SYSTEM and Olympus are registered trademarks of OM Digital Solutions Corporation or Olympus Corporation. This project is not affiliated with, endorsed by, or sponsored by these companies. All trademarks are used only for compatibility description and nominative fair use purposes.*
+
+## Web UI
+
+The repository ships a browser UI in `web/` that runs the full conversion in
+the browser.  Build and run it with:
+
+```bash
+./scripts/build_web.sh
+cd web
+npm run preview   # http://localhost:4173
+```
+
+See [docs/web-ui.md](docs/web-ui.md) for the requirements, the supported
+browsers and the test commands.
