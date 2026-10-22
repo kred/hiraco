@@ -1211,7 +1211,7 @@ if(HIRACO_BUILD_WASM)
     -sWASM=1
     -sMODULARIZE=1
     -sEXPORT_NAME=hiracoWasm
-    -sEXPORTED_FUNCTIONS=["_hiraco_wasm_is_dng_sdk_enabled","_hiraco_wasm_get_dng_status","_hiraco_wasm_get_writer_summary","_hiraco_wasm_convert","_hiraco_wasm_free_buffer","_hiraco_wasm_get_last_error","_malloc","_free"]
+    -sEXPORTED_FUNCTIONS=["_hiraco_wasm_is_dng_sdk_enabled","_hiraco_wasm_get_dng_status","_hiraco_wasm_get_writer_summary","_hiraco_wasm_convert","_hiraco_wasm_free_buffer","_hiraco_wasm_get_last_error","_hiraco_wasm_open_session","_hiraco_wasm_close_session","_hiraco_wasm_get_image_size","_hiraco_wasm_get_metadata_json","_hiraco_wasm_set_highlight_recovery","_hiraco_wasm_get_original_preview","_hiraco_wasm_get_converted_preview","_hiraco_wasm_get_resolved_stage_settings","_hiraco_wasm_convert_session","_hiraco_wasm_request_cancel","_malloc","_free"]
     -sEXPORTED_RUNTIME_METHODS=["ccall","cwrap","HEAPU8","HEAPU32","lengthBytesUTF8","stringToUTF8","stringToNewUTF8","UTF8ToString"]
   )
 endif()
