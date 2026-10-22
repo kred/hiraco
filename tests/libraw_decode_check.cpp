@@ -11,6 +11,10 @@
 //
 // Usage:
 //   hiraco-libraw-check <input.ORF> <output.bin>
+//
+// The output path is the last argument.  The input is the first argument
+// LibRaw can open, so a wrapper that passes its own path in front of the
+// real arguments is tolerated.
 #include <libraw/libraw.h>
 
 #include <cstdint>
@@ -38,9 +42,21 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // The output is the last argument, the input is the first argument that
+  // opens as a RAW file.
+  const char* output_path = argv[argc - 1];
   LibRaw processor;
-  int result = processor.open_file(argv[1]);
-  if (result != LIBRAW_SUCCESS) {
+  int result = LIBRAW_FILE_UNSUPPORTED;
+  const char* input_path = nullptr;
+  for (int index = 1; index < argc - 1; ++index) {
+    if (index > 1) processor.recycle();
+    result = processor.open_file(argv[index]);
+    if (result == LIBRAW_SUCCESS) {
+      input_path = argv[index];
+      break;
+    }
+  }
+  if (input_path == nullptr) {
     fprintf(stderr, "open_file failed: %s\n", libraw_strerror(result));
     return 1;
   }
@@ -104,9 +120,9 @@ int main(int argc, char** argv) {
   const auto* source_pixels = reinterpret_cast<const uint16_t*>(image->data);
   std::vector<uint16_t> samples(source_pixels, source_pixels + sample_count);
 
-  FILE* handle = fopen(argv[2], "wb");
+  FILE* handle = fopen(output_path, "wb");
   if (handle == nullptr) {
-    fprintf(stderr, "cannot open %s for writing\n", argv[2]);
+    fprintf(stderr, "cannot open %s for writing\n", output_path);
     return 1;
   }
   fwrite(&header, sizeof(header), 1, handle);
