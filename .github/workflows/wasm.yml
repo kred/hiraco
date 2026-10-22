@@ -148,6 +148,18 @@ jobs:
       - name: Build the WebAssembly target
         run: ./scripts/build_wasm.sh
 
+      - name: Install Node.js
+        # The WebAssembly build is a 64 bit module with a 64 bit shared
+        # memory, so its JavaScript loader creates the memory with
+        # address:"i64".  That needs Node.js 24; Node.js 22 refuses it
+        # with "TypeError: Cannot convert a BigInt value to a number" and
+        # the --experimental-wasm-memory64 flag does not help there.  The
+        # runner image ships Node.js 22 as the default, so the version that
+        # can run the module is installed here.
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
       - name: Check the WebAssembly capability reporting
         run: |
           node build-wasm/hiraco-capability-check.js
