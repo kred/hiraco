@@ -32,8 +32,20 @@ npm run preview  # http://localhost:4173
 
 The dev and preview servers send the `Cross-Origin-Opener-Policy: same-origin`
 and `Cross-Origin-Embedder-Policy: require-corp` headers, which the module
-needs for its shared memory.  A static host that serves the built `dist/`
-without those headers will not be able to run the converter.
+needs for its shared memory.  A static host that does not send those headers
+is still supported, because the application registers a small service worker
+(`coi-serviceworker.js`) that adds them to every response.  The first visit
+reloads the page once so the headers take effect.
+
+The application cannot be opened directly from the file system (`file://`):
+browsers block both ES modules and service workers on that protocol, so the
+page has to be served over `http://` or `https://`, even locally.  Any
+static server works, for example:
+
+```bash
+cd web/dist
+python3 -m http.server 8000
+```
 
 ## Testing
 

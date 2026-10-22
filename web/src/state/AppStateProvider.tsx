@@ -361,6 +361,14 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const support = checkBrowserSupport();
+    if (support.registering) {
+      dispatch({
+        type: 'module-status',
+        status: 'loading',
+        message: 'Enabling cross-origin isolation…',
+      });
+      return;
+    }
     if (!support.supported) {
       dispatch({ type: 'module-status', status: 'unsupported', message: support.reason });
       return;
