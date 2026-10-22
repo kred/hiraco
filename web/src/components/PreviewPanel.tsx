@@ -121,6 +121,25 @@ export function PreviewPanel() {
           </p>
         )}
       </div>
+
+      {state.compareMode === 'reveal' && hasPreview && (
+        <div className="slider-row reveal-row">
+          <label htmlFor="reveal-slider">Reveal</label>
+          <input
+            id="reveal-slider"
+            className="slider"
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={state.reveal}
+            onChange={(event) =>
+              dispatch({ type: 'reveal-changed', reveal: Number(event.target.value) })
+            }
+          />
+          <span className="slider-value">{Math.round(state.reveal * 100)}%</span>
+        </div>
+      )}
     </section>
   );
 }

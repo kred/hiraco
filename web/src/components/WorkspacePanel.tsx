@@ -2,7 +2,7 @@ import { useRef } from 'react';
 import { useAppState } from '../state/AppStateProvider';
 
 export function WorkspacePanel() {
-  const { state, dispatch } = useAppState();
+  const { state, actions } = useAppState();
   const sourceInput = useRef<HTMLInputElement>(null);
   const companionInput = useRef<HTMLInputElement>(null);
 
@@ -23,7 +23,7 @@ export function WorkspacePanel() {
             onChange={(event) => {
               const file = event.target.files?.[0];
               if (file) {
-                dispatch({ type: 'source-selected', name: file.name });
+                actions.selectSource(file);
               }
             }}
           />
@@ -39,7 +39,7 @@ export function WorkspacePanel() {
             aria-label="ORI companion"
             onChange={(event) => {
               const file = event.target.files?.[0];
-              dispatch({ type: 'companion-selected', name: file ? file.name : null });
+              actions.selectCompanion(file ?? null);
             }}
           />
           <p className="hint">

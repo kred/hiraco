@@ -100,10 +100,10 @@ export function applyRecoveredMask(
       continue;
     }
     const offset = index * 4;
-    // A warm highlight that stays readable in both themes.
+    // The native application casts the recovered pixels to solid magenta.
     pixels[offset] = 255;
-    pixels[offset + 1] = 96;
-    pixels[offset + 2] = 32;
+    pixels[offset + 1] = 0;
+    pixels[offset + 2] = 255;
   }
   return { ...preview, pixels };
 }

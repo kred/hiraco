@@ -7,37 +7,12 @@ import {
   PRESET_IDS,
   PRESET_LABELS,
   STAGE_SECTIONS,
-  applyOverrides,
   formatStageValue,
-  normalizeOverrides,
-  type StageKey,
-  type StageSettings,
 } from '../lib/stageSettings';
 
 export function ControlsPanel() {
-  const { state, dispatch } = useAppState();
+  const { state, dispatch, actions } = useAppState();
   const busy = state.activity.state === 'working';
-
-  const changeStage = (key: StageKey, value: number) => {
-    const settings: StageSettings = { ...state.settings, [key]: value };
-    dispatch({
-      type: 'settings-changed',
-      settings,
-      overrides: normalizeOverrides({ ...state.overrides, [key]: value }, state.baseSettings),
-    });
-  };
-
-  const resetSection = (keys: StageKey[]) => {
-    const overrides = { ...state.overrides };
-    for (const key of keys) {
-      delete overrides[key];
-    }
-    dispatch({
-      type: 'settings-changed',
-      settings: applyOverrides(state.baseSettings, overrides),
-      overrides: normalizeOverrides(overrides, state.baseSettings),
-    });
-  };
 
   return (
     <section className="panel" aria-label="Processing">
@@ -56,7 +31,7 @@ export function ControlsPanel() {
                 type="button"
                 className="preset-button"
                 aria-pressed={state.preset === preset}
-                onClick={() => dispatch({ type: 'preset-applied', preset, settings: state.settings, overrides: state.overrides })}
+                onClick={() => actions.applyPreset(preset)}
               >
                 {PRESET_LABELS[preset]}
               </button>
@@ -71,7 +46,7 @@ export function ControlsPanel() {
               <button
                 type="button"
                 className="button ghost"
-                onClick={() => resetSection(section.sliders.map((slider) => slider.key))}
+                onClick={() => actions.resetSection(section.sliders.map((slider) => slider.key))}
               >
                 Reset
               </button>
@@ -96,7 +71,10 @@ export function ControlsPanel() {
                   disabled={busy}
                   onChange={(event) => {
                     const raw = Number(event.target.value);
-                    changeStage(slider.key, slider.integer ? Math.round(raw) : raw);
+                    actions.setStageValue(
+                      slider.key,
+                      slider.integer ? Math.round(raw) : raw,
+                    );
                   }}
                 />
               </div>
@@ -134,13 +112,36 @@ export function ControlsPanel() {
 
       <footer className="panel-footer">
         <div className="button-row">
-          <button type="button" className="button primary" disabled={busy}>
+          <button
+            type="button"
+            className="button primary"
+            disabled={busy || state.sourceName === null}
+            onClick={() => actions.convert()}
+          >
             Convert
           </button>
-          <button type="button" className="button danger" disabled={!busy}>
+          <button
+            type="button"
+            className="button danger"
+            disabled={!busy}
+            onClick={() => actions.cancel()}
+          >
             Cancel
           </button>
+          <button
+            type="button"
+            className="button"
+            disabled={state.result === null}
+            onClick={() => actions.download()}
+          >
+            Save DNG
+          </button>
         </div>
+        {state.resultSummary !== null && (
+          <p className="hint" data-testid="writer-summary">
+            {state.resultSummary}
+          </p>
+        )}
       </footer>
     </section>
   );

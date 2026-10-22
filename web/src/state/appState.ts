@@ -46,6 +46,9 @@ export interface SourceMetadata {
 
 export type ActivityState = 'idle' | 'working' | 'error' | 'done';
 
+/** The state of the WebAssembly module inside the browser. */
+export type ModuleStatus = 'unknown' | 'loading' | 'ready' | 'unsupported';
+
 export interface Activity {
   state: ActivityState;
   message: string;
@@ -77,6 +80,12 @@ export interface AppState {
   /** The Linear DNG produced by the last conversion, as a blob. */
   result: Blob | null;
   resultName: string | null;
+  /** The state of the WebAssembly module. */
+  moduleStatus: ModuleStatus;
+  /** Why the module cannot run, when it cannot. */
+  moduleMessage: string | null;
+  /** The one line summary of the writer configuration. */
+  resultSummary: string | null;
 }
 
 export const initialAppState: AppState = {
@@ -100,6 +109,9 @@ export const initialAppState: AppState = {
   error: null,
   result: null,
   resultName: null,
+  moduleStatus: 'unknown',
+  moduleMessage: null,
+  resultSummary: null,
 };
 
 export type AppAction =
@@ -117,6 +129,9 @@ export type AppAction =
   | { type: 'reveal-changed'; reveal: number }
   | { type: 'recovered-pixels-changed'; showRecoveredPixels: boolean }
   | { type: 'activity'; activity: Activity }
+  | { type: 'activity-progress'; message: string; fraction: number | null }
   | { type: 'error'; message: string | null }
+  | { type: 'module-status'; status: ModuleStatus; message: string | null }
+  | { type: 'result-summary'; summary: string | null }
   | { type: 'result'; blob: Blob; name: string }
   | { type: 'reset' };
