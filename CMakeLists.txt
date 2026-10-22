@@ -105,8 +105,10 @@ if(HIRACO_BUILD_WASM)
   set(PNG_FOUND TRUE)
   set(PNG_INCLUDE_DIRS "")
   set(PNG_LIBRARIES "")
-  # LibRaw and FFTW3 are resolved for the WebAssembly build by their own
-  # porting steps; until those exist there is nothing to link against.
+  # Placeholders for the LibRaw and FFTW3 porting steps below.  For the
+  # WebAssembly build the bundled source blocks are enabled unconditionally
+  # and overwrite these four variables, so nothing is linked against the
+  # system libraries here.
   set(LIBRAW_LIBRARIES "")
   set(LIBRAW_INCLUDE_DIRS "")
   set(FFTW3_LIBRARIES "")

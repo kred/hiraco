@@ -88,10 +88,21 @@ int main(int argc, char** argv) {
 
   const size_t sample_count =
       static_cast<size_t>(image->width) * image->height * image->colors;
-  std::vector<uint16_t> samples(sample_count);
-  for (size_t index = 0; index < sample_count; ++index) {
-    samples[index] = image->data[index];
+  if (image->bits != 16) {
+    fprintf(stderr, "expected 16 bit samples, got %u\n", image->bits);
+    return 1;
   }
+  if (image->data_size < sample_count * sizeof(uint16_t)) {
+    fprintf(stderr, "processed image holds %u bytes, need %zu\n",
+            image->data_size, sample_count * sizeof(uint16_t));
+    return 1;
+  }
+  // The processed image is a byte buffer that holds one 16 bit sample per
+  // two bytes, so the samples are read through a 16 bit view of it.  This is
+  // the sequence `dng_writer_bridge.cpp` uses as well, so both builds are
+  // compared on the same pixels.
+  const auto* source_pixels = reinterpret_cast<const uint16_t*>(image->data);
+  std::vector<uint16_t> samples(source_pixels, source_pixels + sample_count);
 
   FILE* handle = fopen(argv[2], "wb");
   if (handle == nullptr) {
