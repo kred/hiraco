@@ -60,7 +60,11 @@ test('converts a RAW file in the browser and matches the native output', async (
     !existsSync(reference),
     `the native reference ${reference} is not available`,
   );
-  const python = process.env.HIRACO_PYTHON ?? 'python3';
+  const python =
+    process.env.HIRACO_PYTHON ??
+    (existsSync(path.join(repoRoot, '.venv', 'bin', 'python3'))
+      ? path.join(repoRoot, '.venv', 'bin', 'python3')
+      : 'python3');
   const report = execFileSync(
     python,
     [
