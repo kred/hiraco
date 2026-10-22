@@ -13,7 +13,10 @@ inline float ClampStage2Gain(float gain) {
   return std::clamp(gain, kStage2GainMin, kStage2GainMax);
 }
 
-#if defined(HIRACO_ENABLE_DNG_SDK) && HIRACO_ENABLE_DNG_SDK && !defined(__EMSCRIPTEN__)
+// The Adobe DNG SDK is a mandatory dependency of the writer: the build
+// refuses to configure without it.  The writer therefore always uses it,
+// and the capability summaries report what the running build can actually do
+// rather than what the source was compiled with.
 
 #include "dng_auto_ptr.h"
 #include "dng_abort_sniffer.h"
@@ -35,6 +38,7 @@ inline float ClampStage2Gain(float gain) {
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fftw3.h>
@@ -228,6 +232,38 @@ void InitFftwThreads() {
   });
 }
 
+#if defined(__EMSCRIPTEN__)
+
+// The WebAssembly build keeps the FFTW wisdom in memory.  There is no home
+// directory to cache it in, the module must not write to the host file
+// system, and the process is short lived anyway.  The wisdom still travels
+// between the planner and the plan cache; it just lives in the process
+// instead of on disk.
+
+std::string& FftwWisdomString() {
+  static std::string wisdom;
+  return wisdom;
+}
+
+void LoadFftwWisdom() {
+  std::lock_guard<std::mutex> lock(g_fftw_wisdom_mutex);
+  const std::string& wisdom = FftwWisdomString();
+  if (!wisdom.empty()) {
+    fftw_import_wisdom_from_string(wisdom.c_str());
+  }
+}
+
+void SaveFftwWisdom() {
+  std::lock_guard<std::mutex> lock(g_fftw_wisdom_mutex);
+  char* wisdom = fftw_export_wisdom_to_string();
+  if (wisdom != nullptr) {
+    FftwWisdomString() = wisdom;
+    free(wisdom);
+  }
+}
+
+#else
+
 std::string FftwWisdomPath() {
   const char* home = std::getenv("HOME");
   if (!home) home = std::getenv("USERPROFILE");
@@ -250,6 +286,28 @@ void SaveFftwWisdom() {
     fftw_export_wisdom_to_filename(path.c_str());
   }
 }
+
+#endif
+
+#if defined(__EMSCRIPTEN__)
+
+// FFTW_MEASURE plans by running the transform repeatedly over the real data
+// and timing the results.  The WebAssembly build compiles FFTW's generic
+// codelets - it has no WebAssembly SIMD variants - so every trial is far
+// more expensive than on the host, and planning a transform of this size
+// takes tens of minutes.  FFTW_ESTIMATE picks an algorithm from FFTW's
+// static cost model instead, which plans instantly.
+//
+// The two modes can select different algorithms, so the transform rounds
+// slightly differently; see docs/wasm-verification.md.
+constexpr unsigned kFftwPlanningFlags = FFTW_ESTIMATE;
+
+#else
+
+// FFTW_MEASURE lets the planner pick the fastest algorithm for the machine.
+constexpr unsigned kFftwPlanningFlags = FFTW_MEASURE;
+
+#endif
 
 std::shared_ptr<const FftwPlanPair> GetFftwPlanPair(uint32_t width, uint32_t height) {
   const uint64_t key = (static_cast<uint64_t>(height) << 32) | width;
@@ -280,12 +338,12 @@ std::shared_ptr<const FftwPlanPair> GetFftwPlanPair(uint32_t width, uint32_t hei
                                          static_cast<int>(width),
                                          planning_input,
                                          planning_output,
-                                         FFTW_MEASURE);
+                                         kFftwPlanningFlags);
   plans->inverse = fftw_plan_dft_c2r_2d(static_cast<int>(height),
                                          static_cast<int>(width),
                                          planning_output,
                                          planning_input,
-                                         FFTW_MEASURE);
+                                         kFftwPlanningFlags);
   fftw_free(planning_output);
   fftw_free(planning_input);
   if (plans->forward == nullptr || plans->inverse == nullptr) {
@@ -298,9 +356,12 @@ std::shared_ptr<const FftwPlanPair> GetFftwPlanPair(uint32_t width, uint32_t hei
 }
 
 double RawDomainBlackLevel(const LibRaw& processor) {
-  const unsigned black = processor.imgdata.color.black;
+  // LibRaw spells these fields with different integer widths depending on the
+  // platform it was built for, so the values are read through double rather
+  // than through a fixed width integer type.
+  const double black = static_cast<double>(processor.imgdata.color.black);
   if (black > 0) {
-    return static_cast<double>(black);
+    return black;
   }
 
   double sum = 0.0;
@@ -315,22 +376,22 @@ double RawDomainBlackLevel(const LibRaw& processor) {
 }
 
 double RawDomainWhiteLevel(const LibRaw& processor) {
-  const unsigned maximum = processor.imgdata.color.maximum;
+  const double maximum = static_cast<double>(processor.imgdata.color.maximum);
   if (maximum > 0) {
-    return static_cast<double>(maximum);
+    return maximum;
   }
 
-  unsigned linear_max = 0;
+  double linear_max = 0;
   for (int index = 0; index < 4; ++index) {
-    linear_max = std::max(linear_max, processor.imgdata.color.linear_max[index]);
+    linear_max = std::max(linear_max, static_cast<double>(processor.imgdata.color.linear_max[index]));
   }
   if (linear_max > 0) {
-    return static_cast<double>(linear_max);
+    return linear_max;
   }
 
-  const unsigned raw_bps = processor.imgdata.color.raw_bps;
+  const uint64_t raw_bps = static_cast<uint64_t>(processor.imgdata.color.raw_bps);
   if (raw_bps > 0 && raw_bps < 31) {
-    return static_cast<double>((1u << raw_bps) - 1u);
+    return static_cast<double>((uint64_t{1} << raw_bps) - 1u);
   }
 
   return 16383.0;
@@ -4666,6 +4727,23 @@ DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string& compress
   return summary;
 }
 
+bool CanWriteLinearDng(const std::string& compression, std::string* reason) {
+  if (!IsSupportedWriteCompression(compression)) {
+    if (reason != nullptr) {
+      *reason = UnsupportedCompressionMessage(compression);
+    }
+    return false;
+  }
+
+  // The probe really starts the DNG runtime and asks it for a negative, so
+  // the answer reflects the running build rather than the source.
+  const DngWriterRuntimeSummary summary = BuildDngWriterRuntimeSummary(compression);
+  if (reason != nullptr) {
+    *reason = summary.status;
+  }
+  return summary.enabled && summary.host_created && summary.negative_created;
+}
+
 DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const std::string& output_path,
                                      const std::string& compression,
@@ -4848,138 +4926,3 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
 
   return result;
 }
-
-#else
-
-DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string&) {
-  DngWriterRuntimeSummary summary;
-  summary.enabled = false;
-  summary.status = "Adobe DNG SDK integration not enabled in this build";
-  return summary;
-}
-
-void FinalizeStage2Settings(ResolvedStageSettings* settings) {
-  if (settings == nullptr) {
-    return;
-  }
-  settings->stage2_gain1 = ClampStage2Gain(settings->stage2_gain1);
-  settings->stage2_gain2 = ClampStage2Gain(settings->stage2_gain2);
-  settings->stage2_gain3 = ClampStage2Gain(settings->stage2_gain3);
-}
-
-ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata&,
-                                                   uint32_t,
-                                                   uint32_t,
-                                                   const StageOverrideSet& overrides) {
-  ResolvedStageSettings settings;
-  if (overrides.stage1_psf_sigma.has_value()) settings.stage1_psf_sigma = *overrides.stage1_psf_sigma;
-  if (overrides.stage1_nsr.has_value()) settings.stage1_nsr = *overrides.stage1_nsr;
-  if (overrides.stage2_denoise.has_value()) settings.stage2_denoise = *overrides.stage2_denoise;
-  if (overrides.stage2_gain1.has_value()) settings.stage2_gain1 = *overrides.stage2_gain1;
-  if (overrides.stage2_gain2.has_value()) settings.stage2_gain2 = *overrides.stage2_gain2;
-  if (overrides.stage2_gain3.has_value()) settings.stage2_gain3 = *overrides.stage2_gain3;
-  if (overrides.stage3_radius.has_value()) settings.stage3_radius = *overrides.stage3_radius;
-  if (overrides.stage3_gain.has_value()) settings.stage3_gain = *overrides.stage3_gain;
-  FinalizeStage2Settings(&settings);
-  return settings;
-}
-
-bool BuildOriginalPreviewFromRaw(const std::string&,
-                                 const SourceLinearDngMetadata&,
-                                 const LibRawOverrideSet&,
-                                 std::shared_ptr<PreviewImage>,
-                                 ProgressCallback,
-                                 CancelCheck,
-                                 std::string* error_message) {
-  if (error_message != nullptr) {
-    *error_message = "Adobe DNG SDK integration not enabled in this build";
-  }
-  return false;
-}
-
-bool EstimatePreviewAutoBrightGainFromRaw(const std::string&,
-                                          const SourceLinearDngMetadata&,
-                                          const LibRawOverrideSet&,
-                                          double*,
-                                          std::string* error_message) {
-  if (error_message != nullptr) {
-    *error_message = "Adobe DNG SDK integration not enabled in this build";
-  }
-  return false;
-}
-
-bool BuildProcessingCacheFromRaw(const std::string&,
-                                 const SourceLinearDngMetadata&,
-                                 uint32_t,
-                                 uint32_t,
-                                 const CropRect&,
-                                 const LibRawOverrideSet&,
-                                 ProcessingCache*,
-                                 ProgressCallback,
-                                 CancelCheck,
-                                 std::string* error_message) {
-  if (error_message != nullptr) {
-    *error_message = "Adobe DNG SDK integration not enabled in this build";
-  }
-  return false;
-}
-
-bool BuildDisplayProcessingCache(const ProcessingCache&,
-                                 uint32_t,
-                                 ProcessingCache*,
-                                 std::string* error_message) {
-  if (error_message != nullptr) {
-    *error_message = "Adobe DNG SDK integration not enabled in this build";
-  }
-  return false;
-}
-
-bool RenderConvertedCropPreview(const SourceLinearDngMetadata&,
-                                const ProcessingCache&,
-                                const CropRect&,
-                                const std::string&,
-                                bool,
-                                const StageOverrideSet&,
-                                std::shared_ptr<PreviewImage>,
-                                ProgressCallback,
-                                CancelCheck,
-                                std::string* error_message,
-                                uint32_t,
-                                const RecoveryImageCoordinates*) {
-  if (error_message != nullptr) {
-    *error_message = "Adobe DNG SDK integration not enabled in this build";
-  }
-  return false;
-}
-
-bool ApplyResolvedStageSettingsForTesting(const SourceLinearDngMetadata&,
-                                          const ResolvedStageSettings&,
-                                          const RasterImage*,
-                                          RasterImage*,
-                                          ProgressCallback,
-                                          CancelCheck,
-                                          std::string* error_message) {
-  if (error_message != nullptr) {
-    *error_message = "Adobe DNG SDK integration not enabled in this build";
-  }
-  return false;
-}
-
-DngWriteResult WriteLinearDngFromRaw(const std::string&,
-                                     const std::string&,
-                                     const std::string&,
-                                     const SourceLinearDngMetadata&,
-                                     const std::string&,
-                                     bool,
-                                     const StageOverrideSet&,
-                                     const LibRawOverrideSet&,
-                                     std::shared_ptr<const PreviewImage>,
-                                     double,
-                                     ProgressCallback,
-                                     CancelCheck) {
-  DngWriteResult result;
-  result.message = "Adobe DNG SDK integration not enabled in this build";
-  return result;
-}
-
-#endif

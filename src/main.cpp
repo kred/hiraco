@@ -20,6 +20,43 @@ int PrintUsage() {
   return 2;
 }
 
+struct ConvertCommandLine {
+  std::string source_path;
+  std::string output_path;
+  std::string compression_text = "deflate";
+  bool debug = false;
+  bool hl_rec = false;
+};
+
+bool ParseConvertCommandLine(int argc, char** argv, ConvertCommandLine* command) {
+  if (argc < 4 || command == nullptr) {
+    return false;
+  }
+
+  const std::string command_name = argv[1];
+  if (command_name != "convert") {
+    return false;
+  }
+
+  command->source_path = argv[2];
+  command->output_path = argv[3];
+
+  for (int index = 4; index < argc; ++index) {
+    const std::string arg = argv[index];
+    if (arg == "--compression" && index + 1 < argc) {
+      command->compression_text = argv[++index];
+    } else if (arg == "--hl-rec") {
+      command->hl_rec = true;
+    } else if (arg == "--debug") {
+      command->debug = true;
+    } else {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 }  // namespace
 
 void EnableTimingLogsForDebug() {
@@ -31,54 +68,44 @@ void EnableTimingLogsForDebug() {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 4) {
+  if (argc == 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+    PrintUsage();
+    return 0;
+  }
+
+  if (argc == 2 && std::string(argv[1]) == "--version") {
+    std::cout << "hiraco-cli\n";
+    return 0;
+  }
+
+  ConvertCommandLine command;
+  if (!ParseConvertCommandLine(argc, argv, &command)) {
     return PrintUsage();
   }
 
-  const std::string command = argv[1];
-  if (command != "convert") {
-    return PrintUsage();
-  }
-
-  const std::string source_path = argv[2];
-  const std::string output_path = argv[3];
-  std::string compression_text = "deflate";
-  bool debug = false;
-  bool hl_rec = false;
-
-  for (int index = 4; index < argc; ++index) {
-    const std::string arg = argv[index];
-    if (arg == "--compression" && index + 1 < argc) {
-      compression_text = argv[++index];
-    } else if (arg == "--hl-rec") {
-      hl_rec = true;
-    } else if (arg == "--debug") {
-      debug = true;
-    } else {
-      return PrintUsage();
-    }
-  }
-
-  if (debug) {
+  if (command.debug) {
     EnableTimingLogsForDebug();
   }
 
+  // The WebAssembly build runs the same conversion pipeline as the native
+  // build: the same core, the same DNG writer and the same dependency
+  // libraries, compiled for wasm64.
   HiracoCompression compression = HiracoCompression::kDeflate;
-  if (!ParseCompressionString(compression_text, &compression)) {
-    std::cerr << "Error: invalid compression mode: " << compression_text << "\n";
+  if (!ParseCompressionString(command.compression_text, &compression)) {
+    std::cerr << "Error: invalid compression mode: " << command.compression_text << "\n";
     return 2;
   }
 
   PreparedSource prepared;
   std::string error_message;
-  if (!PrepareSource(source_path, &prepared, &error_message)) {
+  if (!PrepareSource(command.source_path, &prepared, &error_message)) {
     std::cerr << "Error: " << error_message << "\n";
     return 1;
   }
 
   // ShouldUseHighlightRecovery() also requires a detected companion, so this is
   // a no-op for sources without one.
-  prepared.enable_highlight_recovery = hl_rec;
+  prepared.enable_highlight_recovery = command.hl_rec;
 
   const StageOverrideSet stage_overrides = ReadStageOverridesFromEnvironment();
   const LibRawOverrideSet libraw_overrides = ReadLibRawOverridesFromEnvironment();
@@ -88,7 +115,7 @@ int main(int argc, char** argv) {
   // format each line completely and emit it under the shared diagnostics mutex;
   // otherwise concurrent calls could interleave their << chains, or interleave
   // with the timing logs, and garble the log.
-  const auto log_progress = [enabled = debug](const ProcessingProgress& update) {
+  const auto log_progress = [enabled = command.debug](const ProcessingProgress& update) {
     if (!enabled) {
       return;
     }
@@ -102,7 +129,7 @@ int main(int argc, char** argv) {
   };
 
   const DngWriteResult result = ConvertToDng(prepared,
-                                             std::filesystem::path(output_path),
+                                             std::filesystem::path(command.output_path),
                                              compression,
                                              stage_overrides,
                                              libraw_overrides,
@@ -112,6 +139,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::cout << "Success: " << output_path << "\n";
+  std::cout << "Success: " << command.output_path << "\n";
   return 0;
 }

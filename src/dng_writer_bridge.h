@@ -15,6 +15,15 @@ struct DngWriterRuntimeSummary {
 
 DngWriterRuntimeSummary BuildDngWriterRuntimeSummary(const std::string& compression);
 
+/// Reports whether the DNG writer can actually be used in this build for the
+/// given compression mode.
+///
+/// The capability summaries in dng_sdk_bridge.h are built on top of this, so
+/// that they report what the running build can do rather than what the
+/// source was compiled with.  `reason` receives a human readable explanation
+/// when the writer cannot be used.
+bool CanWriteLinearDng(const std::string& compression, std::string* reason);
+
 // Diagnostics for the most recent ORI highlight-recovery run.  Surfaced in the
 // GUI status line so users can see recovery engage (or learn that the image has
 // no recoverable highlights) without HIRACO_DEBUG_HL_RECOVERY.  run_sequence
