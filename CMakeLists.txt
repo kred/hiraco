@@ -43,6 +43,15 @@ set(HIRACO_HALIDE_DIR "" CACHE PATH
 The Halide tool is a host tool that runs on the build machine and emits code for the target, \
 so WebAssembly builds need the host Halide installation; Emscripten hides it from the default \
 package search, which is why it can be pointed at explicitly here.")
+
+# The CI workflow passes the directory in the environment, because the
+# workflow cannot know in advance where it unpacked the package.  The
+# environment is read directly: declaring the cache entry above replaces any
+# environment binding of the same name with the empty cache value, so an
+# environment value would otherwise be discarded.
+if(NOT HIRACO_HALIDE_DIR AND DEFINED ENV{HIRACO_HALIDE_DIR})
+  set(HIRACO_HALIDE_DIR "$ENV{HIRACO_HALIDE_DIR}")
+endif()
 set(HIRACO_BOOST_INCLUDE_DIR "" CACHE PATH "Override the path to Boost headers for the Adobe XMP toolkit")
 
 if(HIRACO_BUILD_WASM)
