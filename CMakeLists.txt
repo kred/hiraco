@@ -601,11 +601,46 @@ if(HIRACO_BUILD_WASM)
   message(STATUS "Halide host library: ${HIRACO_HALIDE_LIBRARY}")
   message(STATUS "Halide generator library: ${HIRACO_HALIDE_GENGEN_LIBRARY}")
 
+  # The generator's `main` lives in libHalide_GenGen.a and nothing refers to
+  # it, so that archive member has to be forced in.  On Apple -force_load
+  # applies to the single archive that follows it, but on GNU ld
+  # --whole-archive stays in effect for *every* archive that follows,
+  # including libHalide.a and the libgcc.a that the compiler driver appends.
+  # The stack-splitting runtime in libgcc.a is then linked twice and the link
+  # fails with "multiple definition of `__morestack'", so the whole-archive
+  # has to be closed again right after the archive it is meant for.
   if(CMAKE_HOST_APPLE)
     set(HIRACO_HALIDE_WHOLE_ARCHIVE "-Wl,-force_load")
+    set(HIRACO_HALIDE_END_WHOLE_ARCHIVE "")
   else()
     set(HIRACO_HALIDE_WHOLE_ARCHIVE "-Wl,--whole-archive")
+    set(HIRACO_HALIDE_END_WHOLE_ARCHIVE "-Wl,--no-whole-archive")
   endif()
+
+  # The static Halide library is not self-contained: it needs zlib, and on
+  # glibc older than 2.34 libdl and libpthread as well.  The Halide CMake
+  # package declares none of them - its dependency files are empty - so a
+  # static link has to ask for them itself.  The shared library carries its
+  # own dependencies and needs nothing.
+  #
+  # The names are given without a search path on purpose: the generator is
+  # linked with the *host* compiler, so the host's own library search path has
+  # to resolve them.  Pointing at a directory here would risk picking up the
+  # WebAssembly sysroot instead.
+  set(HIRACO_HALIDE_SYSTEM_LIBS "")
+  set(_hiraco_halide_is_static OFF)
+  if(TARGET Halide::Halide)
+    get_target_property(_hiraco_halide_type Halide::Halide TYPE)
+    if(_hiraco_halide_type STREQUAL "STATIC_LIBRARY")
+      set(_hiraco_halide_is_static ON)
+    endif()
+  elseif(HIRACO_HALIDE_LIBRARY MATCHES "\\.a$")
+    set(_hiraco_halide_is_static ON)
+  endif()
+  if(_hiraco_halide_is_static)
+    set(HIRACO_HALIDE_SYSTEM_LIBS "-lz" "-ldl" "-lpthread")
+  endif()
+  message(STATUS "Halide host system libraries: ${HIRACO_HALIDE_SYSTEM_LIBS}")
 
   # The Halide generators are host tools, so they need a host C++ compiler.
   # CMAKE_HOST_CXX_COMPILER is not always populated in a cross-compiling
@@ -648,7 +683,9 @@ if(HIRACO_BUILD_WASM)
               -o ${gen_exe}
               -L${HIRACO_HALIDE_PREFIX}/lib
               ${HIRACO_HALIDE_WHOLE_ARCHIVE} ${HIRACO_HALIDE_GENGEN_LIBRARY}
+              ${HIRACO_HALIDE_END_WHOLE_ARCHIVE}
               ${HIRACO_HALIDE_LIBRARY}
+              ${HIRACO_HALIDE_SYSTEM_LIBS}
       DEPENDS "${generator_source}"
       COMMENT "Building host Halide generator ${target}_gen"
       VERBATIM)
