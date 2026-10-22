@@ -83,6 +83,7 @@ export class HiracoWasmClient {
   private worker: Worker | null = null;
   private pending: PendingRequest[] = [];
   private nextRequestId = 1;
+  private ready: Promise<WasmCapabilities> | null = null;
   private progressListeners = new Set<(update: ProgressUpdate) => void>();
   private capabilities: WasmCapabilities | null = null;
 
@@ -96,18 +97,13 @@ export class HiracoWasmClient {
 
   /** Starts the worker and loads the module. */
   async init(): Promise<WasmCapabilities> {
-    if (this.capabilities) {
-      return this.capabilities;
-    }
-    const worker = this.ensureWorker();
-    const capabilities = (await this.request(worker, { type: 'init' })) as WasmCapabilities;
-    this.capabilities = capabilities;
-    return capabilities;
+    await this.ensureReady();
+    return this.capabilities as WasmCapabilities;
   }
 
   /** Prepares a RAW file, with an optional ORI companion, for the session. */
   async open(raw: ArrayBuffer, rawName: string, companion?: ArrayBuffer, companionName?: string): Promise<OpenedSource> {
-    const worker = this.ensureWorker();
+    const worker = await this.ensureReady();
     return (await this.request(worker, {
       type: 'open',
       raw,
@@ -119,7 +115,7 @@ export class HiracoWasmClient {
 
   /** Renders the preview of the untouched source. */
   async originalPreview(maxDimension: number): Promise<BridgePreview> {
-    const worker = this.ensureWorker();
+    const worker = await this.ensureReady();
     const reply = (await this.request(worker, {
       type: 'preview',
       kind: 'original',
@@ -130,7 +126,7 @@ export class HiracoWasmClient {
 
   /** Renders the preview of the processed source. */
   async convertedPreview(maxDimension: number, overrides: number[]): Promise<BridgePreview> {
-    const worker = this.ensureWorker();
+    const worker = await this.ensureReady();
     const reply = (await this.request(worker, {
       type: 'preview',
       kind: 'converted',
@@ -155,21 +151,21 @@ export class HiracoWasmClient {
 
   /** Asks the core for the settings it resolves for this image. */
   async resolvedSettings(overrides: number[]): Promise<number[]> {
-    const worker = this.ensureWorker();
+    const worker = await this.ensureReady();
     const reply = (await this.request(worker, { type: 'settings', overrides })) as { values: number[] };
     return reply.values;
   }
 
   /** Asks the bridge for a one line summary of the writer configuration. */
   async writerSummary(compression: string): Promise<string> {
-    const worker = this.ensureWorker();
+    const worker = await this.ensureReady();
     const reply = (await this.request(worker, { type: 'summary', compression })) as { text: string };
     return reply.text;
   }
 
   /** Writes the Linear DNG and returns its bytes. */
   async convert(compression: string, overrides: number[]): Promise<Uint8Array> {
-    const worker = this.ensureWorker();
+    const worker = await this.ensureReady();
     const reply = (await this.request(worker, { type: 'convert', compression, overrides })) as {
       dng: ArrayBuffer;
       bytes: number;
@@ -206,6 +202,19 @@ export class HiracoWasmClient {
       this.stopWorker(new Error(event.message || 'the module failed to start'));
     };
     this.worker = worker;
+    // The module is loaded once per worker.  A worker that was stopped
+    // earlier, for example after a cancellation, starts over.
+    this.ready = this.request(worker, { type: 'init' }).then((capabilities) => {
+      this.capabilities = capabilities as WasmCapabilities;
+      return this.capabilities;
+    });
+    return worker;
+  }
+
+  /** Returns the worker with a loaded module. */
+  private async ensureReady(): Promise<Worker> {
+    const worker = this.ensureWorker();
+    await this.ready;
     return worker;
   }
 
@@ -264,6 +273,7 @@ export class HiracoWasmClient {
   private stopWorker(error: Error): void {
     const worker = this.worker;
     this.worker = null;
+    this.ready = null;
     this.capabilities = null;
     if (worker) {
       worker.terminate();

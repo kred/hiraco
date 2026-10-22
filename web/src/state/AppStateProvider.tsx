@@ -87,7 +87,7 @@ function reducer(state: AppState, action: AppAction): AppState {
         ...state,
         settings: action.settings,
         overrides: action.overrides,
-        preset: action.preset,
+        preset: action.preset === 'custom' ? null : action.preset,
       };
     case 'base-settings-changed':
       return { ...state, baseSettings: action.baseSettings };
@@ -224,6 +224,7 @@ interface AppActions {
   applyPreset(preset: PresetId): void;
   /** Drops the overrides of one section. */
   resetSection(keys: StageKey[]): void;
+  resetPreset(): void;
   /** Writes the Linear DNG in the browser. */
   convert(): void;
   /** Stops the running conversion. */
@@ -293,16 +294,6 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }
   }, [client]);
 
-  const schedulePreview = useCallback(() => {
-    if (previewTimer.current !== null) {
-      clearTimeout(previewTimer.current);
-    }
-    previewTimer.current = setTimeout(() => {
-      previewTimer.current = null;
-      void renderConvertedPreview();
-    }, PREVIEW_DELAY_MS);
-  }, [renderConvertedPreview]);
-
   const openSession = useCallback(async (): Promise<void> => {
     const source = sourceRef.current;
     if (source === null) {
@@ -351,6 +342,22 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       dispatch({ type: 'error', message: messageOf(error) });
     }
   }, [client, renderConvertedPreview]);
+
+  const schedulePreview = useCallback(() => {
+    if (previewTimer.current !== null) {
+      clearTimeout(previewTimer.current);
+    }
+    previewTimer.current = setTimeout(() => {
+      previewTimer.current = null;
+      if (!sessionRef.current) {
+        // The worker was stopped, so the image has to be prepared again
+        // before it can be previewed.
+        void openSession();
+        return;
+      }
+      void renderConvertedPreview();
+    }, PREVIEW_DELAY_MS);
+  }, [renderConvertedPreview, openSession]);
 
   useEffect(() => {
     const support = checkBrowserSupport();
@@ -457,6 +464,17 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     [schedulePreview],
   );
 
+  const resetPreset = useCallback(() => {
+    const current = stateRef.current;
+    dispatch({
+      type: 'preset-applied',
+      preset: 'custom',
+      settings: current.baseSettings,
+      overrides: {},
+    });
+    schedulePreview();
+  }, [schedulePreview]);
+
   const resetSection = useCallback(
     (keys: StageKey[]) => {
       const current = stateRef.current;
@@ -464,10 +482,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       for (const key of keys) {
         delete overrides[key];
       }
+      const nextOverrides = normalizeOverrides(overrides, current.baseSettings);
       dispatch({
         type: 'settings-changed',
-        settings: applyOverrides(current.baseSettings, overrides),
-        overrides: normalizeOverrides(overrides, current.baseSettings),
+        settings: applyOverrides(current.baseSettings, nextOverrides),
+        overrides: nextOverrides,
       });
       schedulePreview();
     },
@@ -514,6 +533,10 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   }, [client, openSession]);
 
   const cancel = useCallback(() => {
+    // The conversion runs inside the module, so the worker is stopped to end
+    // it.  The next worker starts without a session, so the image is
+    // prepared again before the next conversion.
+    sessionRef.current = false;
     client().cancel();
   }, [client]);
 
@@ -547,6 +570,7 @@ const actions = useMemo<AppActions>(
       setStageValue,
       applyPreset,
       resetSection,
+      resetPreset,
       convert: () => void convert(),
       cancel,
       download,
