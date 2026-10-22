@@ -96,6 +96,11 @@ test.describe('the preview and the controls', () => {
     expect(download.suggestedFilename()).toBe('_8142490.dng');
 
     // The bridge reports what the writer is configured for.
-    await expect(page.getByTestId('writer-summary')).toBeVisible();
+    await expect(page.getByTestId('writer-summary')).toContainText('Deflate');
+
+    const path = await download.path();
+    expect(path).not.toBeNull();
+    const size = (await (await import('node:fs')).promises.stat(path!)).size;
+    expect(size).toBeGreaterThan(1_000_000);
   });
 });
