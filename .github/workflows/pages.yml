@@ -1,0 +1,84 @@
+name: GitHub Pages
+
+on:
+  push:
+    branches: [feature/web-ui]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the web app
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Emscripten
+        uses: emscripten-core/setup-emsdk@v16
+        with:
+          version: 6.0.12
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libjpeg-dev libpng-dev zlib1g-dev libomp-dev libtiff-dev \
+            libraw-dev libfftw3-dev libboost-dev liblcms2-dev
+
+      - name: Install Halide
+        env:
+          HALIDE_URL: https://github.com/halide/Halide/releases/download/v21.0.0/Halide-21.0.0-x86-64-linux-b629c80de18f1534ec71fddd8b567aa7027a0876.tar.gz
+        run: |
+          curl -sSL --retry 3 --fail -o /tmp/halide.tar.gz "${HALIDE_URL}"
+          mkdir -p /opt/halide
+          tar xzf /tmp/halide.tar.gz -C /opt/halide --strip-components=1
+          halide_cmake_dir="$(dirname "$(find /opt/halide -name HalideConfig.cmake -print -quit)")"
+          if [ -z "${halide_cmake_dir}" ]; then
+            echo "::error::HalideConfig.cmake not found in the Halide archive"
+            exit 1
+          fi
+          echo "HIRACO_HALIDE_DIR=${halide_cmake_dir}" >> "${GITHUB_ENV}"
+          test -n "$(find /opt/halide -name 'libHalide_GenGen.a' -print -quit)"
+
+      - name: Fetch the Adobe DNG SDK
+        env:
+          DNG_SDK_URL: ${{ vars.DNG_SDK_URL || 'https://download.adobe.com/pub/adobe/dng/dng_sdk_1_7_1_2768_20261013.zip' }}
+          DNG_SDK_SHA256: ${{ vars.DNG_SDK_SHA256 || 'c1d3a545ed45b150e59af2e6aa0695c1551f0e2bed34ad87436898a05194d2b1' }}
+        run: |
+          curl -sSL --retry 3 --fail -o /tmp/dng-sdk.zip "${DNG_SDK_URL}"
+          echo "${DNG_SDK_SHA256}  /tmp/dng-sdk.zip" | sha256sum --check --strict
+          rm -rf dng_sdk_1_7_1
+          unzip -q /tmp/dng-sdk.zip -d .
+          test -f dng_sdk_1_7_1/dng_sdk/source/dng_host.h
+
+      - name: Build the WebAssembly module and web assets
+        run: ./scripts/build_web.sh
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
