@@ -38,7 +38,7 @@ import {
 } from '../lib/stageSettings';
 
 /** The longest edge of the preview the browser renders. */
-const PREVIEW_MAX_DIMENSION = 1024;
+const PREVIEW_MAX_DIMENSION = 2560;
 
 /** How long the browser waits for the sliders to settle before it renders. */
 const PREVIEW_DELAY_MS = 250;
