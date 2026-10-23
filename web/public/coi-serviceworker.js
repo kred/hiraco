@@ -20,30 +20,50 @@ if (typeof window === 'undefined') {
   });
 
   self.addEventListener('fetch', function (event) {
-    if (event.request.cache === 'only-if-cached' && event.request.mode !== 'same-origin') {
-      return;
-    }
-
     event.respondWith(
-      fetch(event.request).then(function (response) {
-        if (response.status === 0) {
-          return response;
-        }
+      fetch(event.request)
+        .then(function (response) {
+          if (response.status === 0) {
+            return response;
+          }
 
-        var newHeaders = new Headers(response.headers);
-        newHeaders.set('Cross-Origin-Embedder-Policy', 'require-corp');
-        newHeaders.set('Cross-Origin-Opener-Policy', 'same-origin');
+          var newHeaders = new Headers(response.headers);
+          newHeaders.set('Cross-Origin-Embedder-Policy', 'require-corp');
+          newHeaders.set('Cross-Origin-Opener-Policy', 'same-origin');
 
-        // Firefox can fail to install the worker if the body is passed as a
-        // ReadableStream, so read it as an ArrayBuffer first.
-        return response.arrayBuffer().then(function (buffer) {
-          return new Response(buffer, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: newHeaders,
-          });
-        });
-      }),
+          // For responses without a body (204, 304, opaque) we can just
+          // pass the original response with modified headers.
+          if (response.status === 204 || response.status === 304 || response.type === 'opaque') {
+            return new Response(null, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: newHeaders,
+            });
+          }
+
+          // For other responses, read the body as ArrayBuffer first.
+          // This avoids issues with ReadableStream in Firefox.
+          return response.arrayBuffer()
+            .then(function (buffer) {
+              return new Response(buffer, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: newHeaders,
+              });
+            })
+            .catch(function () {
+              // If arrayBuffer() fails, fall back to the original body.
+              return new Response(response.body, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: newHeaders,
+              });
+            });
+        })
+        .catch(function (e) {
+          console.error('coi-serviceworker: fetch failed', e);
+          return new Response('', { status: 500 });
+        }),
     );
   });
 } else {
