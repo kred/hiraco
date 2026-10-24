@@ -67,8 +67,20 @@ if (typeof window === 'undefined') {
     );
   });
 } else {
+  // The first visit registers the worker and reloads the page once: the
+  // current document was loaded without the isolation headers, so only a
+  // document served through the worker can be cross-origin isolated.
+  var reloadKey = 'coi-serviceworker-reloaded';
+
   (async function () {
     if (window.crossOriginIsolated) {
+      // Isolation is in place, so a guard left behind by an earlier attempt
+      // in this tab can be dropped again.
+      try {
+        window.sessionStorage.removeItem(reloadKey);
+      } catch (e) {
+        // Ignored: the guard is only an optimization.
+      }
       return;
     }
 
@@ -77,18 +89,59 @@ if (typeof window === 'undefined') {
     }
 
     try {
-      var registration = await navigator.serviceWorker.register('coi-serviceworker.js');
+      var guarded = false;
+      try {
+        guarded = window.sessionStorage.getItem(reloadKey) !== null;
+      } catch (e) {
+        // Treat a storage failure as "no guard"; the reload is still tried.
+      }
+      if (guarded) {
+        console.error(
+          'coi-serviceworker: the page is still not cross-origin isolated after ' +
+          'a reload; the service worker cannot add the isolation headers.');
+        return;
+      }
 
-      if (registration.installing) {
+      var registration = await navigator.serviceWorker.register('./coi-serviceworker.js');
+
+      // registration.installing stops referring to the worker as soon as it
+      // leaves the installing state, so the listener has to keep its own
+      // reference.  Reading registration.installing inside the listener threw
+      // once the worker activated, which left the page unisolated forever.
+      var worker = registration.installing || registration.waiting;
+      if (worker && worker.state !== 'activated') {
         await new Promise(function (resolve) {
-          registration.installing.addEventListener('statechange', function () {
-            if (registration.installing.state === 'activated') {
+          worker.addEventListener('statechange', function () {
+            if (worker.state === 'activated' || worker.state === 'redundant') {
               resolve();
             }
           });
         });
       }
 
+      // The worker claims the page while it activates.  Waiting for that
+      // keeps the reload from happening before the worker can serve the
+      // document, with at most a short timeout if no claim arrives.
+      if (!navigator.serviceWorker.controller) {
+        await new Promise(function (resolve) {
+          var timer = setTimeout(resolve, 3000);
+          navigator.serviceWorker.addEventListener('controllerchange', function () {
+            clearTimeout(timer);
+            resolve();
+          }, { once: true });
+          if (navigator.serviceWorker.controller) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+      }
+
+      try {
+        window.sessionStorage.setItem(reloadKey, '1');
+      } catch (e) {
+        // Without storage a reload loop cannot be detected; one reload is
+        // still better than leaving the page unusable.
+      }
       window.location.reload();
     } catch (e) {
       console.error('coi-serviceworker: registration failed', e);

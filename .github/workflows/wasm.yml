@@ -266,3 +266,11 @@ jobs:
         env:
           HIRACO_PYTHON: python3
         run: npx playwright test
+
+      - name: Run the static host isolation test
+        # GitHub Pages cannot send the COOP/COEP headers, so the deployment
+        # depends on the service worker fallback.  This runs the built app
+        # behind a server without those headers and checks that the page
+        # still becomes cross-origin isolated.
+        working-directory: web
+        run: npm run test:coi

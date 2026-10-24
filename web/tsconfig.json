@@ -19,5 +19,5 @@
     "verbatimModuleSyntax": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "e2e", "vite.config.ts", "playwright.config.ts"]
+  "include": ["src", "e2e", "vite.config.ts", "playwright.config.ts", "playwright.coi.config.ts"]
 }

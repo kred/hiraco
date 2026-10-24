@@ -9,6 +9,10 @@ import { defineConfig, devices } from '@playwright/test';
  */
 export default defineConfig({
   testDir: './e2e',
+  // coi.spec.ts runs against a server without isolation headers and has its
+  // own configuration (playwright.coi.config.ts); the preview server used
+  // here already provides the headers.
+  testIgnore: 'coi.spec.ts',
   // The conversion of a full sized RAW file takes a while.
   timeout: 15 * 60 * 1000,
   expect: { timeout: 60_000 },
