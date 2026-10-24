@@ -249,6 +249,10 @@ jobs:
         working-directory: web
         run: npm ci
 
+      - name: Build the web application
+        working-directory: web
+        run: npm run build
+
       - name: Run the unit tests
         working-directory: web
         run: npm run test
