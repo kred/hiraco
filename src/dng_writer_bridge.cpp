@@ -4298,7 +4298,13 @@ bool BuildOriginalPreviewFromRaw(const std::string& source_path,
   }
 
   RasterImage rendered;
-  const RenderSettings preview_settings = BuildPreviewRenderSettings(metadata, libraw_overrides);
+  // The original preview must show the full raw resolution, not a half-size
+  // embedded-style decode.  Full sensor width/height is decoded here and then
+  // downsampled by BuildPreviewImage / ScalePreview to the requested display
+  // dimension.  half_size is forced to 0 so both native and WASM use the full
+  // 50 MP / 80 MP raw data instead of an embedded ORF thumbnail.
+  RenderSettings preview_settings = BuildPreviewRenderSettings(metadata, libraw_overrides);
+  preview_settings.half_size = 0;
   {
     const hiraco::ScopedTimingLog timer("preview", "Render LibRaw preview");
     if (!RenderLibRawImage(source_path, metadata, preview_settings, &rendered, error_message)) {

@@ -1,0 +1,119 @@
+/*
+ * Design tokens.
+ *
+ * Every colour the app uses is declared once, here, in a light and a dark
+ * variant.  The theme is switched by the `data-theme` attribute on <html>,
+ * which the theme provider keeps in sync with the operating system
+ * preference and with the user's explicit choice.
+ */
+
+:root {
+  color-scheme: light;
+
+  --bg-app: #eef0f4;
+  --bg-panel: #ffffff;
+  --bg-panel-alt: #f7f8fa;
+  --bg-inset: #e7eaf0;
+  --bg-hover: #f0f2f6;
+
+  --border: #d5dae2;
+  --border-strong: #b8c0cd;
+
+  --text: #171a1f;
+  --text-muted: #5b6472;
+  --text-faint: #838d9c;
+
+  --accent: #2f6feb;
+  --accent-text: #ffffff;
+  --accent-soft: #e4ecfd;
+  --accent-border: #b6ccfa;
+
+  --danger: #c33a2c;
+  --danger-soft: #fbe6e3;
+  --ok: #1f7a4d;
+  --ok-soft: #e0f2e8;
+
+  --shadow-panel: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 24px rgba(16, 24, 40, 0.06);
+  --shadow-pop: 0 6px 24px rgba(16, 24, 40, 0.18);
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+
+  --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --focus-ring: 0 0 0 2px var(--bg-panel), 0 0 0 4px var(--accent);
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg-app: #0f1115;
+  --bg-panel: #171a20;
+  --bg-panel-alt: #1c2027;
+  --bg-inset: #0d1015;
+  --bg-hover: #222731;
+
+  --border: #2a2f38;
+  --border-strong: #3b424e;
+
+  --text: #e8ebf0;
+  --text-muted: #9aa3b2;
+  --text-faint: #6f7887;
+
+  --accent: #5b8dff;
+  --accent-text: #0a0f1c;
+  --accent-soft: #1b2540;
+  --accent-border: #2f4478;
+
+  --danger: #ff6f61;
+  --danger-soft: #3a1e1b;
+  --ok: #55c48c;
+  --ok-soft: #16301f;
+
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-pop: 0 6px 24px rgba(0, 0, 0, 0.55);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-app);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-sm);
+}

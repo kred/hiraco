@@ -535,7 +535,8 @@ std::shared_ptr<PreviewImage> ScalePreviewImage(std::shared_ptr<const PreviewIma
 
 std::shared_ptr<PreviewImage> MakeComparisonOriginalPreview(
     std::shared_ptr<const PreviewImage> preview,
-    const PreparedSource& prepared) {
+    const PreparedSource& prepared,
+    uint32_t max_dimension) {
   if (!preview || preview->width == 0 || preview->height == 0) {
     return nullptr;
   }
@@ -572,7 +573,12 @@ std::shared_ptr<PreviewImage> MakeComparisonOriginalPreview(
       }
     }
   }
-  return ScalePreviewImage(comparison_preview, kFullPreviewMaxDimension);
+  if (max_dimension == 0) {
+    // Uncapped request: the comparison preview keeps the source resolution,
+    // so 100% zoom shows real image pixels one to one.
+    return comparison_preview;
+  }
+  return ScalePreviewImage(comparison_preview, max_dimension);
 }
 
 class PaletteButton final : public wxControl {
@@ -715,11 +721,29 @@ class CompareCanvas final : public wxScrolledWindow {
     Bind(wxEVT_LEAVE_WINDOW, &CompareCanvas::OnMouseLeave, this);
   }
 
-  void SetOriginalPreview(std::shared_ptr<const PreviewImage> preview) {
+  void SetOriginalPreview(std::shared_ptr<const PreviewImage> preview,
+                          uint32_t image_width = 0,
+                          uint32_t image_height = 0) {
     original_preview_ = std::move(preview);
+    // The comparative zoom scale is anchored to the real image size, so a
+    // cleared preview also drops the extent and falls back to bitmap scale.
+    if (original_preview_ == nullptr) {
+      image_width_ = 0;
+      image_height_ = 0;
+    } else {
+      image_width_ = image_width;
+      image_height_ = image_height;
+    }
     original_bitmap_ = MakeBitmapFromPreview(original_preview_);
     UpdateVirtualArea();
     Refresh();
+  }
+
+  // The zoom-changed callback fires after the mode changed for any reason
+  // (toolbar, mode switch, side-by-side forcing 100%), so the frame can
+  // re-prepare the previews at the resolution the new mode needs.
+  void SetZoomChangedCallback(std::function<void(ZoomMode)> callback) {
+    zoom_changed_ = std::move(callback);
   }
 
   void SetConvertedPreview(std::shared_ptr<const PreviewImage> preview) {
@@ -774,6 +798,7 @@ class CompareCanvas final : public wxScrolledWindow {
     int view_y = 0;
     GetViewStart(&view_x, &view_y);
     const bool was_fit = zoom_mode_ == ZoomMode::kFit;
+    const ZoomMode previous_zoom_mode = zoom_mode_;
     const double previous_scale = CurrentScale();
     const ComparisonMode previous_mode = comparison_mode_;
     if (mode == ComparisonMode::kSideBySide && previous_mode != ComparisonMode::kSideBySide) {
@@ -798,6 +823,9 @@ class CompareCanvas final : public wxScrolledWindow {
                           static_cast<int>(std::round(view_y * current_scale / previous_scale)));
     }
     Refresh();
+    if (previous_zoom_mode != zoom_mode_ && zoom_changed_) {
+      zoom_changed_(zoom_mode_);
+    }
   }
 
   ComparisonMode GetComparisonMode() const {
@@ -810,6 +838,7 @@ class CompareCanvas final : public wxScrolledWindow {
     } else {
       non_side_by_side_zoom_mode_ = mode;
     }
+    const bool mode_changed = zoom_mode_ != mode;
     zoom_mode_ = mode;
     UpdateVirtualArea();
     if (zoom_mode_ == ZoomMode::kFit) {
@@ -818,6 +847,9 @@ class CompareCanvas final : public wxScrolledWindow {
       CenterView();
     }
     Refresh();
+    if (mode_changed && zoom_changed_) {
+      zoom_changed_(zoom_mode_);
+    }
   }
 
   ZoomMode GetZoomMode() const {
@@ -872,11 +904,19 @@ class CompareCanvas final : public wxScrolledWindow {
       return 1.0;
     }
 
+    // The zoom factors refer to the real image, so they are corrected by how
+    // far the displayed bitmap sits from the source resolution: a capped
+    // proxy bitmap is a fraction of the real width, while the uncapped 100%
+    // bitmap matches it one to one.
+    const double source_ratio = (image_width_ > 0 && bitmap->GetWidth() > 0)
+        ? static_cast<double>(image_width_) / bitmap->GetWidth()
+        : 1.0;
+
     switch (zoom_mode_) {
       case ZoomMode::k50:
-        return 0.5;
+        return 0.5 * source_ratio;
       case ZoomMode::k100:
-        return 1.0;
+        return source_ratio;
       case ZoomMode::kFit: {
         const wxSize client = GetClientSize();
         const int available_width = comparison_mode_ == ComparisonMode::kSideBySide
@@ -1145,6 +1185,10 @@ class CompareCanvas final : public wxScrolledWindow {
   std::shared_ptr<const PreviewImage> converted_preview_;
   wxBitmap original_bitmap_;
   wxBitmap converted_bitmap_;
+  // Real (oriented) image size of the original preview.  Anchors the zoom
+  // scale; zero while unknown falls back to the raw bitmap scale.
+  uint32_t image_width_ = 0;
+  uint32_t image_height_ = 0;
   // Pre-built pink overlay for the converted preview.  Empty when the preview
   // carries no recovery mask, so the Original pane and the "no mask" case both
   // fall back to the clean bitmap.
@@ -1157,9 +1201,18 @@ class CompareCanvas final : public wxScrolledWindow {
   ComparisonMode comparison_mode_ = ComparisonMode::kConverted;
   ZoomMode zoom_mode_ = ZoomMode::kFit;
   ZoomMode non_side_by_side_zoom_mode_ = ZoomMode::kFit;
+  std::function<void(ZoomMode)> zoom_changed_;
   bool panning_ = false;
   wxPoint last_pan_point_;
 };
+
+// The maximum dimension the comparison previews carry for a zoom mode.  100%
+// removes the cap (0 = no limit), so the preview keeps the source resolution
+// and the zoom factor refers to real image pixels; every other mode uses the
+// cheap capped proxy bitmap.
+uint32_t ZoomMaxDimensionFor(CompareCanvas::ZoomMode mode) {
+  return mode == CompareCanvas::ZoomMode::k100 ? 0u : kFullPreviewMaxDimension;
+}
 
 class OverwriteDialog final : public wxDialog {
  public:
@@ -1409,6 +1462,9 @@ class HiracoMainFrame final : public wxFrame {
     preview_toolbar->Add(zoom_toolbar, 0, wxALIGN_CENTER_VERTICAL);
 
     compare_canvas_ = new CompareCanvas(center_panel);
+    compare_canvas_->SetZoomChangedCallback([this](CompareCanvas::ZoomMode mode) {
+      OnCanvasZoomChanged(mode);
+    });
     center_sizer->Add(preview_toolbar, 0, wxALL | wxEXPAND, 10);
     center_sizer->Add(compare_canvas_, 1, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, 10);
     center_panel->SetSizer(center_sizer);
@@ -2861,8 +2917,9 @@ class HiracoMainFrame final : public wxFrame {
     if (item_copy.prepared.has_value()) {
       std::shared_ptr<const PreviewImage> cached_preview;
       if (TryGetCachedOriginalPreview(*item_copy.prepared, {}, &cached_preview)) {
-        compare_canvas_->SetOriginalPreview(
-            MakeComparisonOriginalPreview(cached_preview, *item_copy.prepared));
+        PresentOriginalPreviewForZoom(*item_copy.prepared,
+                                      compare_canvas_->GetZoomMode(),
+                                      cached_preview);
         compare_canvas_->SetConvertedPreview(nullptr);
         queue_[selected_row_].resolution_label = ResolutionLabelForPrepared(*item_copy.prepared);
         RefreshQueueRow(selected_row_);
@@ -2944,6 +3001,40 @@ class HiracoMainFrame final : public wxFrame {
     });
   }
 
+  // Re-presents the original comparison preview at the resolution the zoom
+  // mode needs: the capped proxy for the cheap modes and the source
+  // resolution for 100%, so the zoom factor always refers to real pixels.
+  // The given preview, when present, takes the place of the cache lookup.
+  void PresentOriginalPreviewForZoom(
+      const PreparedSource& prepared,
+      CompareCanvas::ZoomMode mode,
+      std::shared_ptr<const PreviewImage> preview = nullptr) {
+    std::shared_ptr<const PreviewImage> cached_preview = std::move(preview);
+    if (!cached_preview && !TryGetCachedOriginalPreview(prepared, {}, &cached_preview)) {
+      return;
+    }
+    const uint32_t oriented_width = OrientedImageWidth(
+        prepared.image_width, prepared.image_height, prepared.metadata.libraw_flip);
+    const uint32_t oriented_height = OrientedImageHeight(
+        prepared.image_width, prepared.image_height, prepared.metadata.libraw_flip);
+    compare_canvas_->SetOriginalPreview(
+        MakeComparisonOriginalPreview(cached_preview, prepared, ZoomMaxDimensionFor(mode)),
+        oriented_width,
+        oriented_height);
+  }
+
+  void OnCanvasZoomChanged(CompareCanvas::ZoomMode mode) {
+    if (close_requested_.load() || conversion_running_) {
+      return;
+    }
+    if (selected_row_ < 0 || selected_row_ >= static_cast<int>(queue_.size()) ||
+        !queue_[selected_row_].prepared.has_value()) {
+      return;
+    }
+    PresentOriginalPreviewForZoom(*queue_[selected_row_].prepared, mode);
+    ScheduleConvertedPreview();
+  }
+
   void ScheduleConvertedPreview() {
     if (close_requested_.load() ||
         selected_row_ < 0 || selected_row_ >= static_cast<int>(queue_.size())) {
@@ -2979,10 +3070,13 @@ class HiracoMainFrame final : public wxFrame {
     PreparedSource prepared = *item.prepared;
     prepared.enable_highlight_recovery = item.enable_highlight_recovery;
     const StageOverrideSet stage_overrides = ResolveEffectiveStageOverrides(item.stage_overrides);
+    // The preview serves the zoom active when the request is queued; a later
+    // zoom change bumps the request id and re-queues at the new size.
+    const uint32_t preview_max_dimension = ZoomMaxDimensionFor(compare_canvas_->GetZoomMode());
     BeginStatusActivity("Rendering converted preview...");
 
     LaunchWorker(WorkerPriority::kInteractive, [this, item_id, request_id, prepared, stage_overrides,
-                  cancel_token = converted_preview_cancel_]() mutable {
+                  preview_max_dimension, cancel_token = converted_preview_cancel_]() mutable {
       ConvertedPreviewReadyPayload payload;
       payload.item_id = item_id;
       payload.request_id = request_id;
@@ -3017,7 +3111,7 @@ class HiracoMainFrame final : public wxFrame {
           recovery_enabled ? GetLastHighlightRecoveryStats() : HighlightRecoveryStats{};
       if (!RenderConvertedFullPreview(&prepared,
                                       stage_overrides,
-                                      kFullPreviewMaxDimension,
+                                      preview_max_dimension,
                                       payload.converted_preview,
                                       {},
                                       report_progress,
@@ -3377,8 +3471,9 @@ class HiracoMainFrame final : public wxFrame {
     UpdateButtons();
 
     if (index >= 0 && index == selected_row_) {
-      compare_canvas_->SetOriginalPreview(
-          MakeComparisonOriginalPreview(payload.original_preview, payload.prepared));
+      PresentOriginalPreviewForZoom(payload.prepared,
+                                    compare_canvas_->GetZoomMode(),
+                                    payload.original_preview);
       compare_canvas_->SetConvertedPreview(nullptr);
       status_label_->SetLabel("Original preview ready. Rendering converted preview...");
       UpdateResolvedSliderValues();

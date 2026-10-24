@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="description"
+      content="hiraco converts RAW captures into Linear DNG files entirely in your browser."
+    />
+    <title>hiraco — Linear DNG converter</title>
+    <!--
+      Cross-origin isolation is needed for SharedArrayBuffer, which the 64 bit
+      wasm module uses for its shared memory.  The service worker below adds
+      the required headers on static hosts that do not send them.  It is
+      loaded synchronously in the head so the page reloads before React
+      starts when isolation has to be set up.
+    -->
+    <script src="./coi-serviceworker.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

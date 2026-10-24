@@ -1,0 +1,7 @@
+node_modules/
+dist/
+# The module itself is built by CMake; the worker that drives it is source.
+public/wasm/hiraco-wasm.js
+public/wasm/hiraco-wasm.wasm
+test-results/
+playwright-report/
