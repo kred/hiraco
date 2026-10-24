@@ -64,6 +64,17 @@ function writeBytes(bytes) {
   return pointer;
 }
 
+// Releases scratch heap allocations once the native side has consumed them.
+// A zero pointer is skipped: that allocation never happened or the value is
+// owned elsewhere.
+function freeScratch(...pointers) {
+  for (const pointer of pointers) {
+    if (pointer) {
+      module._free(pointer);
+    }
+  }
+}
+
 function copyOut(pointer, size) {
   return module.HEAPU8.slice(pointer, pointer + size).buffer;
 }
@@ -127,37 +138,45 @@ function openSession(request) {
     companionNamePointer = module.stringToNewUTF8(request.companionName || 'companion.ori');
   }
 
-  const id = module._hiraco_wasm_open_session(
-    BigInt(rawPointer),
-    BigInt(raw.length),
-    BigInt(rawNamePointer),
-    BigInt(companionPointer),
-    BigInt(companionSize),
-    BigInt(companionNamePointer));
-
-  if (!id) {
-    throw new Error(module.UTF8ToString(toPointer(module._hiraco_wasm_get_last_error())));
-  }
-  if (sessionId) {
-    module._hiraco_wasm_close_session(sessionId);
-  }
-  sessionId = id;
-
   const widthPointer = module._malloc(4);
   const heightPointer = module._malloc(4);
-  module._hiraco_wasm_get_image_size(sessionId, BigInt(widthPointer), BigInt(heightPointer));
-
   const metadataPointer = module._malloc(64 * 1024);
-  const metadataLength = module._hiraco_wasm_get_metadata_json(sessionId, BigInt(metadataPointer), BigInt(64 * 1024));
-  const metadata = metadataLength > 0 ? JSON.parse(module.UTF8ToString(metadataPointer, metadataLength)) : {};
+  try {
+    // open_session stages the input in the virtual file system and copies
+    // the names, so the buffers above are only handed over and are released
+    // afterwards, whatever the call does.
+    const id = module._hiraco_wasm_open_session(
+      BigInt(rawPointer),
+      BigInt(raw.length),
+      BigInt(rawNamePointer),
+      BigInt(companionPointer),
+      BigInt(companionSize),
+      BigInt(companionNamePointer));
 
-  reply({
-    type: 'opened',
-    sessionId: Number(sessionId),
-    width: heap().getUint32(widthPointer, true),
-    height: heap().getUint32(heightPointer, true),
-    metadata: metadata,
-  });
+    if (!id) {
+      throw new Error(module.UTF8ToString(toPointer(module._hiraco_wasm_get_last_error())));
+    }
+    if (sessionId) {
+      module._hiraco_wasm_close_session(sessionId);
+    }
+    sessionId = id;
+
+    module._hiraco_wasm_get_image_size(sessionId, BigInt(widthPointer), BigInt(heightPointer));
+
+    const metadataLength = module._hiraco_wasm_get_metadata_json(sessionId, BigInt(metadataPointer), BigInt(64 * 1024));
+    const metadata = metadataLength > 0 ? JSON.parse(module.UTF8ToString(metadataPointer, metadataLength)) : {};
+
+    reply({
+      type: 'opened',
+      sessionId: Number(sessionId),
+      width: heap().getUint32(widthPointer, true),
+      height: heap().getUint32(heightPointer, true),
+      metadata: metadata,
+    });
+  } finally {
+    freeScratch(rawPointer, rawNamePointer, companionPointer, companionNamePointer,
+                widthPointer, heightPointer, metadataPointer);
+  }
 }
 
 function renderPreview(request) {
@@ -169,102 +188,123 @@ function renderPreview(request) {
   const maskSizePointer = module._malloc(8);
   const overridesPointer = stageOverrides(request.overrides);
 
-  let status = 0;
-  if (request.kind === 'original') {
-    status = module._hiraco_wasm_get_original_preview(
-      sessionId,
-      request.maxDimension,
-      BigInt(pixelsPointer),
-      BigInt(sizePointer),
-      BigInt(widthPointer),
-      BigInt(heightPointer));
-  } else {
-    status = module._hiraco_wasm_get_converted_preview(
-      sessionId,
-      request.maxDimension,
-      BigInt(overridesPointer),
-      BigInt(STAGE_VALUE_COUNT),
-      BigInt(pixelsPointer),
-      BigInt(sizePointer),
-      BigInt(widthPointer),
-      BigInt(heightPointer),
-      BigInt(maskPointer),
-      BigInt(maskSizePointer));
-  }
-  if (status !== 0) {
-    throw new Error(module.UTF8ToString(toPointer(module._hiraco_wasm_get_last_error())));
-  }
-
-  const pixelAddress = readSize(pixelsPointer);
-  const pixelBytes = readSize(sizePointer);
-  const width = heap().getUint32(widthPointer, true);
-  const height = heap().getUint32(heightPointer, true);
-  const message = {
-    type: 'preview',
-    kind: request.kind,
-    width: width,
-    height: height,
-    pixels: copyOut(pixelAddress, pixelBytes),
-  };
-
-  if (request.kind === 'converted') {
-    const maskAddress = readSize(maskPointer);
-    const maskBytes = readSize(maskSizePointer);
-    if (maskBytes > 0) {
-      message.mask = copyOut(maskAddress, maskBytes);
+  try {
+    let status = 0;
+    if (request.kind === 'original') {
+      status = module._hiraco_wasm_get_original_preview(
+        sessionId,
+        request.maxDimension,
+        BigInt(pixelsPointer),
+        BigInt(sizePointer),
+        BigInt(widthPointer),
+        BigInt(heightPointer));
+    } else {
+      status = module._hiraco_wasm_get_converted_preview(
+        sessionId,
+        request.maxDimension,
+        BigInt(overridesPointer),
+        BigInt(STAGE_VALUE_COUNT),
+        BigInt(pixelsPointer),
+        BigInt(sizePointer),
+        BigInt(widthPointer),
+        BigInt(heightPointer),
+        BigInt(maskPointer),
+        BigInt(maskSizePointer));
     }
-    module._hiraco_wasm_free_buffer(BigInt(maskAddress), BigInt(maskBytes));
+    if (status !== 0) {
+      throw new Error(module.UTF8ToString(toPointer(module._hiraco_wasm_get_last_error())));
+    }
+
+    const pixelAddress = readSize(pixelsPointer);
+    const pixelBytes = readSize(sizePointer);
+    const width = heap().getUint32(widthPointer, true);
+    const height = heap().getUint32(heightPointer, true);
+    const message = {
+      type: 'preview',
+      kind: request.kind,
+      width: width,
+      height: height,
+      pixels: copyOut(pixelAddress, pixelBytes),
+    };
+
+    if (request.kind === 'converted') {
+      const maskAddress = readSize(maskPointer);
+      const maskBytes = readSize(maskSizePointer);
+      if (maskBytes > 0) {
+        message.mask = copyOut(maskAddress, maskBytes);
+      }
+      // The bridge zeroes the mask pointers when there is no mask, and the
+      // freed byte count is zero there, so nothing else is released.
+      module._hiraco_wasm_free_buffer(BigInt(maskAddress), BigInt(maskBytes));
+    }
+
+    module._hiraco_wasm_free_buffer(BigInt(pixelAddress), BigInt(pixelBytes));
+
+    reply(message);
+  } finally {
+    freeScratch(pixelsPointer, sizePointer, widthPointer, heightPointer,
+                maskPointer, maskSizePointer, overridesPointer);
   }
-
-  module._hiraco_wasm_free_buffer(BigInt(pixelAddress), BigInt(pixelBytes));
-
-  reply(message);
 }
 
 function resolveSettings(request) {
   const overridesPointer = stageOverrides(request.overrides);
   const valuesPointer = module._malloc(STAGE_VALUE_COUNT * 8);
-  const status = module._hiraco_wasm_get_resolved_stage_settings(
-    sessionId,
-    BigInt(overridesPointer),
-    BigInt(STAGE_VALUE_COUNT),
-    BigInt(valuesPointer),
-    BigInt(STAGE_VALUE_COUNT));
-  if (status !== 0) {
-    throw new Error(module.UTF8ToString(toPointer(module._hiraco_wasm_get_last_error())));
+  try {
+    const status = module._hiraco_wasm_get_resolved_stage_settings(
+      sessionId,
+      BigInt(overridesPointer),
+      BigInt(STAGE_VALUE_COUNT),
+      BigInt(valuesPointer),
+      BigInt(STAGE_VALUE_COUNT));
+    if (status !== 0) {
+      throw new Error(module.UTF8ToString(toPointer(module._hiraco_wasm_get_last_error())));
+    }
+    const values = [];
+    for (let index = 0; index < STAGE_VALUE_COUNT; ++index) {
+      values.push(heap().getFloat64(valuesPointer + index * 8, true));
+    }
+    reply({ type: 'settings', values: values });
+  } finally {
+    freeScratch(overridesPointer, valuesPointer);
   }
-  const values = [];
-  for (let index = 0; index < STAGE_VALUE_COUNT; ++index) {
-    values.push(heap().getFloat64(valuesPointer + index * 8, true));
-  }
-  reply({ type: 'settings', values: values });
 }
 
 function convert(request) {
   const overridesPointer = stageOverrides(request.overrides);
+  const compressionPointer = module.stringToNewUTF8(request.compression || 'deflate');
   const outPointerPointer = module._malloc(8);
   const outSizePointer = module._malloc(8);
-  const status = module._hiraco_wasm_convert_session(
-    sessionId,
-    BigInt(module.stringToNewUTF8(request.compression || 'deflate')),
-    BigInt(overridesPointer),
-    BigInt(STAGE_VALUE_COUNT),
-    BigInt(outPointerPointer),
-    BigInt(outSizePointer));
-  if (status !== 0) {
-    throw new Error(module.UTF8ToString(toPointer(module._hiraco_wasm_get_last_error())));
+  try {
+    const status = module._hiraco_wasm_convert_session(
+      sessionId,
+      BigInt(compressionPointer),
+      BigInt(overridesPointer),
+      BigInt(STAGE_VALUE_COUNT),
+      BigInt(outPointerPointer),
+      BigInt(outSizePointer));
+    if (status !== 0) {
+      throw new Error(module.UTF8ToString(toPointer(module._hiraco_wasm_get_last_error())));
+    }
+    const pointer = readSize(outPointerPointer);
+    const size = readSize(outSizePointer);
+    reply({ type: 'converted', dng: copyOut(pointer, size), bytes: size });
+    module._hiraco_wasm_free_buffer(BigInt(pointer), BigInt(size));
+  } finally {
+    freeScratch(overridesPointer, compressionPointer, outPointerPointer, outSizePointer);
   }
-  const pointer = readSize(outPointerPointer);
-  const size = readSize(outSizePointer);
-  reply({ type: 'converted', dng: copyOut(pointer, size), bytes: size });
-  module._hiraco_wasm_free_buffer(BigInt(pointer), BigInt(size));
 }
 
 function writerSummary(request) {
-  const pointer = module._malloc(4096);
-  const length = module._hiraco_wasm_get_writer_summary(
-    BigInt(pointer), BigInt(4096), BigInt(module.stringToNewUTF8(request.compression || 'deflate')));
-  reply({ type: 'summary', text: length > 0 ? module.UTF8ToString(pointer, length) : '' });
+  const summaryPointer = module._malloc(4096);
+  const compressionPointer = module.stringToNewUTF8(request.compression || 'deflate');
+  try {
+    const length = module._hiraco_wasm_get_writer_summary(
+      BigInt(summaryPointer), BigInt(4096), BigInt(compressionPointer));
+    reply({ type: 'summary', text: length > 0 ? module.UTF8ToString(summaryPointer, length) : '' });
+  } finally {
+    freeScratch(summaryPointer, compressionPointer);
+  }
 }
 
 function installDriver() {

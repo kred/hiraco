@@ -191,6 +191,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    env:
+      # The same prebuilt Halide release the wasm job installs.  A job level
+      # env block does not carry across jobs, so this job has to define the
+      # URL again for its own "Install Halide" step.
+      HALIDE_URL: https://github.com/halide/Halide/releases/download/v21.0.0/Halide-21.0.0-x86-64-linux-b629c80de18f1534ec71fddd8b567aa7027a0876.tar.gz
+
     steps:
       - uses: actions/checkout@v4
 

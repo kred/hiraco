@@ -17,8 +17,9 @@ interface ThemeContextValue {
   theme: Theme;
   /** The theme the operating system asks for. */
   systemTheme: Theme;
-  /** Follow the operating system preference again. */
+  /** Sets and persists an explicit theme choice. */
   setTheme: (theme: Theme) => void;
+  /** Toggles between the light and the dark theme. */
   toggleTheme: () => void;
 }
 
