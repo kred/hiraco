@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef } from 'react';
-import { COMPARE_MODES, ZOOM_MODES, zoomFactor } from '../lib/compare';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { COMPARE_MODES, ZOOM_MODES, zoomFactor, previewDisplaySize } from '../lib/compare';
 import {
   applyRecoveredMask,
   composeReveal,
@@ -11,6 +11,7 @@ import { useAppState } from '../state/AppStateProvider';
 
 export function PreviewPanel() {
   const { state, dispatch } = useAppState();
+  const surfaceRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const original = state.originalPreview;
@@ -53,6 +54,154 @@ export function PreviewPanel() {
 
   const factor = zoomFactor(state.zoomMode);
   const hasPreview = composed !== null;
+
+  // Measure the preview surface so "fit" can scale the image to it.
+  const [available, setAvailable] = useState({ width: 0, height: 0 });
+  useEffect(() => {
+    const surface = surfaceRef.current;
+    if (!surface || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        setAvailable({ width, height });
+      }
+    });
+    observer.observe(surface);
+    return () => observer.disconnect();
+  }, []);
+
+  // Pan offset, applied as a CSS translate3d.  Kept in a ref so dragging can
+  // mutate it without re-rendering on every pointer move.
+  const pan = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const drag = useRef<{
+    active: boolean;
+    startX: number;
+    startY: number;
+    startPanX: number;
+    startPanY: number;
+    pointerId: number | null;
+  }>({
+    active: false,
+    startX: 0,
+    startY: 0,
+    startPanX: 0,
+    startPanY: 0,
+    pointerId: null,
+  });
+
+  // The on-screen size of the composed buffer.  Zoom factors scale relative to
+  // the real image, not the preview buffer: the buffer may be capped at
+  // PREVIEW_MAX_DIMENSION, so a plain factor would silently display less than
+  // the labelled zoom (50% of a capped 2560px buffer is 25% of an 80MP image).
+  const displaySize = useMemo(() => {
+    if (!composed) {
+      return { width: 0, height: 0 };
+    }
+    if (factor !== null) {
+      const ratio = state.imageWidth > 0 ? state.imageWidth / composed.width : 1;
+      const scale = factor * ratio;
+      return {
+        width: Math.round(composed.width * scale),
+        height: Math.round(composed.height * scale),
+      };
+    }
+    return previewDisplaySize(
+      'fit',
+      composed.width,
+      composed.height,
+      available.width,
+      available.height,
+    );
+  }, [composed, factor, state.imageWidth, available.width, available.height]);
+
+  // Applies a pan offset, clamped so the image can never leave the visible
+  // area.  The canvas is anchored at its center (translate(-50%, -50%)), so
+  // the pan range is symmetric around zero.
+  const applyPan = useCallback(
+    (nextX: number, nextY: number) => {
+      const maxPanX = Math.max(0, (displaySize.width - available.width) / 2);
+      const maxPanY = Math.max(0, (displaySize.height - available.height) / 2);
+      pan.current = {
+        x: Math.min(Math.max(nextX, -maxPanX), maxPanX),
+        y: Math.min(Math.max(nextY, -maxPanY), maxPanY),
+      };
+      const canvas = canvasRef.current;
+      if (canvas) {
+        canvas.style.transform = `translate(-50%, -50%) translate3d(${pan.current.x}px, ${pan.current.y}px, 0)`;
+      }
+    },
+    [displaySize.width, displaySize.height, available.width, available.height],
+  );
+
+  // Re-clamp the pan and keep the canvas centered before every paint when
+  // the image, zoom mode, surface size, or the element itself changes.
+  useLayoutEffect(() => {
+    applyPan(pan.current.x, pan.current.y);
+  }, [applyPan, hasPreview]);
+
+  const onPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!composed || event.button !== 0) {
+        return;
+      }
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        return;
+      }
+      event.preventDefault();
+      canvas.setPointerCapture(event.pointerId);
+      drag.current = {
+        active: true,
+        startX: event.clientX,
+        startY: event.clientY,
+        startPanX: pan.current.x,
+        startPanY: pan.current.y,
+        pointerId: event.pointerId,
+      };
+      canvas.style.cursor = 'grabbing';
+    },
+    [composed],
+  );
+
+  const onPointerMove = useCallback(
+    (event: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!drag.current.active || !composed) {
+        return;
+      }
+      const dx = event.clientX - drag.current.startX;
+      const dy = event.clientY - drag.current.startY;
+      applyPan(drag.current.startPanX + dx, drag.current.startPanY + dy);
+    },
+    [composed, applyPan],
+  );
+
+  const endDrag = useCallback(() => {
+    drag.current.active = false;
+    const canvas = canvasRef.current;
+    if (canvas && drag.current.pointerId !== null) {
+      canvas.releasePointerCapture(drag.current.pointerId);
+      drag.current.pointerId = null;
+    }
+    const currentCanvas = canvasRef.current;
+    if (currentCanvas) {
+      currentCanvas.style.cursor = 'grab';
+    }
+  }, []);
+
+  const onPointerUp = useCallback(endDrag, [endDrag]);
+  const onPointerCancel = useCallback(endDrag, [endDrag]);
+  const onPointerLeave = useCallback(() => {
+    if (!drag.current.active) {
+      return;
+    }
+    endDrag();
+  }, [drag.current.active, endDrag]);
+
+  const onContextMenu = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+  }, []);
 
   return (
     <section className="panel" aria-label="Preview">
@@ -102,17 +251,24 @@ export function PreviewPanel() {
         </div>
       </header>
 
-      <div className="preview-surface">
+      <div ref={surfaceRef} className="preview-surface">
         {hasPreview ? (
           <canvas
             ref={canvasRef}
             className="preview-canvas"
             data-testid="preview-canvas"
-            style={
-              factor === null
-                ? undefined
-                : { width: Math.round(composed.width * factor), height: 'auto' }
-            }
+            style={{
+              cursor: 'grab',
+              touchAction: 'none',
+              width: displaySize.width,
+              height: displaySize.height,
+            }}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={onPointerUp}
+            onPointerCancel={onPointerCancel}
+            onPointerLeave={onPointerLeave}
+            onContextMenu={onContextMenu}
           />
         ) : (
           <p className="preview-placeholder">

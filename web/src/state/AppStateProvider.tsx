@@ -276,8 +276,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     previewRunning.current = true;
     try {
       const overrides = stateRef.current.overrides;
+      // At 100% zoom request the full-resolution preview; otherwise cap at
+      // PREVIEW_MAX_DIMENSION so the browser doesn't allocate enormous buffers.
+      const maxDimension = stateRef.current.zoomMode === '100' ? 0 : PREVIEW_MAX_DIMENSION;
       const preview = await client().convertedPreview(
-        PREVIEW_MAX_DIMENSION,
+        maxDimension,
         overridesToArray(overrides),
       );
       dispatch({ type: 'converted-preview', preview: previewFromBridge(preview) });
@@ -292,6 +295,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         void renderConvertedPreview();
       }
     }
+  }, [client]);
+
+  const renderOriginalPreview = useCallback(async (): Promise<void> => {
+    const maxDimension = stateRef.current.zoomMode === '100' ? 0 : PREVIEW_MAX_DIMENSION;
+    const preview = await client().originalPreview(maxDimension);
+    dispatch({ type: 'original-preview', preview: previewFromBridge(preview) });
   }, [client]);
 
   const openSession = useCallback(async (): Promise<void> => {
@@ -323,8 +332,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         metadata: metadataFromBridge(opened.metadata),
         baseSettings,
       });
-      const original = await client().originalPreview(PREVIEW_MAX_DIMENSION);
-      dispatch({ type: 'original-preview', preview: previewFromBridge(original) });
+      await renderOriginalPreview();
       await renderConvertedPreview();
       dispatch({
         type: 'activity',
@@ -395,6 +403,16 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       cancelled = true;
     };
   }, [client]);
+
+  // When the zoom mode changes, re-fetch both previews at the appropriate
+  // resolution: full resolution at 100%, capped at PREVIEW_MAX_DIMENSION otherwise.
+  useEffect(() => {
+    if (!sessionRef.current) {
+      return;
+    }
+    void renderOriginalPreview();
+    void renderConvertedPreview();
+  }, [state.zoomMode, renderOriginalPreview, renderConvertedPreview]);
 
   useEffect(
     () => () => {

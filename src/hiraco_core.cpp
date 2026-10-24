@@ -898,7 +898,7 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
                                 CancelCheck cancel,
                                 std::string* error_message) {
   const hiraco::ScopedTimingLog preview_timer("preview", "Render converted full preview");
-  if (prepared == nullptr || !preview || max_dimension == 0) {
+  if (prepared == nullptr || !preview) {
     if (error_message != nullptr) {
       *error_message = "invalid converted full preview request";
     }
@@ -1005,33 +1005,38 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
   }
 
   std::shared_ptr<const ProcessingCache> display_cache;
-  {
-    std::lock_guard<std::mutex> lock(prepared->data->mutex);
-    if (prepared->data->has_display_processing_cache &&
-        prepared->data->display_processing_cache &&
-        prepared->data->display_processing_cache_max_dimension == max_dimension &&
-        LibRawOverridesEqual(prepared->data->display_processing_cache_libraw_overrides,
-                             libraw_overrides)) {
-      display_cache = prepared->data->display_processing_cache;
-    }
-  }
-
-  if (!display_cache) {
-    auto built_display_cache = std::make_shared<ProcessingCache>();
-    if (!BuildDisplayProcessingCache(*source_cache,
-                                     max_dimension,
-                                     built_display_cache.get(),
-                                     error_message)) {
-      return false;
-    }
+  if (max_dimension == 0) {
+    // No downscale: render directly from the full-resolution source cache.
+    display_cache = source_cache;
+  } else {
     {
       std::lock_guard<std::mutex> lock(prepared->data->mutex);
-      prepared->data->has_display_processing_cache = true;
-      prepared->data->display_processing_cache = built_display_cache;
-      prepared->data->display_processing_cache_max_dimension = max_dimension;
-      prepared->data->display_processing_cache_libraw_overrides = libraw_overrides;
+      if (prepared->data->has_display_processing_cache &&
+          prepared->data->display_processing_cache &&
+          prepared->data->display_processing_cache_max_dimension == max_dimension &&
+          LibRawOverridesEqual(prepared->data->display_processing_cache_libraw_overrides,
+                               libraw_overrides)) {
+        display_cache = prepared->data->display_processing_cache;
+      }
     }
-    display_cache = std::move(built_display_cache);
+
+    if (!display_cache) {
+      auto built_display_cache = std::make_shared<ProcessingCache>();
+      if (!BuildDisplayProcessingCache(*source_cache,
+                                       max_dimension,
+                                       built_display_cache.get(),
+                                       error_message)) {
+        return false;
+      }
+      {
+        std::lock_guard<std::mutex> lock(prepared->data->mutex);
+        prepared->data->has_display_processing_cache = true;
+        prepared->data->display_processing_cache = built_display_cache;
+        prepared->data->display_processing_cache_max_dimension = max_dimension;
+        prepared->data->display_processing_cache_libraw_overrides = libraw_overrides;
+      }
+      display_cache = std::move(built_display_cache);
+    }
   }
 
   const CropRect source_cache_region = source_cache->has_cached_crop

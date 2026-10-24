@@ -272,11 +272,12 @@
 }
 
 .preview-surface {
+  position: relative;
   flex: 1;
   min-height: 0;
   display: grid;
   place-items: center;
-  overflow: auto;
+  overflow: hidden;
   padding: var(--space-4);
   background: var(--bg-inset);
 }
@@ -288,7 +289,13 @@
 }
 
 .preview-canvas {
-  max-width: 100%;
+  /* Absolutely positioned at the surface center so an oversized image (a
+     10386px wide RAW at 100% zoom) is never resized or clamped by the grid
+     track; panning moves it with translate3d. max-width would silently
+     shrink 100% zoom back to the viewport width. */
+  position: absolute;
+  left: 50%;
+  top: 50%;
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);

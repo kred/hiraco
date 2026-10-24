@@ -160,14 +160,16 @@ void BuildStageOverrideSet(const double* values, size_t count, StageOverrideSet*
   }
   const size_t available = std::min(count, kStageValueCount);
   const auto is_set = [](double value) { return !std::isnan(value); };
-  if (is_set(values[0])) overrides->stage1_psf_sigma = static_cast<float>(values[0]);
-  if (is_set(values[1])) overrides->stage1_nsr = static_cast<float>(values[1]);
-  if (is_set(values[2])) overrides->stage2_denoise = static_cast<float>(values[2]);
-  if (is_set(values[3])) overrides->stage2_gain1 = static_cast<float>(values[3]);
-  if (is_set(values[4])) overrides->stage2_gain2 = static_cast<float>(values[4]);
-  if (is_set(values[5])) overrides->stage2_gain3 = static_cast<float>(values[5]);
-  if (is_set(values[6])) overrides->stage3_radius = static_cast<int>(std::lround(values[6]));
-  if (is_set(values[7])) overrides->stage3_gain = static_cast<float>(values[7]);
+  // Shorter value lists are allowed: every read is bounded by available, so
+  // a count below kStageValueCount never goes past the end of values.
+  if (available > 0 && is_set(values[0])) overrides->stage1_psf_sigma = static_cast<float>(values[0]);
+  if (available > 1 && is_set(values[1])) overrides->stage1_nsr = static_cast<float>(values[1]);
+  if (available > 2 && is_set(values[2])) overrides->stage2_denoise = static_cast<float>(values[2]);
+  if (available > 3 && is_set(values[3])) overrides->stage2_gain1 = static_cast<float>(values[3]);
+  if (available > 4 && is_set(values[4])) overrides->stage2_gain2 = static_cast<float>(values[4]);
+  if (available > 5 && is_set(values[5])) overrides->stage2_gain3 = static_cast<float>(values[5]);
+  if (available > 6 && is_set(values[6])) overrides->stage3_radius = static_cast<int>(std::lround(values[6]));
+  if (available > 7 && is_set(values[7])) overrides->stage3_gain = static_cast<float>(values[7]);
 }
 
 void CopyResolvedStageSettings(const ResolvedStageSettings& settings, double* values) {
@@ -584,9 +586,6 @@ int hiraco_wasm_get_original_preview(uint32_t session_id, uint32_t max_dimension
     LastError() = "unknown session";
     return 1;
   }
-  if (max_dimension == 0) {
-    max_dimension = 2048;
-  }
 
   session->cancel_requested->store(false);
   std::shared_ptr<PreviewImage> preview = std::make_shared<PreviewImage>();
@@ -601,10 +600,16 @@ int hiraco_wasm_get_original_preview(uint32_t session_id, uint32_t max_dimension
     return 1;
   }
 
-  PreviewImage scaled;
-  ScalePreview(*preview, max_dimension, &scaled);
+  // A max_dimension of 0 means no limit: return the full-resolution preview.
+  // Otherwise scale down so the longest edge is at most max_dimension.
+  PreviewImage output;
+  if (max_dimension != 0) {
+    ScalePreview(*preview, max_dimension, &output);
+  } else {
+    output = *preview;
+  }
   std::vector<uint8_t> rgba;
-  CopyPreviewToRgba(scaled, &rgba);
+  CopyPreviewToRgba(output, &rgba);
   if (rgba.empty()) {
     LastError() = "the original preview is empty";
     return 1;
@@ -614,10 +619,10 @@ int hiraco_wasm_get_original_preview(uint32_t session_id, uint32_t max_dimension
     return 1;
   }
   if (out_width != nullptr) {
-    *out_width = scaled.width;
+    *out_width = output.width;
   }
   if (out_height != nullptr) {
-    *out_height = scaled.height;
+    *out_height = output.height;
   }
   return 0;
 }
@@ -645,9 +650,6 @@ int hiraco_wasm_get_converted_preview(uint32_t session_id, uint32_t max_dimensio
   if (session == nullptr) {
     LastError() = "unknown session";
     return 1;
-  }
-  if (max_dimension == 0) {
-    max_dimension = 2048;
   }
 
   StageOverrideSet overrides;
