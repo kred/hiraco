@@ -73,6 +73,13 @@ test.describe('the preview and the controls', () => {
     await expect(inspector.getByText('Black level')).toHaveCount(0);
     await expect(inspector.getByText('White level')).toHaveCount(0);
 
+    // The neutral settings are the medium preset, so that button is shown as
+    // selected, and the DNG is saved by Convert itself (no second button).
+    await expect(
+      page.getByRole('button', { name: 'Medium', exact: true }),
+    ).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.getByRole('button', { name: 'Save DNG', exact: true })).toHaveCount(0);
+
     // The working size lives in the inspector only; the workspace shows the
     // file names, not the geometry.
     const workspace = page.getByRole('region', { name: 'Workspace' });
@@ -110,9 +117,6 @@ test.describe('the preview and the controls', () => {
     await page.getByRole('button', { name: 'Convert', exact: true }).click();
     const download = await downloadPromise;
     expect(download.suggestedFilename()).toBe('_8142490.dng');
-
-    // The bridge reports what the writer is configured for.
-    await expect(page.getByTestId('writer-summary')).toContainText('Deflate');
 
     const path = await download.path();
     expect(path).not.toBeNull();

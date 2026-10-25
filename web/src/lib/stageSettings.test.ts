@@ -9,6 +9,7 @@ import {
   formatStageValue,
   makeExplicitOverrides,
   normalizeOverrides,
+  presetForSettings,
   serializeStageOverrides,
   settingsEqual,
   type StageSettings,
@@ -87,6 +88,29 @@ describe('builtInPresetSettings', () => {
         DEFAULT_STAGE_SETTINGS,
       ),
     ).toBe(true);
+  });
+
+  it('finds the built-in preset that produced the settings', () => {
+    expect(presetForSettings(DEFAULT_STAGE_SETTINGS, DEFAULT_STAGE_SETTINGS)).toBe(
+      'medium',
+    );
+    expect(
+      presetForSettings(
+        DEFAULT_STAGE_SETTINGS,
+        builtInPresetSettings(DEFAULT_STAGE_SETTINGS, PRESET_STRENGTH.small),
+      ),
+    ).toBe('small');
+    expect(
+      presetForSettings(
+        DEFAULT_STAGE_SETTINGS,
+        builtInPresetSettings(DEFAULT_STAGE_SETTINGS, PRESET_STRENGTH.strong),
+      ),
+    ).toBe('strong');
+  });
+
+  it('reports no preset when the settings match none', () => {
+    const custom: StageSettings = { ...DEFAULT_STAGE_SETTINGS, stage1_psf_sigma: 2.5 };
+    expect(presetForSettings(DEFAULT_STAGE_SETTINGS, custom)).toBeNull();
   });
 
   it('clamps the detail gains into the slider range', () => {

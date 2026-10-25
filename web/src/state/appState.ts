@@ -81,8 +81,6 @@ export interface AppState {
   moduleStatus: ModuleStatus;
   /** Why the module cannot run, when it cannot. */
   moduleMessage: string | null;
-  /** The one line summary of the writer configuration. */
-  resultSummary: string | null;
 }
 
 export const initialAppState: AppState = {
@@ -107,13 +105,12 @@ export const initialAppState: AppState = {
   resultName: null,
   moduleStatus: 'unknown',
   moduleMessage: null,
-  resultSummary: null,
 };
 
 export type AppAction =
   | { type: 'source-selected'; name: string }
   | { type: 'companion-selected'; name: string | null }
-  | { type: 'source-prepared'; width: number; height: number; metadata: SourceMetadata; baseSettings: StageSettings }
+  | { type: 'source-prepared'; width: number; height: number; metadata: SourceMetadata; baseSettings: StageSettings; preset: PresetId | null }
   | { type: 'original-preview'; preview: PreviewBuffer }
   | { type: 'converted-preview'; preview: PreviewBuffer }
   | { type: 'settings-changed'; settings: StageSettings; overrides: StageOverrides }
@@ -127,6 +124,5 @@ export type AppAction =
   | { type: 'activity-progress'; message: string; fraction: number | null }
   | { type: 'error'; message: string | null }
   | { type: 'module-status'; status: ModuleStatus; message: string | null }
-  | { type: 'result-summary'; summary: string | null }
   | { type: 'result'; blob: Blob; name: string }
   | { type: 'reset' };

@@ -274,6 +274,25 @@ export function settingsEqual(
 }
 
 /**
+ * The built-in preset that produces `settings` from `base`, or null when none
+ * does.  The native GUI uses the same comparison to highlight a preset: it
+ * rebuilds each preset from the image's base settings and compares.  Opening
+ * an image leaves the settings at the base, which is the medium preset by
+ * construction, so that button is highlighted on load.
+ */
+export function presetForSettings(
+  base: StageSettings,
+  settings: StageSettings,
+): PresetId | null {
+  for (const preset of ['small', 'medium', 'strong'] as const) {
+    if (settingsEqual(settings, builtInPresetSettings(base, PRESET_STRENGTH[preset]))) {
+      return preset;
+    }
+  }
+  return null;
+}
+
+/**
  * Serialise the overrides for the wasm bridge: one double per stage value,
  * `NaN` meaning "not overridden".
  */
