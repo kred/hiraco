@@ -3940,6 +3940,9 @@ RasterImage CropRasterImage(const RasterImage& source,
   result.bits = source.bits;
   result.pixels.resize(static_cast<size_t>(result.width) * result.height * result.colors, 0);
 
+  // Each row writes a disjoint destination range, so the copy parallelizes
+  // without any synchronization.
+  #pragma omp parallel for schedule(static) if(result.height > 100)
   for (uint32_t row = 0; row < result.height; ++row) {
     const size_t src_row = static_cast<size_t>(crop.y + row) * source.width;
     const size_t dst_row = static_cast<size_t>(row) * result.width;
@@ -4156,6 +4159,7 @@ size_t ApplyRecoveredPixelCast(PreviewImage* preview) {
   // preview is RGB or RGBA, and overwriting an alpha channel would change how
   // the overlay composits rather than what colour it is.
   size_t changed = 0;
+  #pragma omp parallel for schedule(static) reduction(+:changed) if(pixel_count > 100000)
   for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
     if (preview->recovered_mask[pixel] == 0) {
       continue;
