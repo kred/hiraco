@@ -17,11 +17,12 @@ async function openApp(page: import('@playwright/test').Page): Promise<void> {
   });
 }
 
-/** The size of the preview canvas. */
+/** The size of a preview canvas. */
 async function canvasSize(
   page: import('@playwright/test').Page,
+  testId = 'preview-canvas',
 ): Promise<{ width: number; height: number }> {
-  return page.getByTestId('preview-canvas').evaluate((canvas) => ({
+  return page.getByTestId(testId).evaluate((canvas) => ({
     width: (canvas as HTMLCanvasElement).width,
     height: (canvas as HTMLCanvasElement).height,
   }));
@@ -35,7 +36,7 @@ test.describe('the preview and the controls', () => {
     );
   });
 
-  test('shows the original, the converted result and the reveal wipe', async ({
+  test('shows the original, the converted result and the side by side panes', async ({
     page,
   }) => {
     await openApp(page);
@@ -49,18 +50,33 @@ test.describe('the preview and the controls', () => {
     const original = await canvasSize(page);
     expect(original.width).toBeGreaterThan(0);
 
+    // Side by side shows the two previews in fixed panes, not in one wide
+    // canvas: the left pane carries the original and the right the result.
     await page.getByRole('button', { name: 'Side by side', exact: true }).click();
-    const sideBySide = await canvasSize(page);
-    expect(sideBySide.width).toBe(original.width + converted.width);
+    const left = await canvasSize(page, 'preview-canvas-left');
+    const right = await canvasSize(page, 'preview-canvas-right');
+    expect(left.width).toBe(original.width);
+    expect(right.width).toBe(converted.width);
+  });
 
-    await page.getByRole('button', { name: 'Reveal', exact: true }).click();
-    await expect(page.getByLabel('Reveal')).toBeVisible();
-    const revealed = await canvasSize(page);
-    expect(revealed.width).toBe(Math.max(original.width, converted.width));
+  test('shows the image details once and no sensor levels', async ({ page }) => {
+    await openApp(page);
+    await page.getByLabel('RAW file').setInputFiles(fixture);
+    await expect(page.getByTestId('preview-canvas')).toBeVisible({ timeout: 300_000 });
 
-    // The wipe moves the border between the two pictures.
-    await page.getByLabel('Reveal').fill('0.25');
-    await expect(page.getByLabel('Reveal')).toHaveValue('0.25');
+    // The reveal wipe has no native counterpart, so the browser does not
+    // offer it either.
+    await expect(page.getByRole('button', { name: 'Reveal', exact: true })).toHaveCount(0);
+
+    const inspector = page.getByRole('region', { name: 'Inspector' });
+    await expect(inspector.getByText('Working size')).toBeVisible();
+    await expect(inspector.getByText('Black level')).toHaveCount(0);
+    await expect(inspector.getByText('White level')).toHaveCount(0);
+
+    // The working size lives in the inspector only; the workspace shows the
+    // file names, not the geometry.
+    const workspace = page.getByRole('region', { name: 'Workspace' });
+    await expect(workspace.getByText('Size', { exact: true })).toHaveCount(0);
   });
 
   test('applies the presets to the sliders', async ({ page }) => {

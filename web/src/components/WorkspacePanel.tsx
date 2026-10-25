@@ -60,12 +60,6 @@ export function WorkspacePanel() {
                 <dd>{state.companionName}</dd>
               </>
             )}
-            <dt>Size</dt>
-            <dd>
-              {state.imageWidth > 0
-                ? `${state.imageWidth} × ${state.imageHeight}`
-                : 'not prepared yet'}
-            </dd>
           </dl>
         )}
       </div>

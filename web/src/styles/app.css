@@ -302,6 +302,22 @@
   image-rendering: auto;
 }
 
+/* Side by side: two fixed panes.  Each pane clips its own canvas; the two
+   canvases share one pan position, so both show the same source region. */
+.preview-split {
+  position: absolute;
+  inset: var(--space-4);
+  display: flex;
+  align-items: stretch;
+}
+
+.preview-pane {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
 /* Status ----------------------------------------------------------------- */
 
 .status-bar {
@@ -415,11 +431,6 @@
 .app-main > .error-banner,
 .app-main > .notice {
   grid-column: 1 / -1;
-}
-
-.reveal-row {
-  padding: var(--space-2) var(--space-3);
-  border-top: 1px solid var(--border);
 }
 
 .empty-state {

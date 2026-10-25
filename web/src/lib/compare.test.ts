@@ -1,10 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  clampRevealFraction,
-  previewDisplaySize,
-  revealFractionFromPointer,
-  zoomFactor,
-} from './compare';
+import { previewDisplaySize, previewMaxDimension, zoomFactor } from './compare';
 
 describe('zoom helpers', () => {
   it('knows the fixed zoom factors', () => {
@@ -34,15 +29,24 @@ describe('zoom helpers', () => {
   });
 });
 
-describe('reveal helpers', () => {
-  it('clamps the reveal position', () => {
-    expect(clampRevealFraction(-1)).toBe(0);
-    expect(clampRevealFraction(2)).toBe(1);
-    expect(clampRevealFraction(0.25)).toBe(0.25);
+describe('preview buffer sizes', () => {
+  const cap = 2560;
+
+  it('asks for the uncapped preview at 100%', () => {
+    expect(previewMaxDimension('100', 10386, cap)).toBe(0);
   });
 
-  it('maps a pointer position to a reveal fraction', () => {
-    expect(revealFractionFromPointer(150, { left: 100, width: 200 })).toBe(0.25);
-    expect(revealFractionFromPointer(50, { left: 100, width: 200 })).toBe(0);
+  it('asks for half the real width at 50% for a large image', () => {
+    // 50% displays the 10386 px image at 5193 px, so the buffer needs at
+    // least that many pixels; the old cap would upscale it and blur.
+    expect(previewMaxDimension('50', 10386, cap)).toBe(5193);
+  });
+
+  it('keeps the cap at 50% for an image smaller than the cap', () => {
+    expect(previewMaxDimension('50', 2000, cap)).toBe(cap);
+  });
+
+  it('keeps the cap for the fit view', () => {
+    expect(previewMaxDimension('fit', 10386, cap)).toBe(cap);
   });
 });

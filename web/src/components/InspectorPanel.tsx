@@ -3,7 +3,6 @@ import { useAppState } from '../state/AppStateProvider';
 function formatOptional(value: number | undefined, suffix = ''): string {
   return value === undefined ? '—' : `${value}${suffix}`;
 }
-
 export function InspectorPanel() {
   const { state } = useAppState();
   const metadata = state.metadata;
@@ -42,10 +41,6 @@ export function InspectorPanel() {
           <dd>
             {metadata.workingWidth} × {metadata.workingHeight}
           </dd>
-          <dt>Black level</dt>
-          <dd>{formatOptional(metadata.blackLevel)}</dd>
-          <dt>White level</dt>
-          <dd>{formatOptional(metadata.whiteLevel)}</dd>
           <dt>ISO</dt>
           <dd>{formatOptional(metadata.iso)}</dd>
           <dt>Shutter</dt>
