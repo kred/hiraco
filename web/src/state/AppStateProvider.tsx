@@ -16,6 +16,7 @@ import {
   type PreviewBuffer,
   type SourceMetadata,
 } from './appState';
+import { previewMaxDimension } from '../lib/compare';
 import {
   CancelledError,
   HiracoWasmClient,
@@ -312,9 +313,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     const started = beginPreviewJob();
     try {
       const overrides = stateRef.current.overrides;
-      // At 100% zoom request the full-resolution preview; otherwise cap at
-      // PREVIEW_MAX_DIMENSION so the browser doesn't allocate enormous buffers.
-      const maxDimension = stateRef.current.zoomMode === '100' ? 0 : PREVIEW_MAX_DIMENSION;
+      const maxDimension = previewMaxDimension(
+        stateRef.current.zoomMode,
+        stateRef.current.imageWidth,
+        PREVIEW_MAX_DIMENSION,
+      );
       const preview = await client().convertedPreview(
         maxDimension,
         overridesToArray(overrides),
@@ -337,7 +340,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const renderOriginalPreview = useCallback(async (): Promise<void> => {
     const started = beginPreviewJob();
     try {
-      const maxDimension = stateRef.current.zoomMode === '100' ? 0 : PREVIEW_MAX_DIMENSION;
+      const maxDimension = previewMaxDimension(
+        stateRef.current.zoomMode,
+        stateRef.current.imageWidth,
+        PREVIEW_MAX_DIMENSION,
+      );
       const preview = await client().originalPreview(maxDimension);
       dispatch({ type: 'original-preview', preview: previewFromBridge(preview) });
     } finally {
