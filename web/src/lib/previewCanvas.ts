@@ -9,8 +9,16 @@ export interface PixelBuffer {
 
 /** Wrap the pixel buffer in an `ImageData` the canvas can draw. */
 export function toImageData(buffer: PixelBuffer): ImageData {
-  const data = new Uint8ClampedArray(buffer.data);
-  return new ImageData(data, buffer.width, buffer.height);
+  // ImageData keeps the array it is given by reference, so wrapping avoids a
+  // full copy of the buffer - hundreds of megabytes for a full resolution
+  // preview.  The buffer is never mutated after it is displayed.  The pixel
+  // data always comes from a transferred ArrayBuffer, never from a shared one,
+  // which the cast records for TypeScript.
+  return new ImageData(
+    buffer.data as Uint8ClampedArray<ArrayBuffer>,
+    buffer.width,
+    buffer.height,
+  );
 }
 
 /**

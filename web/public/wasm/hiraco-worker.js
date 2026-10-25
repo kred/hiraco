@@ -28,8 +28,8 @@ let module = null;
 let sessionId = 0;
 let currentRequestId = 0;
 
-function reply(message) {
-  self.postMessage({ id: currentRequestId, ...message });
+function reply(message, transfer = []) {
+  self.postMessage({ id: currentRequestId, ...message }, transfer);
 }
 
 function fail(error) {
@@ -240,7 +240,14 @@ function renderPreview(request) {
 
     module._hiraco_wasm_free_buffer(BigInt(pixelAddress), BigInt(pixelBytes));
 
-    reply(message);
+    // Move the buffers to the page instead of structured-cloning them: a
+    // full resolution preview is hundreds of megabytes, and a clone would
+    // double both the peak memory and the time spent copying.
+    const transfer = [message.pixels];
+    if (message.mask) {
+      transfer.push(message.mask);
+    }
+    reply(message, transfer);
   } finally {
     freeScratch(pixelsPointer, sizePointer, widthPointer, heightPointer,
                 maskPointer, maskSizePointer, overridesPointer);
@@ -288,8 +295,11 @@ function convert(request) {
     }
     const pointer = readSize(outPointerPointer);
     const size = readSize(outSizePointer);
-    reply({ type: 'converted', dng: copyOut(pointer, size), bytes: size });
+    const message = { type: 'converted', dng: copyOut(pointer, size), bytes: size };
     module._hiraco_wasm_free_buffer(BigInt(pointer), BigInt(size));
+    // The DNG can be tens of megabytes; hand the buffer over instead of
+    // copying it to the page.
+    reply(message, [message.dng]);
   } finally {
     freeScratch(overridesPointer, compressionPointer, outPointerPointer, outSizePointer);
   }

@@ -75,14 +75,21 @@ if(HIRACO_BUILD_WASM)
   set(HIRACO_EMSCRIPTEN_THREAD_FLAGS -pthread)
   add_compile_options(${HIRACO_EMSCRIPTEN_THREAD_FLAGS})
   add_link_options(${HIRACO_EMSCRIPTEN_THREAD_FLAGS})
-  # The pool is bounded so that a machine with many cores does not spawn an
-  # unbounded number of workers inside the sandbox.
-  include(ProcessorCount)
-  ProcessorCount(HIRACO_WASM_HOST_CORES)
-  if(HIRACO_WASM_HOST_CORES LESS 1)
-    set(HIRACO_WASM_HOST_CORES 4)
-  endif()
-  set(HIRACO_WASM_PTHREAD_POOL_SIZE "${HIRACO_WASM_HOST_CORES}" CACHE STRING
+  # WebAssembly SIMD128 lets the compiler vectorize the per-pixel loops under
+  # -O3 instead of leaving them scalar.  Every browser that can run this
+  # module (wasm64, shared memory, cross-origin isolation) supports SIMD too.
+  set(HIRACO_EMSCRIPTEN_SIMD_FLAGS -msimd128)
+  add_compile_options(${HIRACO_EMSCRIPTEN_SIMD_FLAGS})
+  add_link_options(${HIRACO_EMSCRIPTEN_SIMD_FLAGS})
+  # The pool has to match the machine that runs the module, not the machine
+  # that built it: a CI runner with two cores would otherwise pre-warm two
+  # workers, and every user with more cores would then need on-demand thread
+  # creation.  That path deadlocks here, because a thread created from inside
+  # a pthread is proxied synchronously to the module's main thread, which is
+  # blocked inside the wasm call.  Emscripten emits this expression into the
+  # generated JS, so the pool is warmed to the browser's own core count (with
+  # one spare worker for the asynchronous helper threads).
+  set(HIRACO_WASM_PTHREAD_POOL_SIZE "(navigator.hardwareConcurrency||4)+1" CACHE STRING
     "Number of worker threads in the WebAssembly thread pool")
   add_link_options(-sPTHREAD_POOL_SIZE=${HIRACO_WASM_PTHREAD_POOL_SIZE})
   # The conversion keeps several double precision buffers of the size of the
@@ -92,7 +99,13 @@ if(HIRACO_BUILD_WASM)
   set(HIRACO_EMSCRIPTEN_MEMORY_FLAGS
     -sALLOW_MEMORY_GROWTH=1
     -sMAXIMUM_MEMORY=16GB
-    -sINITIAL_MEMORY=256MB
+    -sINITIAL_MEMORY=512MB
+    # With a shared memory and growth enabled, growing the heap normally
+    # copies the whole heap into a new SharedArrayBuffer.  For a multi-GB
+    # 80 MP capture that is repeatedly expensive.  Where the browser supports
+    # growable memory the heap grows in place; elsewhere Emscripten falls back
+    # to the copying path.
+    -sGROWABLE_ARRAYBUFFERS=1
   )
   add_link_options(${HIRACO_EMSCRIPTEN_MEMORY_FLAGS})
   # LibRaw's identify step uses large stack buffers; the default 64 KB stack
