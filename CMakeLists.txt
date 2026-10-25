@@ -81,21 +81,17 @@ if(HIRACO_BUILD_WASM)
   set(HIRACO_EMSCRIPTEN_SIMD_FLAGS -msimd128)
   add_compile_options(${HIRACO_EMSCRIPTEN_SIMD_FLAGS})
   add_link_options(${HIRACO_EMSCRIPTEN_SIMD_FLAGS})
-  # The pool is bounded so that a machine with many cores does not spawn an
-  # unbounded number of workers inside the sandbox.
-  include(ProcessorCount)
-  ProcessorCount(HIRACO_WASM_HOST_CORES)
-  if(HIRACO_WASM_HOST_CORES LESS 1)
-    set(HIRACO_WASM_HOST_CORES 4)
-  endif()
-  set(HIRACO_WASM_PTHREAD_POOL_SIZE "${HIRACO_WASM_HOST_CORES}" CACHE STRING
+  # The pool has to match the machine that runs the module, not the machine
+  # that built it: a CI runner with two cores would otherwise pre-warm two
+  # workers, and every user with more cores would then need on-demand thread
+  # creation.  That path deadlocks here, because a thread created from inside
+  # a pthread is proxied synchronously to the module's main thread, which is
+  # blocked inside the wasm call.  Emscripten emits this expression into the
+  # generated JS, so the pool is warmed to the browser's own core count (with
+  # one spare worker for the asynchronous helper threads).
+  set(HIRACO_WASM_PTHREAD_POOL_SIZE "(navigator.hardwareConcurrency||4)+1" CACHE STRING
     "Number of worker threads in the WebAssembly thread pool")
   add_link_options(-sPTHREAD_POOL_SIZE=${HIRACO_WASM_PTHREAD_POOL_SIZE})
-  # The pool size is fixed at build time, and the build machine is not the
-  # machine that runs the module: a CI runner with two cores would otherwise
-  # cap every user at two threads.  With strict mode off, threads beyond the
-  # initial pool are created on demand, up to what the runtime needs.
-  add_link_options(-sPTHREAD_POOL_SIZE_STRICT=0)
   # The conversion keeps several double precision buffers of the size of the
   # image alive at once.  A 10386 x 7792 sensor-shift capture is 242 M
   # samples, and the native build peaks at about 8 GB of resident memory, so
