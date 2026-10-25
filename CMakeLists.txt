@@ -75,6 +75,12 @@ if(HIRACO_BUILD_WASM)
   set(HIRACO_EMSCRIPTEN_THREAD_FLAGS -pthread)
   add_compile_options(${HIRACO_EMSCRIPTEN_THREAD_FLAGS})
   add_link_options(${HIRACO_EMSCRIPTEN_THREAD_FLAGS})
+  # WebAssembly SIMD128 lets the compiler vectorize the per-pixel loops under
+  # -O3 instead of leaving them scalar.  Every browser that can run this
+  # module (wasm64, shared memory, cross-origin isolation) supports SIMD too.
+  set(HIRACO_EMSCRIPTEN_SIMD_FLAGS -msimd128)
+  add_compile_options(${HIRACO_EMSCRIPTEN_SIMD_FLAGS})
+  add_link_options(${HIRACO_EMSCRIPTEN_SIMD_FLAGS})
   # The pool is bounded so that a machine with many cores does not spawn an
   # unbounded number of workers inside the sandbox.
   include(ProcessorCount)
@@ -85,6 +91,11 @@ if(HIRACO_BUILD_WASM)
   set(HIRACO_WASM_PTHREAD_POOL_SIZE "${HIRACO_WASM_HOST_CORES}" CACHE STRING
     "Number of worker threads in the WebAssembly thread pool")
   add_link_options(-sPTHREAD_POOL_SIZE=${HIRACO_WASM_PTHREAD_POOL_SIZE})
+  # The pool size is fixed at build time, and the build machine is not the
+  # machine that runs the module: a CI runner with two cores would otherwise
+  # cap every user at two threads.  With strict mode off, threads beyond the
+  # initial pool are created on demand, up to what the runtime needs.
+  add_link_options(-sPTHREAD_POOL_SIZE_STRICT=0)
   # The conversion keeps several double precision buffers of the size of the
   # image alive at once.  A 10386 x 7792 sensor-shift capture is 242 M
   # samples, and the native build peaks at about 8 GB of resident memory, so
@@ -92,7 +103,13 @@ if(HIRACO_BUILD_WASM)
   set(HIRACO_EMSCRIPTEN_MEMORY_FLAGS
     -sALLOW_MEMORY_GROWTH=1
     -sMAXIMUM_MEMORY=16GB
-    -sINITIAL_MEMORY=256MB
+    -sINITIAL_MEMORY=512MB
+    # With a shared memory and growth enabled, growing the heap normally
+    # copies the whole heap into a new SharedArrayBuffer.  For a multi-GB
+    # 80 MP capture that is repeatedly expensive.  Where the browser supports
+    # growable memory the heap grows in place; elsewhere Emscripten falls back
+    # to the copying path.
+    -sGROWABLE_ARRAYBUFFERS=1
   )
   add_link_options(${HIRACO_EMSCRIPTEN_MEMORY_FLAGS})
   # LibRaw's identify step uses large stack buffers; the default 64 KB stack

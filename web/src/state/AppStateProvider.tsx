@@ -250,6 +250,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewRunning = useRef(false);
   const previewPending = useRef(false);
+  const originalRunning = useRef(false);
+  const originalPending = useRef(false);
   // True while openSession prepares the image: that path shows its own
   // "Preparing the image…" activity, so preview renders must not replace it.
   const sessionLoading = useRef(false);
@@ -338,6 +340,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   }, [beginPreviewJob, client, endPreviewJob]);
 
   const renderOriginalPreview = useCallback(async (): Promise<void> => {
+    if (originalRunning.current) {
+      originalPending.current = true;
+      return;
+    }
+    originalRunning.current = true;
     const started = beginPreviewJob();
     try {
       const maxDimension = previewMaxDimension(
@@ -348,9 +355,21 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       const preview = await client().originalPreview(maxDimension);
       dispatch({ type: 'original-preview', preview: previewFromBridge(preview) });
     } finally {
+      originalRunning.current = false;
       endPreviewJob(started);
+      if (originalPending.current) {
+        originalPending.current = false;
+        // The queued render serves the newest zoom mode.  The caller of the
+        // first request reports its own failure; a cancellation of this
+        // follow-up request is expected and not shown.
+        void renderOriginalPreview().catch((error: unknown) => {
+          if (!(error instanceof CancelledError)) {
+            dispatch({ type: 'error', message: messageOf(error) });
+          }
+        });
+      }
     }
-  }, [beginPreviewJob, client, endPreviewJob]);
+  }, [beginPreviewJob, client, dispatch, endPreviewJob]);
 
   const openSession = useCallback(async (): Promise<void> => {
     const source = sourceRef.current;
