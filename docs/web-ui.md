@@ -1,5 +1,7 @@
 # The hiraco web UI
 
+A live build is published at https://kred.github.io/hiraco/.
+
 `web/` holds a Vite + React + TypeScript application that runs the full
 hiraco conversion in the browser.  The browser loads the `hiraco-wasm`
 module, prepares the RAW file, renders the previews, applies the presets and

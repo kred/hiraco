@@ -5,7 +5,8 @@
 The repository builds one shared processing core and exposes it through native and browser-oriented targets:
 - `hiraco-cli` for the full desktop command-line conversion pipeline
 - `hiraco-gui` for interactive preview, tuning, and batch conversion
-- `hiraco-wasm` (experimental) for the browser-facing conversion module
+- `hiraco-wasm` for the browser-facing conversion module; a live build of the
+  browser UI is published at https://kred.github.io/hiraco/
 
 The current implementation supports both a custom high-resolution raw-domain reconstruction path and a LibRaw-based render path for other supported inputs. The native desktop stack remains the default. The WebAssembly build carries the *same* conversion core: the DNG SDK writer, the image processing stages and the RAW decoder are all compiled for WebAssembly, so `hiraco-cli.js` really converts ORF and ORI files. The two builds do not produce bit-identical files, because aarch64 contracts `a * b + c` into a fused multiply-add and WebAssembly has no such instruction; see `docs/wasm-verification.md` for the measured difference.
 ![Comparison](contact_sheet.png)
@@ -18,7 +19,8 @@ The current implementation supports both a custom high-resolution raw-domain rec
 - `hiraco-core`: shared static library containing preparation, metadata, preview, full-preview, enhancement, and DNG writing code.
 - `hiraco-cli`: command-line `convert` frontend.
 - `hiraco-gui`: wxWidgets desktop frontend with thumbnail queueing, full-frame comparison, output controls, and conversion.
-- `hiraco-wasm`: experimental browser target built with Emscripten; the GUI is intentionally excluded, and the module carries the same conversion core as the native build and converts RAW buffers into DNG buffers.
+- `hiraco-wasm`: browser target built with Emscripten; the GUI is intentionally excluded, and the module carries the same conversion core as the native build and converts RAW buffers into DNG buffers.
+- `hiraco-web`: the Vite + React browser UI in `web/`, built on `hiraco-wasm`, with a live build at https://kred.github.io/hiraco/.
 - Custom high-resolution raw-domain reconstruction driven by vendor metadata and stack-guidance maps.
 - Optional, per-file ORI-assisted highlight recovery for supported high-resolution
   ORFs when a same-directory companion candidate is detected.  The correction is
@@ -111,7 +113,9 @@ This produces:
 - `build/release/hiraco-gui`
 - `build/release/libhiraco-core.a`
 
-#### WebAssembly target (experimental)
+#### WebAssembly target
+
+A live build of the browser UI is published at https://kred.github.io/hiraco/.
 
 ```bash
 # install Emscripten and the Halide host tool first, then:
@@ -297,6 +301,8 @@ limitations.
 *OM SYSTEM and Olympus are registered trademarks of OM Digital Solutions Corporation or Olympus Corporation. This project is not affiliated with, endorsed by, or sponsored by these companies. All trademarks are used only for compatibility description and nominative fair use purposes.*
 
 ## Web UI
+
+A live build is published at https://kred.github.io/hiraco/.
 
 The repository ships a browser UI in `web/` that runs the full conversion in
 the browser.  Build and run it with:

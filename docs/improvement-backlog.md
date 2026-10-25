@@ -2,8 +2,19 @@
 
 Prioritized improvement candidates derived from the audit in
 [`project-review.md`](project-review.md). Written 2026-10-09 against commit
-`d6f5e2f`. **No implementation has been done** — this file is a task breakdown
-for a follow-up goal.
+`d6f5e2f`; this file is a snapshot of the backlog at that point.
+
+Status note (2026-10-25): several candidates are now implemented and should be
+read as done rather than open tasks:
+
+- I-01 (deflate compression) — the DNG writer now honours deflate through the
+  bundled SDK patch.
+- I-13 (HL Rec in the CLI) — `hiraco-cli convert ... --hl-rec`.
+- The browser UI and its WebAssembly build/deploy pipeline have shipped
+  (live site: https://kred.github.io/hiraco/).
+
+The remaining entries still need individual verification against the current
+tree before they are picked up.
 
 Each candidate carries: **evidence** (file:line or measured result, with the
 finding ID from the review where applicable), **benefit**, **risk**, **effort**,
