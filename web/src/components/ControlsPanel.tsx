@@ -124,24 +124,12 @@ export function ControlsPanel() {
             type="button"
             className="button danger"
             disabled={!busy}
+            title="Stop the running conversion. The worker restarts, so the next conversion prepares the image again."
             onClick={() => actions.cancel()}
           >
             Cancel
           </button>
-          <button
-            type="button"
-            className="button"
-            disabled={state.result === null}
-            onClick={() => actions.download()}
-          >
-            Save DNG
-          </button>
         </div>
-        {state.resultSummary !== null && (
-          <p className="hint" data-testid="writer-summary">
-            {state.resultSummary}
-          </p>
-        )}
       </footer>
     </section>
   );

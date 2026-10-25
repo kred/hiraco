@@ -31,6 +31,7 @@ import {
   builtInPresetSettings,
   makeExplicitOverrides,
   normalizeOverrides,
+  presetForSettings,
   serializeStageOverrides,
   type PresetId,
   type StageKey,
@@ -55,7 +56,6 @@ function reducer(state: AppState, action: AppAction): AppState {
         metadata: null,
         result: null,
         resultName: null,
-        resultSummary: null,
         error: null,
         activity: { state: 'idle', message: `Loaded ${action.name}`, fraction: null },
       };
@@ -70,7 +70,7 @@ function reducer(state: AppState, action: AppAction): AppState {
         baseSettings: action.baseSettings,
         settings: action.baseSettings,
         overrides: {},
-        preset: null,
+        preset: action.preset,
       };
     case 'original-preview':
       return { ...state, originalPreview: action.preview };
@@ -116,8 +116,6 @@ function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, error: action.message };
     case 'module-status':
       return { ...state, moduleStatus: action.status, moduleMessage: action.message };
-    case 'result-summary':
-      return { ...state, resultSummary: action.summary };
     case 'result':
       return {
         ...state,
@@ -226,8 +224,6 @@ interface AppActions {
   convert(): void;
   /** Stops the running conversion. */
   cancel(): void;
-  /** Saves the produced DNG. */
-  download(): void;
 }
 
 interface AppStateContextValue {
@@ -400,6 +396,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         height: opened.height,
         metadata: metadataFromBridge(opened.metadata),
         baseSettings,
+        // The neutral settings are the medium preset, so its button is shown
+        // as selected, matching what the native GUI does on load.
+        preset: presetForSettings(baseSettings, baseSettings),
       });
       await renderOriginalPreview();
       await renderConvertedPreview();
@@ -617,8 +616,6 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         overridesToArray(stateRef.current.overrides),
       );
       const name = resultNameFor(source.name);
-      const summary = await client().writerSummary(current.compression);
-      dispatch({ type: 'result-summary', summary });
       const blob = new Blob([new Uint8Array(dng)], { type: 'image/x-adobe-dng' });
       dispatch({ type: 'result', blob, name });
       // The native application writes the file when the conversion ends,
@@ -643,14 +640,6 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     sessionRef.current = false;
     client().cancel();
   }, [client]);
-
-  const download = useCallback(() => {
-    const current = stateRef.current;
-    if (current.result === null) {
-      return;
-    }
-    saveFile(current.result, current.resultName ?? 'output.dng');
-  }, []);
 
   /** Hands a file to the browser as a download. */
 function saveFile(blob: Blob, name: string): void {
@@ -677,13 +666,11 @@ const actions = useMemo<AppActions>(
       resetPreset,
       convert: () => void convert(),
       cancel,
-      download,
     }),
     [
       applyPreset,
       cancel,
       convert,
-      download,
       resetSection,
       selectCompanion,
       selectSource,
