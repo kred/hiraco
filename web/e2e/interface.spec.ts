@@ -79,7 +79,8 @@ test.describe('the preview and the controls', () => {
     await expect(workspace.getByText('Size', { exact: true })).toHaveCount(0);
   });
 
-  test('applies the presets to the sliders', async ({ page }) => {    await openApp(page);
+  test('applies the presets to the sliders', async ({ page }) => {
+    await openApp(page);
     await page.getByLabel('RAW file').setInputFiles(fixture);
     await expect(page.getByTestId('preview-canvas')).toBeVisible({ timeout: 300_000 });
 

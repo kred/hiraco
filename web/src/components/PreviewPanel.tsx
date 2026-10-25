@@ -246,32 +246,30 @@ export function PreviewPanel() {
   const paneWidth = Math.max(0, Math.floor((available.width - paneGap) / 2));
   const paneHeight = available.height;
 
-  const leftSize = useMemo(
-    () =>
-      leftBuffer
-        ? previewDisplaySize(
-            state.zoomMode,
-            leftBuffer.width,
-            leftBuffer.height,
-            paneWidth,
-            paneHeight,
-          )
-        : { width: 0, height: 0 },
-    [leftBuffer, state.zoomMode, paneWidth, paneHeight],
+  // Fixed zoom factors refer to the real image, not to the possibly capped
+  // preview buffer: at 50 % the buffer may hold only 2560 px of an 8000 px
+  // image, so a plain factor would display the wrong magnification.  This is
+  // the same correction the single-canvas path applies.
+  const paneDisplaySize = useCallback(
+    (buffer: PreviewBuffer | null) => {
+      if (!buffer) {
+        return { width: 0, height: 0 };
+      }
+      if (factor !== null) {
+        const ratio = state.imageWidth > 0 ? state.imageWidth / buffer.width : 1;
+        const scale = factor * ratio;
+        return {
+          width: Math.round(buffer.width * scale),
+          height: Math.round(buffer.height * scale),
+        };
+      }
+      return previewDisplaySize('fit', buffer.width, buffer.height, paneWidth, paneHeight);
+    },
+    [factor, state.imageWidth, paneWidth, paneHeight],
   );
-  const rightSize = useMemo(
-    () =>
-      rightBuffer
-        ? previewDisplaySize(
-            state.zoomMode,
-            rightBuffer.width,
-            rightBuffer.height,
-            paneWidth,
-            paneHeight,
-          )
-        : { width: 0, height: 0 },
-    [rightBuffer, state.zoomMode, paneWidth, paneHeight],
-  );
+
+  const leftSize = useMemo(() => paneDisplaySize(leftBuffer), [paneDisplaySize, leftBuffer]);
+  const rightSize = useMemo(() => paneDisplaySize(rightBuffer), [paneDisplaySize, rightBuffer]);
 
   const imageWidth =
     state.imageWidth > 0 ? state.imageWidth : (leftBuffer?.width ?? rightBuffer?.width ?? 0);

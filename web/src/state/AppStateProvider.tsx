@@ -340,10 +340,6 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       const maxDimension = stateRef.current.zoomMode === '100' ? 0 : PREVIEW_MAX_DIMENSION;
       const preview = await client().originalPreview(maxDimension);
       dispatch({ type: 'original-preview', preview: previewFromBridge(preview) });
-    } catch (error) {
-      if (!(error instanceof CancelledError)) {
-        dispatch({ type: 'error', message: messageOf(error) });
-      }
     } finally {
       endPreviewJob(started);
     }
@@ -459,7 +455,14 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     if (!sessionRef.current) {
       return;
     }
-    void renderOriginalPreview();
+    // openSession awaits this call and handles a cancellation itself; when the
+    // zoom change triggers it, the rejection is caught here instead.  The
+    // CancelledError carries no user-facing error message.
+    void renderOriginalPreview().catch((error: unknown) => {
+      if (!(error instanceof CancelledError)) {
+        dispatch({ type: 'error', message: messageOf(error) });
+      }
+    });
     void renderConvertedPreview();
   }, [state.zoomMode, renderOriginalPreview, renderConvertedPreview]);
 
