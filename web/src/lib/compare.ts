@@ -1,12 +1,11 @@
 /**
  * The preview comparison and zoom helpers.
  *
- * The native GUI offers three comparison modes (original, converted, side by
- * side) and three zoom modes (fit, 50 %, 100 %).  The browser adds a reveal
- * slider, which the design mockups show as a fourth way to compare.
+ * The browser offers the same three comparison modes as the native GUI
+ * (original, converted, side by side) and three zoom modes (fit, 50 %, 100 %).
  */
 
-export type CompareMode = 'original' | 'converted' | 'side-by-side' | 'reveal';
+export type CompareMode = 'original' | 'converted' | 'side-by-side';
 
 export interface CompareModeSpec {
   id: CompareMode;
@@ -29,11 +28,6 @@ export const COMPARE_MODES: CompareModeSpec[] = [
     id: 'side-by-side',
     label: 'Side by side',
     title: 'Show the original and the result next to each other',
-  },
-  {
-    id: 'reveal',
-    label: 'Reveal',
-    title: 'Wipe between the original and the result',
   },
 ];
 
@@ -93,23 +87,4 @@ export function previewDisplaySize(
     width: Math.max(1, Math.round(imageWidth * scale)),
     height: Math.max(1, Math.round(imageHeight * scale)),
   };
-}
-
-/** Keep the reveal position inside the image. */
-export function clampRevealFraction(value: number): number {
-  if (!Number.isFinite(value)) {
-    return 0.5;
-  }
-  return value < 0 ? 0 : value > 1 ? 1 : value;
-}
-
-/** The reveal position for a pointer at `clientX` inside `rect`. */
-export function revealFractionFromPointer(clientX: number, rect: {
-  left: number;
-  width: number;
-}): number {
-  if (rect.width <= 0) {
-    return 0.5;
-  }
-  return clampRevealFraction((clientX - rect.left) / rect.width);
 }

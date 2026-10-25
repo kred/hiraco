@@ -97,8 +97,6 @@ function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, compareMode: action.compareMode };
     case 'zoom-mode-changed':
       return { ...state, zoomMode: action.zoomMode };
-    case 'reveal-changed':
-      return { ...state, reveal: action.reveal };
     case 'recovered-pixels-changed':
       return { ...state, showRecoveredPixels: action.showRecoveredPixels };
     case 'activity':
@@ -154,8 +152,6 @@ function metadataFromBridge(metadata: BridgeMetadata): SourceMetadata {
     model: metadata.model,
     uniqueCameraModel: metadata.unique_camera_model,
     librawFlip: metadata.flip,
-    blackLevel: metadata.has_black_level ? metadata.black_level : undefined,
-    whiteLevel: metadata.has_white_level ? metadata.white_level : undefined,
     asShotNeutral: metadata.has_as_shot_neutral
       ? (metadata.as_shot_neutral as [number, number, number])
       : undefined,
@@ -253,6 +249,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewRunning = useRef(false);
   const previewPending = useRef(false);
+  // True while openSession prepares the image: that path shows its own
+  // "Preparing the image…" activity, so preview renders must not replace it.
+  const sessionLoading = useRef(false);
+  // Number of preview renders in flight (original and converted may run
+  // together), so the activity ends only when the last one finishes.
+  const previewJobs = useRef(0);
 
   const client = useCallback((): HiracoWasmClient => {
     if (clientRef.current === null) {
@@ -268,12 +270,46 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     return clientRef.current;
   }, []);
 
+  // A preview render is real work that can take a while (the full resolution
+  // render of an 80 megapixel RAW especially), so it is reported through the
+  // same activity channel as a conversion.  The worker streams its progress
+  // through the activity-progress action; the reducer only applies those
+  // updates while an operation is marked as working, which is what these two
+  // helpers establish and take down again.
+  const beginPreviewJob = useCallback((): boolean => {
+    if (sessionLoading.current) {
+      return false;
+    }
+    previewJobs.current += 1;
+    if (previewJobs.current === 1) {
+      dispatch({
+        type: 'activity',
+        activity: { state: 'working', message: 'Rendering preview…', fraction: null },
+      });
+    }
+    return true;
+  }, []);
+
+  const endPreviewJob = useCallback((started: boolean): void => {
+    if (!started) {
+      return;
+    }
+    previewJobs.current = Math.max(0, previewJobs.current - 1);
+    if (previewJobs.current === 0) {
+      dispatch({
+        type: 'activity',
+        activity: { state: 'idle', message: 'Ready', fraction: null },
+      });
+    }
+  }, []);
+
   const renderConvertedPreview = useCallback(async (): Promise<void> => {
     if (previewRunning.current) {
       previewPending.current = true;
       return;
     }
     previewRunning.current = true;
+    const started = beginPreviewJob();
     try {
       const overrides = stateRef.current.overrides;
       // At 100% zoom request the full-resolution preview; otherwise cap at
@@ -290,18 +326,28 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       }
     } finally {
       previewRunning.current = false;
+      endPreviewJob(started);
       if (previewPending.current) {
         previewPending.current = false;
         void renderConvertedPreview();
       }
     }
-  }, [client]);
+  }, [beginPreviewJob, client, endPreviewJob]);
 
   const renderOriginalPreview = useCallback(async (): Promise<void> => {
-    const maxDimension = stateRef.current.zoomMode === '100' ? 0 : PREVIEW_MAX_DIMENSION;
-    const preview = await client().originalPreview(maxDimension);
-    dispatch({ type: 'original-preview', preview: previewFromBridge(preview) });
-  }, [client]);
+    const started = beginPreviewJob();
+    try {
+      const maxDimension = stateRef.current.zoomMode === '100' ? 0 : PREVIEW_MAX_DIMENSION;
+      const preview = await client().originalPreview(maxDimension);
+      dispatch({ type: 'original-preview', preview: previewFromBridge(preview) });
+    } catch (error) {
+      if (!(error instanceof CancelledError)) {
+        dispatch({ type: 'error', message: messageOf(error) });
+      }
+    } finally {
+      endPreviewJob(started);
+    }
+  }, [beginPreviewJob, client, endPreviewJob]);
 
   const openSession = useCallback(async (): Promise<void> => {
     const source = sourceRef.current;
@@ -312,6 +358,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       type: 'activity',
       activity: { state: 'working', message: 'Preparing the image…', fraction: null },
     });
+    sessionLoading.current = true;
     try {
       const companion = companionRef.current;
       const opened = await client().open(
@@ -348,6 +395,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         return;
       }
       dispatch({ type: 'error', message: messageOf(error) });
+    } finally {
+      sessionLoading.current = false;
     }
   }, [client, renderConvertedPreview]);
 

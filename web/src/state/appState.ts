@@ -33,8 +33,6 @@ export interface SourceMetadata {
   model: string;
   uniqueCameraModel: string;
   librawFlip: number;
-  blackLevel?: number;
-  whiteLevel?: number;
   asShotNeutral?: [number, number, number];
   iso?: number;
   shutterSpeed?: string;
@@ -73,7 +71,6 @@ export interface AppState {
   compression: CompressionMode;
   compareMode: CompareMode;
   zoomMode: ZoomMode;
-  reveal: number;
   showRecoveredPixels: boolean;
   activity: Activity;
   error: string | null;
@@ -103,7 +100,6 @@ export const initialAppState: AppState = {
   compression: 'deflate',
   compareMode: 'converted',
   zoomMode: 'fit',
-  reveal: 0.5,
   showRecoveredPixels: false,
   activity: { state: 'idle', message: 'Ready', fraction: null },
   error: null,
@@ -126,7 +122,6 @@ export type AppAction =
   | { type: 'compression-changed'; compression: CompressionMode }
   | { type: 'compare-mode-changed'; compareMode: CompareMode }
   | { type: 'zoom-mode-changed'; zoomMode: ZoomMode }
-  | { type: 'reveal-changed'; reveal: number }
   | { type: 'recovered-pixels-changed'; showRecoveredPixels: boolean }
   | { type: 'activity'; activity: Activity }
   | { type: 'activity-progress'; message: string; fraction: number | null }
