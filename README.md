@@ -216,14 +216,20 @@ a 5220 x 3912 capture - because its FFTW has no SIMD codelets and the
 demosaic runs without OpenMP.
 
 The browser module takes the RAW data as a buffer and returns the DNG as a
-buffer, so a page never needs a file system:
+buffer, so a page never needs a file system.  The generated glue is CommonJS;
+in Node it can be loaded like this:
 
 ```js
 const createModule = require('./build-wasm/hiraco-wasm.js');
-const module = await createModule();
-// ... fill the heap with the RAW data, call _hiraco_wasm_convert, read the
-// DNG back out of the heap.  See tests/wasm_convert_harness.js.
+
+createModule().then((module) => {
+  // ... fill the heap with the RAW data, call _hiraco_wasm_convert, read the
+  // DNG back out of the heap.  See tests/wasm_convert_harness.js.
+});
 ```
+
+In a browser the worker loads the same glue as a classic script, where it
+defines the `hiracoWasm` factory (see `web/public/wasm/hiraco-worker.js`).
 
 ### GUI
 
