@@ -116,4 +116,24 @@ test('pairs an ORI companion with its RAW into one queue entry', async ({ page }
   const item = page.getByTestId('queue-item');
   await expect(item).toContainText('_8142492.ORF');
   await expect(item).toContainText('ORI');
+
+});
+
+
+test('removes the selected queue entry', async ({ page }) => {
+  const raw =
+    process.env.HIRACO_E2E_SMALL_RAW ?? path.join(repoRoot, 'reference', '_3060001.ORF');
+  test.skip(!existsSync(raw), 'the small RAW fixture is not part of the repository');
+
+  await openApp(page);
+  await page.getByLabel('RAW file').setInputFiles(raw);
+  await expect(page.getByTestId('queue-item')).toHaveCount(1);
+  // Wait for the preview work to finish so the remove button is enabled.
+  await expect(page.getByRole('button', { name: 'Clear all' })).toBeEnabled({
+    timeout: 300_000,
+  });
+
+  await page.getByRole('button', { name: 'Remove _3060001.ORF', exact: true }).click();
+  await expect(page.getByTestId('queue-item')).toHaveCount(0);
+  await expect(page.getByText('No files queued yet.')).toBeVisible();
 });
