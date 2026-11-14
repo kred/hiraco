@@ -61,7 +61,6 @@ premise **inferred** from the architecture).
 | `src/stack_guidance.cpp` / `.h` | Stack-guidance map unpacker | 295 / 25 |
 | `src/halide/*.cpp` | Halide AOT generators (à trous wavelet, guided filter) | 212 |
 | `src/dng_sdk_bridge.cpp` | DNG SDK capability summary | 98 |
-| `src/dng_jxl_stubs.cpp` | JXL decoder stubs for the non-JXL build path | 61 |
 | `src/main.cpp` | CLI entry point | 84 |
 | `src/hiraco_types.h` | Shared types, defaults, cache structs | 230 |
 | `src/hiraco_timing.h` | `HIRACO_TIMING` scoped timers | 83 |
