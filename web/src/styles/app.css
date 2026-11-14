@@ -400,6 +400,122 @@
   overflow-wrap: anywhere;
 }
 
+/* Queue ----------------------------------------------------------------- */
+
+.queue-section {
+  margin-top: var(--space-2);
+}
+
+.queue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.queue-item {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.queue-item[data-selected='true'] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.queue-select {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.queue-select:disabled {
+  cursor: not-allowed;
+}
+
+.queue-name {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.queue-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.queue-item[data-status='error'] .queue-meta {
+  color: var(--danger);
+}
+
+.queue-item[data-status='done'] .queue-meta {
+  color: var(--ok);
+}
+
+.queue-remove {
+  width: 28px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.queue-remove:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--danger);
+}
+
+.queue-remove:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.queue-hint {
+  margin: var(--space-2) 0 0;
+}
+
+.custom-preset-field {
+  margin-top: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+
+.custom-preset-actions {
+  margin-bottom: var(--space-2);
+}
+
+.inline-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+
+.inline-row .text-input {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
+
+.convert-hint {
+  margin: var(--space-2) 0 0;
+}
+
 /* Misc ------------------------------------------------------------------- */
 
 .hint {

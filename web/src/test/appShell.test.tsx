@@ -21,6 +21,17 @@ describe('the application shell', () => {
     expect(screen.getByLabelText('Edge Gain')).toBeInTheDocument();
   });
 
+  it('offers a multi-file queue and saved custom presets', () => {
+    render(<App />);
+    expect(screen.getByLabelText('RAW file')).toHaveAttribute('multiple');
+    expect(screen.getByRole('heading', { name: 'Queue' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Saved custom preset')).toBeInTheDocument();
+    expect(screen.getByLabelText('Custom preset name')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'Save preset' }),
+    ).toBeInTheDocument();
+  });
+
   it('switches the theme and remembers it', () => {
     render(<App />);
     const toggle = screen.getByRole('button', { name: /Switch to the (light|dark) theme/ });

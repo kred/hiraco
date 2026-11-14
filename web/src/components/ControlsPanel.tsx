@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useAppState } from '../state/AppStateProvider';
 import {
   COMPRESSION_MODES,
@@ -13,6 +14,10 @@ import {
 export function ControlsPanel() {
   const { state, dispatch, actions } = useAppState();
   const busy = state.activity.state === 'working';
+  const activeCustomPreset =
+    state.customPresets.find((preset) => preset.name === state.activeCustomPreset) ??
+    null;
+  const [presetName, setPresetName] = useState('');
 
   return (
     <section className="panel" aria-label="Processing">
@@ -31,11 +36,95 @@ export function ControlsPanel() {
                 type="button"
                 className="preset-button"
                 aria-pressed={state.preset === preset}
+                disabled={busy || (preset === 'custom' && activeCustomPreset === null)}
+                title={
+                  preset === 'custom' && activeCustomPreset === null
+                    ? 'Save or select a custom preset first.'
+                    : undefined
+                }
                 onClick={() => actions.applyPreset(preset)}
               >
                 {PRESET_LABELS[preset]}
               </button>
             ))}
+          </div>
+
+          <div className="field custom-preset-field">
+            <label className="field-label" htmlFor="saved-custom-preset">
+              Saved custom preset
+            </label>
+            <select
+              id="saved-custom-preset"
+              className="select"
+              aria-label="Saved custom preset"
+              value={state.activeCustomPreset ?? ''}
+              disabled={busy}
+              onChange={(event) =>
+                actions.selectCustomPreset(event.target.value === '' ? null : event.target.value)
+              }
+            >
+              <option value="">None</option>
+              {state.customPresets.map((preset) => (
+                <option key={preset.name} value={preset.name}>
+                  {preset.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="button-row custom-preset-actions">
+            <button
+              type="button"
+              className="button"
+              disabled={busy || activeCustomPreset === null}
+              onClick={() => {
+                if (activeCustomPreset !== null) {
+                  actions.loadCustomPreset(activeCustomPreset.name);
+                }
+              }}
+            >
+              Load
+            </button>
+            <button
+              type="button"
+              className="button danger"
+              disabled={busy || activeCustomPreset === null}
+              onClick={() => {
+                if (activeCustomPreset !== null) {
+                  actions.deleteCustomPreset(activeCustomPreset.name);
+                }
+              }}
+            >
+              Delete
+            </button>
+          </div>
+
+          <div className="field custom-preset-field">
+            <label className="field-label" htmlFor="custom-preset-name">
+              Save current settings as
+            </label>
+            <div className="inline-row">
+              <input
+                id="custom-preset-name"
+                className="text-input"
+                type="text"
+                aria-label="Custom preset name"
+                placeholder="Preset name"
+                maxLength={64}
+                value={presetName}
+                disabled={busy}
+                onChange={(event) => setPresetName(event.target.value)}
+              />
+              <button
+                type="button"
+                className="button"
+                disabled={busy || presetName.trim() === ''}
+                onClick={() => {
+                  actions.saveCustomPreset(presetName);
+                }}
+              >
+                Save preset
+              </button>
+            </div>
           </div>
         </div>
 
@@ -115,7 +204,14 @@ export function ControlsPanel() {
           <button
             type="button"
             className="button primary"
-            disabled={busy || state.sourceName === null}
+            disabled={
+              busy || state.queue.length === 0 || state.moduleStatus !== 'ready'
+            }
+            title={
+              state.queue.length > 1
+                ? `Convert all ${state.queue.length} queued files with the current settings`
+                : 'Convert the queued file with the current settings'
+            }
             onClick={() => actions.convert()}
           >
             Convert
@@ -130,6 +226,11 @@ export function ControlsPanel() {
             Cancel
           </button>
         </div>
+        {state.queue.length > 1 && (
+          <p className="hint convert-hint">
+            Converts all {state.queue.length} queued files with the current settings.
+          </p>
+        )}
       </footer>
     </section>
   );

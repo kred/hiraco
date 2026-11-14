@@ -317,7 +317,9 @@ limitations.
 A live build is published at https://kred.github.io/hiraco/.
 
 The repository ships a browser UI in `web/` that runs the full conversion in
-the browser.  Build and run it with:
+the browser.  It supports a multi-file queue, ORI companion pairing, synced
+settings across the queue, and named custom presets saved in the browser.
+Build and run it with:
 
 ```bash
 ./scripts/build_web.sh
