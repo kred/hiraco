@@ -5006,10 +5006,16 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     }
 
     std::error_code rename_error;
-    // On Windows rename does not replace an existing target.
-    std::filesystem::remove(output_fs_path, rename_error);
-    rename_error.clear();
     std::filesystem::rename(temporary_fs_path, output_fs_path, rename_error);
+    if (rename_error) {
+      // Windows does not replace an existing target with rename.  Try again
+      // after removing it, but only after the direct rename failed, so POSIX
+      // never loses the previous output.
+      std::error_code remove_error;
+      std::filesystem::remove(output_fs_path, remove_error);
+      rename_error.clear();
+      std::filesystem::rename(temporary_fs_path, output_fs_path, rename_error);
+    }
     if (rename_error) {
       remove_temporary();
       result.message = "could not publish the written DNG: " + rename_error.message();
