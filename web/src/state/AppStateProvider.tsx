@@ -14,9 +14,17 @@ import {
   type AppAction,
   type AppState,
   type PreviewBuffer,
+  type QueueItem,
   type SourceMetadata,
 } from './appState';
 import { previewMaxDimension } from '../lib/compare';
+import {
+  loadCustomPresets,
+  persistCustomPresets,
+  removeCustomPreset as removeSavedPreset,
+  sanitizeCustomPreset,
+  upsertCustomPreset,
+} from '../lib/customPresets';
 import {
   CancelledError,
   HiracoWasmClient,
@@ -48,29 +56,102 @@ const PREVIEW_DELAY_MS = 250;
 
 function reducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
-    case 'source-selected':
+    case 'queue-added':
+      return { ...state, queue: [...state.queue, ...action.items] };
+    case 'queue-updated':
       return {
         ...state,
-        sourceName: action.name,
+        queue: state.queue.map((item) =>
+          item.id === action.id ? { ...item, ...action.patch } : item,
+        ),
+      };
+    case 'queue-removed':
+      return {
+        ...state,
+        queue: state.queue.filter((item) => item.id !== action.id),
+      };
+    case 'queue-cleared':
+      return {
+        ...state,
+        queue: [],
+        selectedItemId: null,
+        sourceName: null,
+        companionName: null,
+        imageWidth: 0,
+        imageHeight: 0,
+        metadata: null,
         originalPreview: null,
         convertedPreview: null,
-        metadata: null,
         error: null,
-        activity: { state: 'idle', message: `Loaded ${action.name}`, fraction: null },
+        activity: { state: 'idle', message: 'Ready', fraction: null },
       };
-    case 'companion-selected':
-      return { ...state, companionName: action.name };
-    case 'source-prepared':
+    case 'selection-changed': {
+      if (action.id === null) {
+        return {
+          ...state,
+          selectedItemId: null,
+          sourceName: null,
+          companionName: null,
+          imageWidth: 0,
+          imageHeight: 0,
+          metadata: null,
+          originalPreview: null,
+          convertedPreview: null,
+          error: null,
+          activity: { state: 'idle', message: 'Ready', fraction: null },
+        };
+      }
+      const item = state.queue.find((entry) => entry.id === action.id);
+      if (item === undefined) {
+        return state;
+      }
+      const baseSettings = item.baseSettings ?? state.baseSettings;
+      const settings = applyOverrides(baseSettings, state.overrides);
+      const builtInPreset = presetForSettings(baseSettings, settings);
+      return {
+        ...state,
+        selectedItemId: item.id,
+        sourceName: item.sourceName,
+        companionName: item.companionName,
+        imageWidth: item.width,
+        imageHeight: item.height,
+        metadata: item.metadata,
+        baseSettings,
+        settings,
+        preset:
+          builtInPreset ??
+          (state.preset === 'custom' && state.activeCustomPreset !== null
+            ? 'custom'
+            : null),
+        originalPreview: null,
+        convertedPreview: null,
+        error: null,
+        activity: { state: 'idle', message: `Loading ${item.sourceName}`, fraction: null },
+      };
+    }
+    case 'custom-presets-changed':
+      return {
+        ...state,
+        customPresets: action.presets,
+        activeCustomPreset: action.active,
+      };
+    case 'source-prepared': {
+      const settings = applyOverrides(action.baseSettings, state.overrides);
+      const builtInPreset = presetForSettings(action.baseSettings, settings);
       return {
         ...state,
         imageWidth: action.width,
         imageHeight: action.height,
         metadata: action.metadata,
         baseSettings: action.baseSettings,
-        settings: action.baseSettings,
-        overrides: {},
-        preset: action.preset,
+        settings,
+        preset:
+          builtInPreset ??
+          (state.preset === 'custom' && state.activeCustomPreset !== null
+            ? 'custom'
+            : null),
       };
+    }
     case 'original-preview':
       return { ...state, originalPreview: action.preview };
     case 'converted-preview':
@@ -87,7 +168,7 @@ function reducer(state: AppState, action: AppAction): AppState {
         ...state,
         settings: action.settings,
         overrides: action.overrides,
-        preset: action.preset === 'custom' ? null : action.preset,
+        preset: action.preset,
       };
     case 'compression-changed':
       return { ...state, compression: action.compression };
@@ -199,15 +280,41 @@ function resultNameFor(sourceName: string): string {
   return `${stem}.dng`;
 }
 
+/** Case-insensitive file stem used to pair an ORF with its ORI companion. */
+function fileStem(name: string): string {
+  const dot = name.lastIndexOf('.');
+  return (dot > 0 ? name.slice(0, dot) : name).toLowerCase();
+}
+
+function fileExtension(name: string): string {
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? name.slice(dot).toLowerCase() : '';
+}
+
+function isCompanionName(name: string): boolean {
+  return fileExtension(name) === '.ori';
+}
+
 interface SourceFile {
   bytes: ArrayBuffer;
   name: string;
 }
 
+interface QueueFiles {
+  source: SourceFile;
+  companion: SourceFile | null;
+}
+
 interface AppActions {
-  /** Opens a RAW file and prepares it in the browser. */
-  selectSource(file: File): void;
-  /** Attaches or removes the ORI companion of the RAW file. */
+  /** Adds one or more RAW files, pairing ORI companions by file stem. */
+  addFiles(files: File[]): void;
+  /** Selects a queue entry and prepares it for preview. */
+  selectQueueItem(id: number): void;
+  /** Removes one queue entry. */
+  removeQueueItem(id: number): void;
+  /** Removes every queue entry. */
+  clearQueue(): void;
+  /** Attaches or removes the ORI companion of the selected RAW file. */
   selectCompanion(file: File | null): void;
   /** Changes one stage value and renders the converted preview again. */
   setStageValue(key: StageKey, value: number): void;
@@ -215,8 +322,15 @@ interface AppActions {
   applyPreset(preset: PresetId): void;
   /** Drops the overrides of one section. */
   resetSection(keys: StageKey[]): void;
-  resetPreset(): void;
-  /** Writes the Linear DNG in the browser. */
+  /** Selects a saved custom preset without applying it yet. */
+  selectCustomPreset(name: string | null): void;
+  /** Saves the current absolute settings under a name. */
+  saveCustomPreset(name: string): void;
+  /** Applies the named saved preset. */
+  loadCustomPreset(name: string): void;
+  /** Deletes the named saved preset. */
+  deleteCustomPreset(name: string): void;
+  /** Writes a Linear DNG for every queued file. */
   convert(): void;
   /** Stops the running conversion. */
   cancel(): void;
@@ -231,13 +345,28 @@ interface AppStateContextValue {
 const AppStateContext = createContext<AppStateContextValue | null>(null);
 
 export function AppStateProvider({ children }: { children: ReactNode }) {
-  const [state, dispatch] = useReducer(reducer, initialAppState);
+  const [state, dispatch] = useReducer(
+    reducer,
+    initialAppState,
+    (initial) => ({ ...initial, customPresets: loadCustomPresets() }),
+  );
   const clientRef = useRef<HiracoWasmClient | null>(null);
   const sourceRef = useRef<SourceFile | null>(null);
   const companionRef = useRef<SourceFile | null>(null);
   const sessionRef = useRef<boolean>(false);
   const stateRef = useRef(state);
   stateRef.current = state;
+  // File bytes are deliberately outside React state: a queue of large ORFs
+  // must not be copied by every reducer update.
+  const queueFiles = useRef<Map<number, QueueFiles>>(new Map());
+  const nextItemId = useRef(1);
+  const activeItemId = useRef<number | null>(null);
+  // Incremented by Clear all so an in-flight add cannot repopulate the queue.
+  const queueEpoch = useRef(0);
+  // Incremented whenever the selected queue entry changes; late preview/open
+  // replies from the previous entry are discarded instead of overwriting it.
+  const selectionGeneration = useRef(0);
+  const convertingRef = useRef(false);
 
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewRunning = useRef(false);
@@ -299,11 +428,15 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const renderConvertedPreview = useCallback(async (): Promise<void> => {
+    if (convertingRef.current) {
+      return;
+    }
     if (previewRunning.current) {
       previewPending.current = true;
       return;
     }
     previewRunning.current = true;
+    const generation = selectionGeneration.current;
     const started = beginPreviewJob();
     try {
       const overrides = stateRef.current.overrides;
@@ -316,8 +449,14 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         maxDimension,
         overridesToArray(overrides),
       );
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
       dispatch({ type: 'converted-preview', preview: previewFromBridge(preview) });
     } catch (error) {
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
       if (error instanceof ModuleCrashedError) {
         sessionRef.current = false;
       }
@@ -335,11 +474,15 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   }, [beginPreviewJob, client, endPreviewJob]);
 
   const renderOriginalPreview = useCallback(async (): Promise<void> => {
+    if (convertingRef.current) {
+      return;
+    }
     if (originalRunning.current) {
       originalPending.current = true;
       return;
     }
     originalRunning.current = true;
+    const generation = selectionGeneration.current;
     const started = beginPreviewJob();
     try {
       const maxDimension = previewMaxDimension(
@@ -348,7 +491,20 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         PREVIEW_MAX_DIMENSION,
       );
       const preview = await client().originalPreview(maxDimension);
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
       dispatch({ type: 'original-preview', preview: previewFromBridge(preview) });
+    } catch (error) {
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
+      if (error instanceof ModuleCrashedError) {
+        sessionRef.current = false;
+      }
+      if (!(error instanceof CancelledError)) {
+        dispatch({ type: 'error', message: messageOf(error) });
+      }
     } finally {
       originalRunning.current = false;
       endPreviewJob(started);
@@ -371,12 +527,19 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const openSession = useCallback(async (): Promise<void> => {
     const source = sourceRef.current;
-    if (source === null) {
+    const itemId = activeItemId.current;
+    if (source === null || itemId === null) {
       return;
     }
+    const generation = selectionGeneration.current;
     dispatch({
       type: 'activity',
       activity: { state: 'working', message: 'Preparing the image…', fraction: null },
+    });
+    dispatch({
+      type: 'queue-updated',
+      id: itemId,
+      patch: { status: 'working', message: 'Preparing…' },
     });
     sessionLoading.current = true;
     try {
@@ -387,41 +550,75 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         companion?.bytes,
         companion?.name,
       );
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
       sessionRef.current = true;
       const baseValues = await client().resolvedSettings(
         overridesToArray({}),
       );
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
       const baseSettings = settingsFromValues(baseValues);
+      const metadata = metadataFromBridge(opened.metadata);
       dispatch({
         type: 'source-prepared',
         width: opened.width,
         height: opened.height,
-        metadata: metadataFromBridge(opened.metadata),
+        metadata,
         baseSettings,
-        // The neutral settings are the medium preset, so its button is shown
-        // as selected, matching what the native GUI does on load.
-        preset: presetForSettings(baseSettings, baseSettings),
+      });
+      dispatch({
+        type: 'queue-updated',
+        id: itemId,
+        patch: {
+          status: 'ready',
+          message: null,
+          width: opened.width,
+          height: opened.height,
+          metadata,
+          baseSettings,
+        },
       });
       await renderOriginalPreview();
       await renderConvertedPreview();
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
       dispatch({
         type: 'activity',
         activity: { state: 'idle', message: 'Ready', fraction: null },
       });
     } catch (error) {
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
       sessionRef.current = false;
       if (error instanceof CancelledError) {
+        dispatch({
+          type: 'queue-updated',
+          id: itemId,
+          patch: { status: 'cancelled', message: 'Cancelled' },
+        });
         dispatch({
           type: 'activity',
           activity: { state: 'idle', message: 'Cancelled', fraction: null },
         });
         return;
       }
+      dispatch({
+        type: 'queue-updated',
+        id: itemId,
+        patch: { status: 'error', message: messageOf(error) },
+      });
       dispatch({ type: 'error', message: messageOf(error) });
     } finally {
-      sessionLoading.current = false;
+      if (generation === selectionGeneration.current) {
+        sessionLoading.current = false;
+      }
     }
-  }, [client, renderConvertedPreview]);
+  }, [client, renderConvertedPreview, renderOriginalPreview]);
 
   const schedulePreview = useCallback(() => {
     if (previewTimer.current !== null) {
@@ -506,39 +703,214 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const selectSource = useCallback(
-    (file: File) => {
-      void file.arrayBuffer().then((bytes) => {
-        sourceRef.current = { bytes, name: file.name };
-        companionRef.current = null;
-        sessionRef.current = false;
-        dispatch({ type: 'source-selected', name: file.name });
-        dispatch({ type: 'companion-selected', name: null });
-        void openSession();
-      }).catch((error: unknown) => {
-        dispatch({ type: 'error', message: messageOf(error) });
-      });
+  const activateItem = useCallback(
+    (id: number | null, announce: boolean) => {
+      selectionGeneration.current += 1;
+      activeItemId.current = id;
+      const files = id === null ? undefined : queueFiles.current.get(id);
+      sourceRef.current = files?.source ?? null;
+      companionRef.current = files?.companion ?? null;
+      sessionRef.current = false;
+      if (previewTimer.current !== null) {
+        clearTimeout(previewTimer.current);
+        previewTimer.current = null;
+      }
+      previewPending.current = false;
+      if (announce) {
+        dispatch({ type: 'selection-changed', id });
+      }
     },
-    [openSession],
+    [dispatch],
   );
+
+  const addFiles = useCallback(
+    (files: File[]) => {
+      if (files.length === 0) {
+        return;
+      }
+      const epoch = queueEpoch.current;
+      void Promise.all(
+        files.map(async (file) => ({ file, bytes: await file.arrayBuffer() })),
+      )
+        .then((entries) => {
+          if (epoch !== queueEpoch.current) {
+            return;
+          }
+          const companions = new Map<string, { file: File; bytes: ArrayBuffer }>();
+          const sources: { file: File; bytes: ArrayBuffer }[] = [];
+          for (const entry of entries) {
+            if (isCompanionName(entry.file.name)) {
+              companions.set(fileStem(entry.file.name), entry);
+            } else {
+              sources.push(entry);
+            }
+          }
+          // An ORI without a matching RAW is a valid source in its own right.
+          for (const entry of entries) {
+            if (
+              isCompanionName(entry.file.name) &&
+              !sources.some((source) => fileStem(source.file.name) === fileStem(entry.file.name))
+            ) {
+              sources.push(entry);
+            }
+          }
+
+          const newItems: QueueItem[] = [];
+          let selectedCompanionChanged = false;
+          for (const source of sources) {
+            const companion = companions.get(fileStem(source.file.name));
+            const companionFile =
+              companion === undefined || companion.file.name === source.file.name
+                ? null
+                : { bytes: companion.bytes, name: companion.file.name };
+
+            // Native AddFiles skips a file name that is already queued; do the
+            // same, but attach a newly supplied companion if one is missing.
+            const existingId = Array.from(queueFiles.current.entries()).find(
+              ([, files]) => files.source.name === source.file.name,
+            )?.[0];
+            if (existingId !== undefined) {
+              const existing = queueFiles.current.get(existingId);
+              if (existing !== undefined && companionFile !== null && existing.companion === null) {
+                existing.companion = companionFile;
+                dispatch({
+                  type: 'queue-updated',
+                  id: existingId,
+                  patch: { companionName: companionFile.name },
+                });
+                if (activeItemId.current === existingId) {
+                  companionRef.current = companionFile;
+                  sessionRef.current = false;
+                  selectedCompanionChanged = true;
+                }
+              }
+              continue;
+            }
+
+            const id = nextItemId.current;
+            nextItemId.current += 1;
+            queueFiles.current.set(id, {
+              source: { bytes: source.bytes, name: source.file.name },
+              companion: companionFile,
+            });
+            newItems.push({
+              id,
+              sourceName: source.file.name,
+              companionName: companionFile?.name ?? null,
+              status: 'pending',
+              message: null,
+              width: 0,
+              height: 0,
+              metadata: null,
+              baseSettings: null,
+            });
+          }
+
+          if (newItems.length > 0) {
+            dispatch({ type: 'queue-added', items: newItems });
+          }
+          if (activeItemId.current === null && newItems.length > 0) {
+            activateItem(newItems[0].id, true);
+            void openSession();
+          } else if (selectedCompanionChanged) {
+            void openSession();
+          }
+        })
+        .catch((error: unknown) => {
+          dispatch({ type: 'error', message: messageOf(error) });
+        });
+    },
+    [activateItem, dispatch, openSession],
+  );
+
+  const selectQueueItem = useCallback(
+    (id: number) => {
+      if (convertingRef.current) {
+        return;
+      }
+      if (id === activeItemId.current && sessionRef.current) {
+        return;
+      }
+      if (!queueFiles.current.has(id)) {
+        return;
+      }
+      activateItem(id, true);
+      void openSession();
+    },
+    [activateItem, openSession],
+  );
+
+  const removeQueueItem = useCallback(
+    (id: number) => {
+      if (convertingRef.current) {
+        return;
+      }
+      const currentQueue = stateRef.current.queue;
+      const index = currentQueue.findIndex((item) => item.id === id);
+      queueFiles.current.delete(id);
+      dispatch({ type: 'queue-removed', id });
+      if (activeItemId.current !== id) {
+        return;
+      }
+      const remaining = currentQueue.filter((item) => item.id !== id);
+      const next = remaining[Math.min(Math.max(index, 0), remaining.length - 1)];
+      if (next !== undefined) {
+        activateItem(next.id, true);
+        void openSession();
+      } else {
+        activateItem(null, true);
+        client().cancel();
+      }
+    },
+    [activateItem, client, dispatch, openSession],
+  );
+
+  const clearQueue = useCallback(() => {
+    if (convertingRef.current) {
+      return;
+    }
+    queueFiles.current.clear();
+    queueEpoch.current += 1;
+    activateItem(null, true);
+    dispatch({ type: 'queue-cleared' });
+    // Terminating the worker also removes the staged session files.
+    client().cancel();
+  }, [activateItem, client, dispatch]);
 
   const selectCompanion = useCallback(
     (file: File | null) => {
+      const id = activeItemId.current;
+      const files = id === null ? undefined : queueFiles.current.get(id);
+      if (id === null || files === undefined) {
+        return;
+      }
       if (file === null) {
+        files.companion = null;
         companionRef.current = null;
-        dispatch({ type: 'companion-selected', name: null });
+        dispatch({ type: 'queue-updated', id, patch: { companionName: null } });
+        sessionRef.current = false;
         void openSession();
         return;
       }
       void file.arrayBuffer().then((bytes) => {
-        companionRef.current = { bytes, name: file.name };
-        dispatch({ type: 'companion-selected', name: file.name });
+        if (activeItemId.current !== id || queueFiles.current.get(id) !== files) {
+          return;
+        }
+        const companion = { bytes, name: file.name };
+        files.companion = companion;
+        companionRef.current = companion;
+        dispatch({
+          type: 'queue-updated',
+          id,
+          patch: { companionName: file.name },
+        });
+        sessionRef.current = false;
         void openSession();
       }).catch((error: unknown) => {
         dispatch({ type: 'error', message: messageOf(error) });
       });
     },
-    [openSession],
+    [dispatch, openSession],
   );
 
   const setStageValue = useCallback(
@@ -559,6 +931,20 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     (preset: PresetId) => {
       const current = stateRef.current;
       if (preset === 'custom') {
+        const saved = current.customPresets.find(
+          (entry) => entry.name === current.activeCustomPreset,
+        );
+        if (saved === undefined) {
+          return;
+        }
+        const overrides = makeExplicitOverrides(saved.settings);
+        dispatch({
+          type: 'preset-applied',
+          preset: 'custom',
+          settings: saved.settings,
+          overrides,
+        });
+        schedulePreview();
         return;
       }
       const strength = PRESET_STRENGTH[preset];
@@ -576,16 +962,82 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     [schedulePreview],
   );
 
-  const resetPreset = useCallback(() => {
-    const current = stateRef.current;
-    dispatch({
-      type: 'preset-applied',
-      preset: 'custom',
-      settings: current.baseSettings,
-      overrides: {},
-    });
-    schedulePreview();
-  }, [schedulePreview]);
+  const selectCustomPreset = useCallback(
+    (name: string | null) => {
+      dispatch({
+        type: 'custom-presets-changed',
+        presets: stateRef.current.customPresets,
+        active: name,
+      });
+    },
+    [dispatch],
+  );
+
+  const saveCustomPreset = useCallback(
+    (name: string) => {
+      const current = stateRef.current;
+      const preset = sanitizeCustomPreset({ name, settings: current.settings });
+      if (preset === null) {
+        dispatch({ type: 'error', message: 'Enter a preset name of 64 characters or fewer.' });
+        return;
+      }
+      const presets = upsertCustomPreset(current.customPresets, preset);
+      persistCustomPresets(presets);
+      const overrides = makeExplicitOverrides(preset.settings);
+      dispatch({ type: 'custom-presets-changed', presets, active: preset.name });
+      dispatch({
+        type: 'preset-applied',
+        preset: 'custom',
+        settings: preset.settings,
+        overrides,
+      });
+      schedulePreview();
+    },
+    [dispatch, schedulePreview],
+  );
+
+  const loadCustomPreset = useCallback(
+    (name: string) => {
+      const current = stateRef.current;
+      const preset = current.customPresets.find((entry) => entry.name === name);
+      if (preset === undefined) {
+        return;
+      }
+      const overrides = makeExplicitOverrides(preset.settings);
+      dispatch({
+        type: 'custom-presets-changed',
+        presets: current.customPresets,
+        active: preset.name,
+      });
+      dispatch({
+        type: 'preset-applied',
+        preset: 'custom',
+        settings: preset.settings,
+        overrides,
+      });
+      schedulePreview();
+    },
+    [dispatch, schedulePreview],
+  );
+
+  const deleteCustomPreset = useCallback(
+    (name: string) => {
+      const current = stateRef.current;
+      const presets = removeSavedPreset(current.customPresets, name);
+      const active =
+        current.activeCustomPreset === name ? null : current.activeCustomPreset;
+      persistCustomPresets(presets);
+      dispatch({ type: 'custom-presets-changed', presets, active });
+      if (current.activeCustomPreset === name && current.preset === 'custom') {
+        dispatch({
+          type: 'settings-changed',
+          settings: current.settings,
+          overrides: current.overrides,
+        });
+      }
+    },
+    [dispatch],
+  );
 
   const resetSection = useCallback(
     (keys: StageKey[]) => {
@@ -606,52 +1058,129 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   );
 
   const convert = useCallback(async () => {
-    const current = stateRef.current;
     const source = sourceRef.current;
-    if (source === null) {
+    const snapshot = stateRef.current;
+    const items = [...snapshot.queue];
+    if (items.length === 0 || source === null) {
       dispatch({ type: 'error', message: 'Load a RAW file first.' });
       return;
     }
-    if (!sessionRef.current) {
-      await openSession();
-      // openSession reports its own error and leaves the session unusable;
-      // starting a conversion anyway would only fail with "unknown session".
-      if (!sessionRef.current) {
-        return;
-      }
+    if (convertingRef.current) {
+      return;
     }
+    convertingRef.current = true;
+    if (previewTimer.current !== null) {
+      clearTimeout(previewTimer.current);
+      previewTimer.current = null;
+    }
+    previewPending.current = false;
+    const overrides = overridesToArray(snapshot.overrides);
+    const compression = snapshot.compression;
+    let converted = 0;
+    let failed = 0;
+    let cancelled = false;
     try {
-      dispatch({
-        type: 'activity',
-        activity: { state: 'working', message: 'Converting…', fraction: null },
-      });
-      const dng = await client().convert(
-        current.compression,
-        overridesToArray(stateRef.current.overrides),
-      );
-      const name = resultNameFor(source.name);
-      const blob = new Blob([dng], { type: 'image/x-adobe-dng' });
-      // The native application writes the file when the conversion ends,
-      // so the browser hands it over as a download right away.
-      saveFile(blob, name);
-      dispatch({
-        type: 'activity',
-        activity: { state: 'done', message: `Wrote ${name}`, fraction: 1 },
-      });
-    } catch (error) {
-      if (error instanceof ModuleCrashedError) {
-        sessionRef.current = false;
-      }
-      if (error instanceof CancelledError) {
+      for (let index = 0; index < items.length; index += 1) {
+        const item = items[index];
+        const files = queueFiles.current.get(item.id);
+        if (files === undefined) {
+          failed += 1;
+          dispatch({
+            type: 'queue-updated',
+            id: item.id,
+            patch: { status: 'error', message: 'The source file is no longer available.' },
+          });
+          continue;
+        }
         dispatch({
           type: 'activity',
-          activity: { state: 'idle', message: 'Cancelled', fraction: null },
+          activity: {
+            state: 'working',
+            message: `Converting ${index + 1} of ${items.length}: ${item.sourceName}`,
+            fraction: index / items.length,
+          },
         });
-        return;
+        dispatch({
+          type: 'queue-updated',
+          id: item.id,
+          patch: { status: 'working', message: 'Preparing…' },
+        });
+        try {
+          const opened = await client().open(
+            files.source.bytes,
+            files.source.name,
+            files.companion?.bytes,
+            files.companion?.name,
+          );
+          const baseValues = await client().resolvedSettings(overridesToArray({}));
+          const baseSettings = settingsFromValues(baseValues);
+          const metadata = metadataFromBridge(opened.metadata);
+          dispatch({
+            type: 'queue-updated',
+            id: item.id,
+            patch: {
+              status: 'working',
+              message: 'Converting…',
+              width: opened.width,
+              height: opened.height,
+              metadata,
+              baseSettings,
+            },
+          });
+          const dng = await client().convert(compression, overrides);
+          const name = resultNameFor(files.source.name);
+          saveFile(new Blob([dng], { type: 'image/x-adobe-dng' }), name);
+          converted += 1;
+          dispatch({
+            type: 'queue-updated',
+            id: item.id,
+            patch: { status: 'done', message: `Saved ${name}` },
+          });
+        } catch (error) {
+          if (error instanceof CancelledError) {
+            cancelled = true;
+            dispatch({
+              type: 'queue-updated',
+              id: item.id,
+              patch: { status: 'cancelled', message: 'Cancelled' },
+            });
+            break;
+          }
+          if (error instanceof ModuleCrashedError) {
+            sessionRef.current = false;
+          }
+          failed += 1;
+          dispatch({
+            type: 'queue-updated',
+            id: item.id,
+            patch: { status: 'error', message: messageOf(error) },
+          });
+        }
+        // Give the browser a moment between automatic downloads; otherwise it
+        // may treat the batch as a pop-up/download burst and block the later
+        // files.
+        await new Promise((resolve) => setTimeout(resolve, 120));
       }
-      dispatch({ type: 'error', message: messageOf(error) });
+    } finally {
+      convertingRef.current = false;
+      // The worker now holds the last converted session, not necessarily the
+      // selected one.  The next preview action reopens the selected item.
+      sessionRef.current = false;
+      const message = cancelled
+        ? 'Cancelled'
+        : failed > 0
+          ? `Converted ${converted} of ${items.length} files · ${failed} failed`
+          : `Wrote ${converted} DNG file${converted === 1 ? '' : 's'}`;
+      dispatch({
+        type: 'activity',
+        activity: {
+          state: cancelled ? 'idle' : failed > 0 ? 'error' : 'done',
+          message,
+          fraction: cancelled ? null : 1,
+        },
+      });
     }
-  }, [client, openSession]);
+  }, [client, dispatch]);
 
   const cancel = useCallback(() => {
     // The conversion runs inside the module, so the worker is stopped to end
@@ -683,22 +1212,35 @@ function saveFile(blob: Blob, name: string): void {
 
 const actions = useMemo<AppActions>(
     () => ({
-      selectSource,
+      addFiles,
+      selectQueueItem,
+      removeQueueItem,
+      clearQueue,
       selectCompanion,
       setStageValue,
       applyPreset,
       resetSection,
-      resetPreset,
+      selectCustomPreset,
+      saveCustomPreset,
+      loadCustomPreset,
+      deleteCustomPreset,
       convert: () => void convert(),
       cancel,
     }),
     [
+      addFiles,
       applyPreset,
       cancel,
+      clearQueue,
       convert,
+      deleteCustomPreset,
+      loadCustomPreset,
+      removeQueueItem,
       resetSection,
+      saveCustomPreset,
       selectCompanion,
-      selectSource,
+      selectCustomPreset,
+      selectQueueItem,
       setStageValue,
     ],
   );

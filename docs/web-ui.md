@@ -7,6 +7,22 @@ hiraco conversion in the browser.  The browser loads the `hiraco-wasm`
 module, prepares the RAW file, renders the previews, applies the presets and
 sliders and writes the Linear DNG, all without uploading the file anywhere.
 
+## Queue and presets
+
+Several RAW files can be queued at once.  ORI files added in the same batch are
+paired automatically with the RAW file of the same name (an ORI added on its
+own is treated as a source).  The selected queue entry is the one shown in the
+preview, but presets and sliders are global: changing them applies to every
+queued file, matching the native queue's "paste settings to all images"
+workflow.  `Convert` writes one DNG for every queued file, sequentially.
+
+The preset row has the native Small, Medium and Strong settings, a Custom
+button, and a saved-preset manager.  Enter a name and `Save preset` to store the
+current absolute slider values in `localStorage`; select a saved name and use
+`Load` (or the Custom preset button) to apply it.  Saved presets survive a page
+reload and are validated/clamped when read back.
+
+
 ## Requirements
 
 - Node.js 24 or newer

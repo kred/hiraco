@@ -5,6 +5,7 @@ import {
   type StageOverrides,
   type StageSettings,
 } from '../lib/stageSettings';
+import type { CustomPreset } from '../lib/customPresets';
 
 export type CompressionMode = 'uncompressed' | 'deflate' | 'jpeg-xl';
 
@@ -53,7 +54,31 @@ export interface Activity {
   fraction: number | null;
 }
 
+export type QueueStatus =
+  | 'pending'
+  | 'ready'
+  | 'working'
+  | 'done'
+  | 'error'
+  | 'cancelled';
+
+/** One source in the conversion queue.  The bytes live in a ref, not here. */
+export interface QueueItem {
+  id: number;
+  sourceName: string;
+  companionName: string | null;
+  status: QueueStatus;
+  message: string | null;
+  width: number;
+  height: number;
+  metadata: SourceMetadata | null;
+  baseSettings: StageSettings | null;
+}
+
 export interface AppState {
+  /** The files queued for conversion and preview. */
+  queue: QueueItem[];
+  selectedItemId: number | null;
   sourceName: string | null;
   companionName: string | null;
   imageWidth: number;
@@ -67,6 +92,10 @@ export interface AppState {
   settings: StageSettings;
   overrides: StageOverrides;
   preset: PresetId | null;
+  /** User-named absolute settings, persisted in localStorage. */
+  customPresets: CustomPreset[];
+  /** The saved preset selected in the custom-preset picker. */
+  activeCustomPreset: string | null;
   compression: CompressionMode;
   compareMode: CompareMode;
   zoomMode: ZoomMode;
@@ -80,6 +109,8 @@ export interface AppState {
 }
 
 export const initialAppState: AppState = {
+  queue: [],
+  selectedItemId: null,
   sourceName: null,
   companionName: null,
   imageWidth: 0,
@@ -91,6 +122,8 @@ export const initialAppState: AppState = {
   settings: DEFAULT_STAGE_SETTINGS,
   overrides: {},
   preset: null,
+  customPresets: [],
+  activeCustomPreset: null,
   compression: 'deflate',
   compareMode: 'converted',
   zoomMode: 'fit',
@@ -102,9 +135,13 @@ export const initialAppState: AppState = {
 };
 
 export type AppAction =
-  | { type: 'source-selected'; name: string }
-  | { type: 'companion-selected'; name: string | null }
-  | { type: 'source-prepared'; width: number; height: number; metadata: SourceMetadata; baseSettings: StageSettings; preset: PresetId | null }
+  | { type: 'queue-added'; items: QueueItem[] }
+  | { type: 'queue-updated'; id: number; patch: Partial<Omit<QueueItem, 'id'>> }
+  | { type: 'queue-removed'; id: number }
+  | { type: 'queue-cleared' }
+  | { type: 'selection-changed'; id: number | null }
+  | { type: 'custom-presets-changed'; presets: CustomPreset[]; active: string | null }
+  | { type: 'source-prepared'; width: number; height: number; metadata: SourceMetadata; baseSettings: StageSettings }
   | { type: 'original-preview'; preview: PreviewBuffer }
   | { type: 'converted-preview'; preview: PreviewBuffer }
   | { type: 'settings-changed'; settings: StageSettings; overrides: StageOverrides }
