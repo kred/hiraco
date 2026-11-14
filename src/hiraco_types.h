@@ -2,9 +2,18 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
+
+// std::isfinite is not consistently visible through the bundled DNG/LibRaw
+// headers on every GCC/libstdc++ version, so keep one dependency-free check.
+inline bool IsFiniteNumber(double value) {
+  return value == value &&
+         value >= -std::numeric_limits<double>::max() &&
+         value <= std::numeric_limits<double>::max();
+}
 
 struct DngWriteResult {
   bool ok = false;

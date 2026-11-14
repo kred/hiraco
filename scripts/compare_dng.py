@@ -71,7 +71,6 @@ VOLATILE_TAGS = {
     315,  # Artist
     316,  # HostComputer
     33723,  # IPTC
-    50708,  # UniqueCameraModel (contains a serial-derived token)
     700,  # XMP metadata packet
 }
 

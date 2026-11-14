@@ -206,22 +206,30 @@ Examples:
 enables ORI-assisted highlight recovery when a companion file is detected next to
 the source; it is off by default and has no effect when no companion is found.
 
-The WebAssembly build does not find a companion file, because the conversion
-runs on a buffer rather than on a directory, so `--hl-rec` has no effect there.
+The `hiraco-wasm` Node command line build finds a companion file next to the
+source like the native build does, because it runs on the real file system.
+The browser module cannot: it converts buffers and the page picks the companion
+explicitly, so `--hl-rec` only affects the Node build.
 
 The WebAssembly build is slower than the native one - roughly twice as long on
 a 5220 x 3912 capture - because its FFTW has no SIMD codelets and the
 demosaic runs without OpenMP.
 
 The browser module takes the RAW data as a buffer and returns the DNG as a
-buffer, so a page never needs a file system:
+buffer, so a page never needs a file system.  The generated glue is CommonJS;
+in Node it can be loaded like this:
 
 ```js
-const createModule = await import('./build-wasm/hiraco-wasm.js');
-const module = await createModule();
-// ... fill the heap with the RAW data, call _hiraco_wasm_convert, read the
-// DNG back out of the heap.  See tests/wasm_convert_harness.js.
+const createModule = require('./build-wasm/hiraco-wasm.js');
+
+createModule().then((module) => {
+  // ... fill the heap with the RAW data, call _hiraco_wasm_convert, read the
+  // DNG back out of the heap.  See tests/wasm_convert_harness.js.
+});
 ```
+
+In a browser the worker loads the same glue as a classic script, where it
+defines the `hiracoWasm` factory (see `web/public/wasm/hiraco-worker.js`).
 
 ### GUI
 
@@ -255,6 +263,10 @@ ctest --test-dir build/relwithdebinfo --output-on-failure
 ```
 
 The test target currently covers core-library behavior rather than full GUI automation.
+The `.ORF`/`.ORI` fixtures are gitignored, so the fixture-dependent tests fail on a
+clean checkout until `reference/` and `sample/` are populated (see
+`.github/workflows/wasm.yml` for the `HIRACO_FIXTURE_URL` download).  The
+fixture-free tests run first; the binary then stops at the first missing fixture.
 
 ### Verifying the WebAssembly build
 

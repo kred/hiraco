@@ -14,12 +14,6 @@ int hiraco_wasm_is_dng_sdk_enabled(void);
 /// A static string describing the DNG writer support of this build.
 const char* hiraco_wasm_get_dng_status(void);
 
-/// Writes a one line summary of the writer configuration for `compression`
-/// into `out_buffer`.  Returns the number of bytes written, excluding the
-/// terminating null, or 0 if the buffer is unusable.
-int hiraco_wasm_get_writer_summary(char* out_buffer, size_t out_buffer_size,
-                                  const char* compression);
-
 /// Converts a RAW file to a Linear DNG entirely in memory.
 ///
 /// `raw_bytes` holds `raw_size` bytes of RAW data and `input_name` is the
@@ -83,11 +77,6 @@ int hiraco_wasm_get_image_size(uint32_t session_id, uint32_t* out_width, uint32_
 /// unknown.
 int hiraco_wasm_get_metadata_json(uint32_t session_id, char* out_buffer, size_t out_buffer_size);
 
-/// Turns highlight recovery on or off for the session.  Returns 0 on
-/// success.  The setting has no effect while the session holds no
-/// companion file.
-int hiraco_wasm_set_highlight_recovery(uint32_t session_id, int enabled);
-
 /// Renders the original preview of the prepared source.
 ///
 /// The result is an RGBA image whose longest edge is at most `max_dimension`
@@ -141,14 +130,6 @@ int hiraco_wasm_get_resolved_stage_settings(uint32_t session_id,
 int hiraco_wasm_convert_session(uint32_t session_id, const char* compression,
                                 const double* stage_overrides, size_t stage_override_count,
                                 uint8_t** out_dng, size_t* out_size);
-
-/// Asks the session to stop at the next cancellation point.
-///
-/// A browser cannot call into the module while a conversion is running, so
-/// the web application aborts a running conversion by replacing the worker
-/// that runs it.  This call is the cooperative half of that: it takes effect
-/// at the cancellation points the conversion itself checks.
-void hiraco_wasm_request_cancel(uint32_t session_id);
 
 #ifdef __cplusplus
 }

@@ -96,9 +96,11 @@ bool RenderConvertedCrop(PreparedSource* prepared,
                          CancelCheck cancel = {},
                          std::string* error_message = nullptr);
 
-// Renders the same processing result used by conversion as a display-sized,
-// oriented full-frame preview. The longest output edge is capped at
-// max_dimension and matching requests are cached on the prepared source.
+// Renders the same processing result used by conversion as an oriented
+// full-frame preview.  The expensive stages run once against the
+// full-resolution raster and the result is cached on the prepared source;
+// max_dimension (0 = uncapped) only controls the size of the returned copy,
+// which is produced by resizing the cached full preview.
 bool RenderConvertedFullPreview(PreparedSource* prepared,
                                 const StageOverrideSet& stage_overrides,
                                 uint32_t max_dimension,
@@ -131,6 +133,12 @@ CropRect CenterCropRect(uint32_t image_width,
 std::filesystem::path ResolveOutputPath(const std::string& source_path,
                                         const std::filesystem::path& base_output_dir,
                                         const std::filesystem::path& relative_subdir);
+
+// Whether two paths name the same file, including through symlinks, hard links
+// or a not-yet-existing target reached by different spellings.  Used to refuse
+// conversions whose output would overwrite the source RAW.
+bool PathsReferToSameFile(const std::filesystem::path& left,
+                          const std::filesystem::path& right);
 
 OverwriteDecision ResolveOverwriteDecision(OverwritePolicy current_policy,
                                            bool target_exists,

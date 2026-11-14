@@ -47,7 +47,7 @@ for fixture in "${fixtures[@]}"; do
     echo "error: missing fixture: ${source_path}" >&2
     exit 2
   fi
-  target_path="${out_dir}/${fixture%.*}.dng"
+  target_path="${out_dir}/${fixture%.*}-${mode}.dng"
   echo "=== ${fixture} -> ${target_path}"
   "${cli}" convert "${source_path}" "${target_path}" --compression "${mode}"
 done

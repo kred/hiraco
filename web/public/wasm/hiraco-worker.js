@@ -55,12 +55,34 @@ function toPointer(value) {
 }
 
 function readSize(pointer) {
+  if (!pointer) {
+    return 0;
+  }
   return Number(heap().getBigUint64(pointer, true));
 }
 
 function writeBytes(bytes) {
-  const pointer = module._malloc(bytes.length);
+  const pointer = allocate(bytes.length);
   module.HEAPU8.set(bytes, pointer);
+  return pointer;
+}
+
+// Every allocation goes through this helper.  With ALLOW_MEMORY_GROWTH a
+// failed malloc returns 0 instead of aborting, and the previous code then
+// copied the whole RAW over address zero.
+function allocate(bytes) {
+  const pointer = module._malloc(bytes);
+  if (!pointer && bytes !== 0) {
+    throw new Error(`out of memory while allocating ${bytes} bytes`);
+  }
+  return pointer;
+}
+
+function toUtf8(value) {
+  const pointer = module.stringToNewUTF8(value);
+  if (!pointer) {
+    throw new Error('out of memory while encoding a string');
+  }
   return pointer;
 }
 
@@ -76,6 +98,16 @@ function freeScratch(...pointers) {
 }
 
 function copyOut(pointer, size) {
+  if (!pointer || size === 0) {
+    return new ArrayBuffer(0);
+  }
+  if (pointer + size > module.HEAPU8.length) {
+    // A stale heap view would silently truncate the DNG, and the page cannot
+    // tell a short file from a corrupt one.
+    throw new Error(
+      `the native buffer [${pointer}, ${pointer + size}) is outside the ${module.HEAPU8.length} byte heap`,
+    );
+  }
   return module.HEAPU8.slice(pointer, pointer + size).buffer;
 }
 
@@ -87,7 +119,7 @@ function stageOverrides(overrides) {
       values[index] = typeof value === 'number' ? value : Number.NaN;
     }
   }
-  const pointer = module._malloc(values.byteLength);
+  const pointer = allocate(values.byteLength);
   module.HEAPU8.set(new Uint8Array(values.buffer), pointer);
   return pointer;
 }
@@ -126,7 +158,7 @@ async function init() {
 function openSession(request) {
   const raw = new Uint8Array(request.raw);
   const rawPointer = writeBytes(raw);
-  const rawNamePointer = module.stringToNewUTF8(request.rawName || 'input.raw');
+  const rawNamePointer = toUtf8(request.rawName || 'input.raw');
 
   let companionPointer = 0;
   let companionSize = 0;
@@ -135,12 +167,12 @@ function openSession(request) {
     const companion = new Uint8Array(request.companion);
     companionSize = companion.length;
     companionPointer = writeBytes(companion);
-    companionNamePointer = module.stringToNewUTF8(request.companionName || 'companion.ori');
+    companionNamePointer = toUtf8(request.companionName || 'companion.ori');
   }
 
-  const widthPointer = module._malloc(4);
-  const heightPointer = module._malloc(4);
-  const metadataPointer = module._malloc(64 * 1024);
+  const widthPointer = allocate(4);
+  const heightPointer = allocate(4);
+  const metadataPointer = allocate(64 * 1024);
   try {
     // open_session stages the input in the virtual file system and copies
     // the names, so the buffers above are only handed over and are released
@@ -180,12 +212,12 @@ function openSession(request) {
 }
 
 function renderPreview(request) {
-  const pixelsPointer = module._malloc(8);
-  const sizePointer = module._malloc(8);
-  const widthPointer = module._malloc(4);
-  const heightPointer = module._malloc(4);
-  const maskPointer = module._malloc(8);
-  const maskSizePointer = module._malloc(8);
+  const pixelsPointer = allocate(8);
+  const sizePointer = allocate(8);
+  const widthPointer = allocate(4);
+  const heightPointer = allocate(4);
+  const maskPointer = allocate(8);
+  const maskSizePointer = allocate(8);
   const overridesPointer = stageOverrides(request.overrides);
 
   try {
@@ -256,7 +288,7 @@ function renderPreview(request) {
 
 function resolveSettings(request) {
   const overridesPointer = stageOverrides(request.overrides);
-  const valuesPointer = module._malloc(STAGE_VALUE_COUNT * 8);
+  const valuesPointer = allocate(STAGE_VALUE_COUNT * 8);
   try {
     const status = module._hiraco_wasm_get_resolved_stage_settings(
       sessionId,
@@ -279,9 +311,9 @@ function resolveSettings(request) {
 
 function convert(request) {
   const overridesPointer = stageOverrides(request.overrides);
-  const compressionPointer = module.stringToNewUTF8(request.compression || 'deflate');
-  const outPointerPointer = module._malloc(8);
-  const outSizePointer = module._malloc(8);
+  const compressionPointer = toUtf8(request.compression || 'deflate');
+  const outPointerPointer = allocate(8);
+  const outSizePointer = allocate(8);
   try {
     const status = module._hiraco_wasm_convert_session(
       sessionId,
@@ -305,18 +337,6 @@ function convert(request) {
   }
 }
 
-function writerSummary(request) {
-  const summaryPointer = module._malloc(4096);
-  const compressionPointer = module.stringToNewUTF8(request.compression || 'deflate');
-  try {
-    const length = module._hiraco_wasm_get_writer_summary(
-      BigInt(summaryPointer), BigInt(4096), BigInt(compressionPointer));
-    reply({ type: 'summary', text: length > 0 ? module.UTF8ToString(summaryPointer, length) : '' });
-  } finally {
-    freeScratch(summaryPointer, compressionPointer);
-  }
-}
-
 function installDriver() {
 self.onmessage = async (event) => {
   const request = event.data || {};
@@ -335,19 +355,8 @@ self.onmessage = async (event) => {
       case 'settings':
         resolveSettings(request);
         break;
-      case 'summary':
-        writerSummary(request);
-        break;
       case 'convert':
         convert(request);
-        break;
-      case 'cancel':
-        // The conversion runs inside the module, so the request only
-        // reaches it between two operations.
-        if (sessionId) {
-          module._hiraco_wasm_request_cancel(sessionId);
-        }
-        reply({ type: 'cancelled' });
         break;
       case 'close':
         if (sessionId) {

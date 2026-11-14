@@ -41,8 +41,9 @@ levels:
    hiding behind a pixel delta.
 2. **Pixels** — the samples of the full-size raw IFD, decoded with `zlib` for
    the uncompressed and Deflate compression modes. For JPEG XL compressed DNGs
-   the compressed payload is compared byte-wise instead, which is an equally
-   strict check because libjxl is deterministic.
+   the comparison only checks the tile structure and container signatures:
+   there is no JPEG XL decoder in the verification environment, so the payload
+   is not compared sample by sample.
 
 The reader in `scripts/dng_reader.py` is deliberately dependency-free. The
 Adobe DNG SDK writes classic little-endian TIFF, and the two compression modes
@@ -200,8 +201,8 @@ The measured result over the whole fixture and mode matrix:
 
 `scripts/verify_wasm.py` enforces a limit of 0.05 % of differing samples, a
 mean absolute delta of 0.05 and a maximum absolute delta of 16384, which is
-about a quarter of the 16 bit range.  The measured results sit three orders of
-magnitude inside those limits.
+about a quarter of the 16 bit range.  The measured maximum delta is 3,795, so
+the results sit comfortably inside those limits.
 
 #### The JPEG XL mode
 
@@ -217,8 +218,8 @@ instead checks that
 The payloads themselves differ whenever the encoded pixels differ, and the
 size of that difference is measured exactly in the uncompressed and Deflate
 modes of the same fixture, because all three modes encode the same pixel
-buffer.  The JPEG XL verdict therefore inherits the pixel verdict of the
-decodable modes of the same fixture.
+buffer.  A JPEG XL pass is therefore a structure/signature check, not a pixel
+comparison; the pixel verdict comes from the decodable modes.
 
 A consequence worth stating plainly: this build does **not** verify that the
 JPEG XL DNGs can be read back.  The Adobe DNG SDK ships a reader

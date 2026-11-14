@@ -37,7 +37,6 @@ option(HIRACO_BUILD_CLI "Build the hiraco-cli binary" ON)
 option(HIRACO_BUILD_GUI "Build the hiraco-gui binary" ON)
 option(HIRACO_BUILD_TESTS "Build hiraco core tests" ON)
 option(HIRACO_BUILD_WASM "Build a browser/WebAssembly target without the wxWidgets GUI" OFF)
-option(HIRACO_WASM_PORTING_HELPER "Emit the native dependency porting checklist for Emscripten builds" ON)
 set(HIRACO_HALIDE_DIR "" CACHE PATH
   "Path to the Halide CMake package directory (the directory containing HalideConfig.cmake). \
 The Halide tool is a host tool that runs on the build machine and emits code for the target, \
@@ -81,6 +80,12 @@ if(HIRACO_BUILD_WASM)
   set(HIRACO_EMSCRIPTEN_SIMD_FLAGS -msimd128)
   add_compile_options(${HIRACO_EMSCRIPTEN_SIMD_FLAGS})
   add_link_options(${HIRACO_EMSCRIPTEN_SIMD_FLAGS})
+  # The DNG SDK reports failures by throwing dng_exception, and the writer
+  # catches them to return the message.  Emscripten's wasm64 exception
+  # catching is not reliable in this build (a throw aborts even with
+  # DISABLE_EXCEPTION_CATCHING=0), so the browser worker treats a fatal
+  # RuntimeError as a dead module and replaces it.  Do not add -fexceptions
+  # here without re-testing a malformed RAW end to end.
   # The pool has to match the machine that runs the module, not the machine
   # that built it: a CI runner with two cores would otherwise pre-warm two
   # workers, and every user with more cores would then need on-demand thread
@@ -110,7 +115,12 @@ if(HIRACO_BUILD_WASM)
   add_link_options(${HIRACO_EMSCRIPTEN_MEMORY_FLAGS})
   # LibRaw's identify step uses large stack buffers; the default 64 KB stack
   # overflows on the very first RAW file.
-  set(HIRACO_EMSCRIPTEN_STACK_FLAGS -sSTACK_SIZE=16777216)
+  set(HIRACO_EMSCRIPTEN_STACK_FLAGS
+    -sSTACK_SIZE=16777216
+    # The thread pool is sized from the browser's core count, and every
+    # pthread otherwise inherits the 16 MB main stack: 32 cores would reserve
+    # half a gigabyte for stacks alone.
+    -sDEFAULT_PTHREAD_STACK_SIZE=1048576)
   add_link_options(${HIRACO_EMSCRIPTEN_STACK_FLAGS})
   set(ZLIB_FOUND TRUE)
   set(ZLIB_INCLUDE_DIRS "")
@@ -126,9 +136,6 @@ if(HIRACO_BUILD_WASM)
   set(LIBRAW_INCLUDE_DIRS "")
   set(FFTW3_LIBRARIES "")
   set(FFTW3_INCLUDE_DIRS "")
-  if(HIRACO_WASM_PORTING_HELPER)
-    message(STATUS "WASM porting notes: the DNG SDK, LibRaw, FFTW3 and the Halide pipelines are all built for WebAssembly. The WebAssembly build differs from the native one in that it has no SIMD FFT, no OpenMP in the demosaic and no fused multiply-add, so its output differs from the native output in the last bits; see docs/wasm-verification.md.")
-  endif()
   message(STATUS "Configuring Hiraco as a WebAssembly target; the desktop GUI and test binaries are intentionally disabled.")
 endif()
 
@@ -247,7 +254,6 @@ function(hiraco_apply_sdk_patch topic marker)
   endforeach()
 endfunction()
 
-option(HIRACO_APPLY_SDK_PATCHES "Apply bundled Adobe DNG SDK patches during configure" ON)
 
 # Deflate (Compression=8) for 16-bit linear raw. The stock SDK writer always
 # picks lossless JPEG for ttShort payloads and exposes no way to request it.
@@ -593,25 +599,33 @@ if(HIRACO_BUILD_WASM)
 
   # The Halide libraries are taken from the imported targets that
   # find_package(Halide) already resolved, so the exact file names of the
-  # installation (which are versioned) do not have to be guessed.
-  get_target_property(_hiraco_halide_lib Halide::Halide IMPORTED_LOCATION_RELEASE)
-  if(NOT _hiraco_halide_lib)
-    get_target_property(_hiraco_halide_lib Halide::Halide IMPORTED_LOCATION)
+  # installation (which are versioned) do not have to be guessed.  Older and
+  # newer Halide packages disagree about which targets exist, so each lookup
+  # is guarded and falls back to find_library.
+  set(_hiraco_halide_lib "")
+  set(_hiraco_halide_gengen_lib "")
+  if(TARGET Halide::Halide)
+    get_target_property(_hiraco_halide_lib Halide::Halide IMPORTED_LOCATION_RELEASE)
+    if(NOT _hiraco_halide_lib)
+      get_target_property(_hiraco_halide_lib Halide::Halide IMPORTED_LOCATION)
+    endif()
   endif()
-  get_target_property(_hiraco_halide_gengen_lib Halide::GenGen IMPORTED_LOCATION_RELEASE)
-  if(NOT _hiraco_halide_gengen_lib)
-    get_target_property(_hiraco_halide_gengen_lib Halide::GenGen IMPORTED_LOCATION)
+  if(TARGET Halide::GenGen)
+    get_target_property(_hiraco_halide_gengen_lib Halide::GenGen IMPORTED_LOCATION_RELEASE)
+    if(NOT _hiraco_halide_gengen_lib)
+      get_target_property(_hiraco_halide_gengen_lib Halide::GenGen IMPORTED_LOCATION)
+    endif()
   endif()
-  if(NOT _hiraco_halide_lib OR NOT _hiraco_halide_gengen_lib)
+  if(_hiraco_halide_lib AND _hiraco_halide_gengen_lib)
+    set(HIRACO_HALIDE_LIBRARY "${_hiraco_halide_lib}")
+    set(HIRACO_HALIDE_GENGEN_LIBRARY "${_hiraco_halide_gengen_lib}")
+  else()
     find_library(HIRACO_HALIDE_LIBRARY NAMES Halide
                  HINTS "${HIRACO_HALIDE_PREFIX}/lib"
                  NO_CMAKE_FIND_ROOT_PATH REQUIRED)
     find_library(HIRACO_HALIDE_GENGEN_LIBRARY NAMES Halide_GenGen
                  HINTS "${HIRACO_HALIDE_PREFIX}/lib"
                  NO_CMAKE_FIND_ROOT_PATH REQUIRED)
-  else()
-    set(HIRACO_HALIDE_LIBRARY "${_hiraco_halide_lib}")
-    set(HIRACO_HALIDE_GENGEN_LIBRARY "${_hiraco_halide_gengen_lib}")
   endif()
   message(STATUS "Halide host library: ${HIRACO_HALIDE_LIBRARY}")
   message(STATUS "Halide generator library: ${HIRACO_HALIDE_GENGEN_LIBRARY}")
@@ -1034,6 +1048,10 @@ add_library(hiraco-core STATIC
   src/stack_guidance.cpp
 )
 
+if(NOT MSVC)
+  target_compile_options(hiraco-core PRIVATE -Wall -Wextra)
+endif()
+
 target_include_directories(hiraco-core
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1102,6 +1120,9 @@ if(HIRACO_BUILD_CLI)
     src/main.cpp
   )
   target_link_libraries(hiraco-cli PRIVATE hiraco-core)
+  if(NOT MSVC)
+    target_compile_options(hiraco-cli PRIVATE -Wall -Wextra)
+  endif()
   if(HIRACO_BUILD_WASM)
     target_link_options(hiraco-cli PRIVATE
       -sENVIRONMENT=node
@@ -1125,6 +1146,9 @@ if(NOT HIRACO_BUILD_WASM)
       src/hiraco_gui.cpp
     )
     target_link_libraries(hiraco-gui PRIVATE hiraco-core ${wxWidgets_LIBRARIES})
+    if(NOT MSVC)
+      target_compile_options(hiraco-gui PRIVATE -Wall -Wextra -Wno-unused-function)
+    endif()
   endif()
 
   if(HIRACO_BUILD_TESTS)
@@ -1133,6 +1157,9 @@ if(NOT HIRACO_BUILD_WASM)
       tests/hiraco_core_tests.cpp
     )
     target_link_libraries(hiraco-core-tests PRIVATE hiraco-core)
+    if(NOT MSVC)
+      target_compile_options(hiraco-core-tests PRIVATE -Wall -Wextra)
+    endif()
     add_test(NAME hiraco-core-tests COMMAND hiraco-core-tests)
   endif()
 endif()
@@ -1203,6 +1230,11 @@ add_executable(hiraco-capability-check
   tests/capability_check.cpp
 )
 target_link_libraries(hiraco-capability-check PRIVATE hiraco-core)
+if(NOT HIRACO_BUILD_WASM AND HIRACO_BUILD_TESTS)
+  # The check needs no fixture: it starts the DNG runtime and compares the
+  # reported capabilities with what the build can actually do.
+  add_test(NAME hiraco-capability-check COMMAND hiraco-capability-check)
+endif()
 if(HIRACO_BUILD_WASM)
   target_link_options(hiraco-capability-check PRIVATE
     -sENVIRONMENT=node
@@ -1224,7 +1256,7 @@ if(HIRACO_BUILD_WASM)
     -sWASM=1
     -sMODULARIZE=1
     -sEXPORT_NAME=hiracoWasm
-    -sEXPORTED_FUNCTIONS=["_hiraco_wasm_is_dng_sdk_enabled","_hiraco_wasm_get_dng_status","_hiraco_wasm_get_writer_summary","_hiraco_wasm_convert","_hiraco_wasm_free_buffer","_hiraco_wasm_get_last_error","_hiraco_wasm_open_session","_hiraco_wasm_close_session","_hiraco_wasm_get_image_size","_hiraco_wasm_get_metadata_json","_hiraco_wasm_set_highlight_recovery","_hiraco_wasm_get_original_preview","_hiraco_wasm_get_converted_preview","_hiraco_wasm_get_resolved_stage_settings","_hiraco_wasm_convert_session","_hiraco_wasm_request_cancel","_malloc","_free"]
+    -sEXPORTED_FUNCTIONS=["_hiraco_wasm_is_dng_sdk_enabled","_hiraco_wasm_get_dng_status","_hiraco_wasm_convert","_hiraco_wasm_free_buffer","_hiraco_wasm_get_last_error","_hiraco_wasm_open_session","_hiraco_wasm_close_session","_hiraco_wasm_get_image_size","_hiraco_wasm_get_metadata_json","_hiraco_wasm_get_original_preview","_hiraco_wasm_get_converted_preview","_hiraco_wasm_get_resolved_stage_settings","_hiraco_wasm_convert_session","_malloc","_free"]
     -sEXPORTED_RUNTIME_METHODS=["ccall","cwrap","HEAPU8","HEAPU32","lengthBytesUTF8","stringToUTF8","stringToNewUTF8","UTF8ToString"]
   )
 

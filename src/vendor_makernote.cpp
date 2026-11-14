@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -21,38 +22,20 @@ static constexpr uint16_t kTagMakerNote = 0x927C;
 
 // Vendor MakerNote sub-IFD pointer tags (within the root MakerNote IFD)
 // Classic CLASSIC_VENDOR format:
-static constexpr uint16_t kTagEquipment = 0x0001;
-static constexpr uint16_t kTagCameraSettings = 0x0002;
-static constexpr uint16_t kTagRawDevelopment = 0x0003;
 static constexpr uint16_t kTagImageProcessing = 0x0004;
-static constexpr uint16_t kTagFocusInfo = 0x0005;
 static constexpr uint16_t kTagRawInfo = 0x0007;
 
 // MODERN_VENDOR format sub-IFD pointer tags (type=13 IFD):
-static constexpr uint16_t kTagOmsEquipment = 0x2010;
-static constexpr uint16_t kTagOmsCameraSettings = 0x2020;
-static constexpr uint16_t kTagOmsRawDevelopment = 0x2030;
 static constexpr uint16_t kTagOmsImageProcessing = 0x2040;
-static constexpr uint16_t kTagOmsFocusInfo = 0x2050;
-
-// Classic ImageProcessing sub-IFD tags
-static constexpr uint16_t kTagStackedImage = 0x0015;
-
-// MODERN_VENDOR ImageProcessing sub-IFD tags
-static constexpr uint16_t kTagOmsStackedImage = 0x0804;
 
 // Classic RawInfo sub-IFD tag IDs for UnknownBlock entries.
 static constexpr uint16_t kTagUnknownBlock1 = 0x0200;
-static constexpr uint16_t kTagUnknownBlock2 = 0x0201;
 static constexpr uint16_t kTagUnknownBlock3 = 0x0202;
-static constexpr uint16_t kTagUnknownBlock4 = 0x0203;
 
 // MODERN_VENDOR ImageProcessing sub-IFD tag IDs for UnknownBlock entries.
 // In the MODERN_VENDOR format these live in ImageProcessing rather than RawInfo.
 static constexpr uint16_t kTagOmsUnknownBlock1 = 0x0635;
-static constexpr uint16_t kTagOmsUnknownBlock2 = 0x0636;
 static constexpr uint16_t kTagOmsUnknownBlock3 = 0x1103;
-static constexpr uint16_t kTagOmsUnknownBlock4 = 0x1104;
 
 // TIFF type IDs
 static constexpr uint16_t kTypeByte = 1;
@@ -96,10 +79,6 @@ class TiffReader {
     return offset + length <= data_.size() && offset + length >= offset;
   }
 
-  uint8_t ReadU8(size_t offset) const {
-    return data_[offset];
-  }
-
   uint16_t ReadU16(size_t offset) const {
     if (little_endian_) {
       return static_cast<uint16_t>(data_[offset]) |
@@ -124,7 +103,6 @@ class TiffReader {
 
   size_t Size() const { return data_.size(); }
   const uint8_t* Data() const { return data_.data(); }
-  bool IsLittleEndian() const { return little_endian_; }
 
  private:
   const std::vector<uint8_t>& data_;
@@ -136,8 +114,25 @@ struct IfdEntry {
   uint16_t type = 0;
   uint32_t count = 0;
   uint32_t value_offset = 0;  // offset into file data (or inline value)
-  bool inline_value = false;
+  // False when the entry claims a value outside the MakerNote buffer.  The
+  // readers skip such entries instead of indexing past the buffer.
+  bool value_valid = true;
 };
+
+// Computes the byte size of an entry without letting a hostile count wrap
+// size_t (relevant on 32-bit builds, where count * 8 can overflow).
+bool EntryValueSize(const IfdEntry& entry, size_t* size) {
+  if (size == nullptr) {
+    return false;
+  }
+  const size_t element_size = std::max<size_t>(TypeSize(entry.type), 1);
+  if (entry.count != 0 &&
+      element_size > std::numeric_limits<size_t>::max() / entry.count) {
+    return false;
+  }
+  *size = element_size * static_cast<size_t>(entry.count);
+  return true;
+}
 
 // Parse a single IFD at the given offset within the TIFF data.
 // base_offset is added to all offsets read from the IFD entries (used
@@ -164,15 +159,27 @@ bool ParseIfd(const TiffReader& reader,
     e.type = reader.ReadU16(pos + 2);
     e.count = reader.ReadU32(pos + 4);
 
-    const size_t value_size = TypeSize(e.type) * e.count;
+    size_t value_size = 0;
+    if (!EntryValueSize(e, &value_size)) {
+      e.value_offset = 0;
+      e.value_valid = false;
+      continue;
+    }
     if (value_size <= 4) {
       // Value stored inline in the 4-byte value/offset field.
       e.value_offset = static_cast<uint32_t>(pos + 8);
-      e.inline_value = true;
     } else {
       const uint32_t raw_offset = reader.ReadU32(pos + 8);
-      e.value_offset = static_cast<uint32_t>(base_offset) + raw_offset;
-      e.inline_value = false;
+      const size_t absolute_offset = base_offset + static_cast<size_t>(raw_offset);
+      // The offset comes from the file: a malformed MakerNote must not make
+      // the reader index outside the buffer.
+      if (absolute_offset > reader.Size() ||
+          value_size > reader.Size() - absolute_offset) {
+        e.value_offset = 0;
+        e.value_valid = false;
+        continue;
+      }
+      e.value_offset = static_cast<uint32_t>(absolute_offset);
     }
   }
 
@@ -195,75 +202,37 @@ const IfdEntry* FindEntry(const std::vector<IfdEntry>& entries, uint16_t tag) {
 }
 
 uint32_t EntryU32(const TiffReader& reader, const IfdEntry& entry) {
+  if (!entry.value_valid) {
+    return 0;
+  }
   if (entry.type == kTypeShort) {
+    if (!reader.Valid(entry.value_offset, 2)) return 0;
     return reader.ReadU16(entry.value_offset);
   }
+  if (!reader.Valid(entry.value_offset, 4)) return 0;
   return reader.ReadU32(entry.value_offset);
 }
 
 std::vector<uint8_t> EntryBinaryPayload(const TiffReader& reader, const IfdEntry& entry) {
-  const size_t total = TypeSize(entry.type) * entry.count;
-  if (!reader.Valid(entry.value_offset, total)) return {};
+  if (!entry.value_valid) return {};
+  size_t total = 0;
+  if (!EntryValueSize(entry, &total) || !reader.Valid(entry.value_offset, total)) return {};
   return std::vector<uint8_t>(
       reader.Data() + entry.value_offset,
       reader.Data() + entry.value_offset + total);
 }
 
-// Read a SHORT or LONG array from an IFD entry and return as vector<uint32_t>.
-std::vector<uint32_t> EntryU32Array(const TiffReader& reader, const IfdEntry& entry) {
-  std::vector<uint32_t> result;
-  result.reserve(entry.count);
-  for (uint32_t i = 0; i < entry.count; ++i) {
-    const size_t pos = entry.value_offset + i * TypeSize(entry.type);
-    if (!reader.Valid(pos, TypeSize(entry.type))) break;
-    if (entry.type == kTypeShort || entry.type == kTypeSShort) {
-      result.push_back(reader.ReadU16(pos));
-    } else {
-      result.push_back(reader.ReadU32(pos));
-    }
-  }
-  return result;
-}
-
 // Read an ASCII string from an IFD entry.
 std::string EntryString(const TiffReader& reader, const IfdEntry& entry) {
-  const size_t total = TypeSize(entry.type) * entry.count;
-  if (!reader.Valid(entry.value_offset, total)) return {};
+  if (!entry.value_valid) return {};
+  size_t total = 0;
+  if (!EntryValueSize(entry, &total) || !reader.Valid(entry.value_offset, total)) return {};
   std::string s(reinterpret_cast<const char*>(reader.Data() + entry.value_offset), total);
   // Trim trailing NUL bytes and spaces.
   while (!s.empty() && (s.back() == '\0' || s.back() == ' ')) {
     s.pop_back();
   }
   return s;
-}
-
-// Decode the StackedImage numeric array into a human-readable label
-// matching ExifTool's decoding (e.g. "Hand-held high resolution (11 12)").
-std::string DecodeStackedImageLabel(const std::vector<uint32_t>& values) {
-  if (values.size() < 2) {
-    if (values.size() == 1 && values[0] == 0) return "No";
-    return {};
-  }
-
-  std::string mode;
-  switch (values[0]) {
-    case 0:  return "No";
-    case 1:  mode = "HDR"; break;
-    case 3:  mode = "Focus-stacked"; break;
-    case 5:  mode = "ND filter"; break;
-    case 9:  mode = "Focus-stacked + ND filter"; break;
-    case 11: mode = "Hand-held high resolution"; break;
-    case 13: mode = "Starry sky"; break;
-    default: mode = "Unknown(" + std::to_string(values[0]) + ")"; break;
-  }
-
-  std::string label = mode + " (";
-  for (size_t i = 0; i < values.size(); ++i) {
-    if (i > 0) label += " ";
-    label += std::to_string(values[i]);
-  }
-  label += ")";
-  return label;
 }
 
 }  // namespace
@@ -373,7 +342,6 @@ VendorMakerNoteResult ReadVendorMakerNote(const std::string& path) {
 
   // Verify Vendor or MODERN_VENDOR MakerNote header.
   const size_t mn_offset = makernote_entry->value_offset;
-  const size_t mn_size = TypeSize(makernote_entry->type) * makernote_entry->count;
 
   size_t mn_ifd_start = 0;  // offset from mn_offset to the first IFD
   if (reader.Valid(mn_offset, kVendorHeaderModernLen + 2) &&
@@ -415,38 +383,6 @@ VendorMakerNoteResult ReadVendorMakerNote(const std::string& path) {
     const uint32_t ip_offset = static_cast<uint32_t>(mn_base) + EntryU32(reader, *img_processing_ptr);
     if (reader.Valid(ip_offset, 2)) {
       ParseIfd(reader, ip_offset, mn_base, &ip_entries, nullptr);
-    }
-  }
-
-  // Read StackedImage.
-  // Classic: tag 0x0015 in ImageProcessing sub-IFD.
-  // MODERN_VENDOR: tag 0x0804 in CameraSettings sub-IFD (0x2020).
-  if (is_modern_vendor) {
-    const IfdEntry* cs_ptr = FindEntry(mn_entries, kTagOmsCameraSettings);
-    if (cs_ptr != nullptr) {
-      const uint32_t cs_offset = static_cast<uint32_t>(mn_base) + EntryU32(reader, *cs_ptr);
-      if (reader.Valid(cs_offset, 2)) {
-        std::vector<IfdEntry> cs_entries;
-        if (ParseIfd(reader, cs_offset, mn_base, &cs_entries, nullptr)) {
-          const IfdEntry* stacked = FindEntry(cs_entries, kTagOmsStackedImage);
-          if (stacked != nullptr) {
-            auto values = EntryU32Array(reader, *stacked);
-            if (!values.empty()) {
-              result.has_stacked_image = true;
-              result.stacked_image_label = DecodeStackedImageLabel(values);
-            }
-          }
-        }
-      }
-    }
-  } else if (!ip_entries.empty()) {
-    const IfdEntry* stacked = FindEntry(ip_entries, kTagStackedImage);
-    if (stacked != nullptr) {
-      auto values = EntryU32Array(reader, *stacked);
-      if (!values.empty()) {
-        result.has_stacked_image = true;
-        result.stacked_image_label = DecodeStackedImageLabel(values);
-      }
     }
   }
 

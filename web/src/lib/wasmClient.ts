@@ -12,6 +12,18 @@ export interface WasmCapabilities {
   dngStatus: string;
 }
 
+/**
+ * A failure that left the WebAssembly module unusable (an abort or a corrupt
+ * heap view).  The worker is terminated; the caller must reopen the image,
+ * which starts a fresh worker.
+ */
+export class ModuleCrashedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ModuleCrashedError';
+  }
+}
+
 /** The metadata of a prepared source, as reported by the bridge. */
 export interface BridgeMetadata {
   make: string;
@@ -156,15 +168,8 @@ export class HiracoWasmClient {
     return reply.values;
   }
 
-  /** Asks the bridge for a one line summary of the writer configuration. */
-  async writerSummary(compression: string): Promise<string> {
-    const worker = await this.ensureReady();
-    const reply = (await this.request(worker, { type: 'summary', compression })) as { text: string };
-    return reply.text;
-  }
-
   /** Writes the Linear DNG and returns its bytes. */
-  async convert(compression: string, overrides: number[]): Promise<Uint8Array> {
+  async convert(compression: string, overrides: number[]): Promise<Uint8Array<ArrayBuffer>> {
     const worker = await this.ensureReady();
     const reply = (await this.request(worker, { type: 'convert', compression, overrides })) as {
       dng: ArrayBuffer;
@@ -247,8 +252,27 @@ export class HiracoWasmClient {
         if (stack) {
           console.error(stack);
         }
-        const error = new Error(String(message.message ?? 'the module failed'));
-        this.rejectAll(error);
+        const text = String(message.message ?? 'the module failed');
+        const fatal =
+          /Aborted|RuntimeError|unreachable|memory access out of bounds|outside the .* byte heap/i.test(
+            text,
+          ) || stack.includes('abort');
+        const error = fatal ? new ModuleCrashedError(text) : new Error(text);
+        if (fatal) {
+          // The module is poisoned after an abort: terminate it so the next
+          // open starts a clean worker instead of calling into a dead module.
+          this.stopWorker(error);
+          return;
+        }
+        // Reject only the request this error answers.  A failing preview must
+        // not reject an unrelated conversion that is still running.
+        const index = this.pending.findIndex((request) => request.id === message.id);
+        if (index >= 0) {
+          const [request] = this.pending.splice(index, 1);
+          request.reject(error);
+        } else {
+          this.rejectAll(error);
+        }
         return;
       }
       default:

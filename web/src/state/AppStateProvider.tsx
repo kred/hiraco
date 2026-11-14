@@ -20,6 +20,7 @@ import { previewMaxDimension } from '../lib/compare';
 import {
   CancelledError,
   HiracoWasmClient,
+  ModuleCrashedError,
   type BridgeMetadata,
   type BridgePreview,
 } from '../lib/wasmClient';
@@ -54,8 +55,6 @@ function reducer(state: AppState, action: AppAction): AppState {
         originalPreview: null,
         convertedPreview: null,
         metadata: null,
-        result: null,
-        resultName: null,
         error: null,
         activity: { state: 'idle', message: `Loaded ${action.name}`, fraction: null },
       };
@@ -90,8 +89,6 @@ function reducer(state: AppState, action: AppAction): AppState {
         overrides: action.overrides,
         preset: action.preset === 'custom' ? null : action.preset,
       };
-    case 'base-settings-changed':
-      return { ...state, baseSettings: action.baseSettings };
     case 'compression-changed':
       return { ...state, compression: action.compression };
     case 'compare-mode-changed':
@@ -113,18 +110,17 @@ function reducer(state: AppState, action: AppAction): AppState {
         activity: { ...state.activity, message: action.message, fraction: action.fraction },
       };
     case 'error':
-      return { ...state, error: action.message };
-    case 'module-status':
-      return { ...state, moduleStatus: action.status, moduleMessage: action.message };
-    case 'result':
       return {
         ...state,
-        result: action.blob,
-        resultName: action.name,
-        activity: { state: 'done', message: `Wrote ${action.name}`, fraction: 1 },
+        error: action.message,
+        activity: {
+          state: action.message === null ? 'idle' : 'error',
+          message: action.message ?? 'Ready',
+          fraction: null,
+        },
       };
-    case 'reset':
-      return initialAppState;
+    case 'module-status':
+      return { ...state, moduleStatus: action.status, moduleMessage: action.message };
     default:
       return state;
   }
@@ -322,6 +318,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       );
       dispatch({ type: 'converted-preview', preview: previewFromBridge(preview) });
     } catch (error) {
+      if (error instanceof ModuleCrashedError) {
+        sessionRef.current = false;
+      }
       if (!(error instanceof CancelledError)) {
         dispatch({ type: 'error', message: messageOf(error) });
       }
@@ -359,6 +358,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         // first request reports its own failure; a cancellation of this
         // follow-up request is expected and not shown.
         void renderOriginalPreview().catch((error: unknown) => {
+          if (error instanceof ModuleCrashedError) {
+            sessionRef.current = false;
+          }
           if (!(error instanceof CancelledError)) {
             dispatch({ type: 'error', message: messageOf(error) });
           }
@@ -484,6 +486,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     // zoom change triggers it, the rejection is caught here instead.  The
     // CancelledError carries no user-facing error message.
     void renderOriginalPreview().catch((error: unknown) => {
+      if (error instanceof ModuleCrashedError) {
+        sessionRef.current = false;
+      }
       if (!(error instanceof CancelledError)) {
         dispatch({ type: 'error', message: messageOf(error) });
       }
@@ -510,6 +515,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         dispatch({ type: 'source-selected', name: file.name });
         dispatch({ type: 'companion-selected', name: null });
         void openSession();
+      }).catch((error: unknown) => {
+        dispatch({ type: 'error', message: messageOf(error) });
       });
     },
     [openSession],
@@ -527,6 +534,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         companionRef.current = { bytes, name: file.name };
         dispatch({ type: 'companion-selected', name: file.name });
         void openSession();
+      }).catch((error: unknown) => {
+        dispatch({ type: 'error', message: messageOf(error) });
       });
     },
     [openSession],
@@ -605,6 +614,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }
     if (!sessionRef.current) {
       await openSession();
+      // openSession reports its own error and leaves the session unusable;
+      // starting a conversion anyway would only fail with "unknown session".
+      if (!sessionRef.current) {
+        return;
+      }
     }
     try {
       dispatch({
@@ -616,12 +630,18 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         overridesToArray(stateRef.current.overrides),
       );
       const name = resultNameFor(source.name);
-      const blob = new Blob([new Uint8Array(dng)], { type: 'image/x-adobe-dng' });
-      dispatch({ type: 'result', blob, name });
+      const blob = new Blob([dng], { type: 'image/x-adobe-dng' });
       // The native application writes the file when the conversion ends,
       // so the browser hands it over as a download right away.
       saveFile(blob, name);
+      dispatch({
+        type: 'activity',
+        activity: { state: 'done', message: `Wrote ${name}`, fraction: 1 },
+      });
     } catch (error) {
+      if (error instanceof ModuleCrashedError) {
+        sessionRef.current = false;
+      }
       if (error instanceof CancelledError) {
         dispatch({
           type: 'activity',
@@ -637,6 +657,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     // The conversion runs inside the module, so the worker is stopped to end
     // it.  The next worker starts without a session, so the image is
     // prepared again before the next conversion.
+    if (previewTimer.current !== null) {
+      clearTimeout(previewTimer.current);
+      previewTimer.current = null;
+    }
+    previewPending.current = false;
     sessionRef.current = false;
     client().cancel();
   }, [client]);

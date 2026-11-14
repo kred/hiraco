@@ -12,10 +12,6 @@ struct VendorMakerNoteResult {
   std::string tiff_make;
   std::string tiff_model;
 
-  // StackedImage raw numeric tag value (e.g. "11 12" for hand-held high res)
-  bool has_stacked_image = false;
-  std::string stacked_image_label;
-
   // UnknownBlock binary payloads extracted from MakerNote sub-IFDs.
   std::vector<uint8_t> unknown_block_1;
   std::vector<uint8_t> unknown_block_3;

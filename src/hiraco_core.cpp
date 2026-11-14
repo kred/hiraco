@@ -307,7 +307,11 @@ SourceLinearDngMetadata BuildMetadataFromLibRaw(const std::string& source_path,
 
   const unsigned raw_white = decode_summary.white_level;
   if (raw_white > 0) {
-    const unsigned raw_bits = 32u - static_cast<unsigned>(__builtin_clz(raw_white));
+    // Portable bit width: __builtin_clz is not available in MSVC builds.
+    unsigned raw_bits = 0;
+    for (unsigned value = raw_white; value != 0; value >>= 1) {
+      ++raw_bits;
+    }
     const unsigned shift = std::max(0, 16 - static_cast<int>(raw_bits));
     metadata.has_black_level = true;
     metadata.black_level = static_cast<double>(decode_summary.black_level) * (1u << shift);
@@ -491,19 +495,18 @@ struct PreparedSourceData {
   std::mutex mutex;
   bool has_original_preview = false;
   std::shared_ptr<const PreviewImage> original_preview;
-  bool has_converted_full_preview = false;
-  PreviewImage converted_full_preview;
-  StageOverrideSet converted_full_preview_stage_overrides;
-  LibRawOverrideSet converted_full_preview_libraw_overrides;
-  uint32_t converted_full_preview_max_dimension = 0;
-  bool converted_full_preview_highlight_recovery = false;
+  LibRawOverrideSet original_preview_libraw_overrides;
+  bool has_processed_full_preview = false;
+  // Full-resolution, fully processed (detail enhancement, transform, recovery)
+  // preview.  Fit and 50% are derived from this by resizing, so the expensive
+  // stages always run once against real pixels, never against a proxy.
+  PreviewImage processed_full_preview;
+  StageOverrideSet processed_full_preview_stage_overrides;
+  LibRawOverrideSet processed_full_preview_libraw_overrides;
+  bool processed_full_preview_highlight_recovery = false;
   bool has_processing_cache = false;
   std::shared_ptr<const ProcessingCache> processing_cache;
   LibRawOverrideSet cached_libraw_overrides;
-  bool has_display_processing_cache = false;
-  std::shared_ptr<const ProcessingCache> display_processing_cache;
-  uint32_t display_processing_cache_max_dimension = 0;
-  LibRawOverrideSet display_processing_cache_libraw_overrides;
   bool has_preview_auto_bright_gain = false;
   double preview_auto_bright_gain = 1.0;
   LibRawOverrideSet preview_auto_bright_libraw_overrides;
@@ -629,7 +632,12 @@ bool PrepareSource(const std::string& source_path,
     return false;
   }
 
-  if (!std::filesystem::exists(source_path)) {
+  std::error_code exists_error;
+  if (!std::filesystem::exists(source_path, exists_error)) {
+    if (exists_error) {
+      *error_message = "could not inspect the source file: " + exists_error.message();
+      return false;
+    }
     *error_message = "source file does not exist: " + source_path;
     return false;
   }
@@ -676,6 +684,10 @@ bool RenderOriginalPreview(PreparedSource* prepared,
                            ProgressCallback progress,
                            CancelCheck cancel,
                            std::string* error_message) {
+  std::string fallback_error;
+  if (error_message == nullptr) {
+    error_message = &fallback_error;
+  }
   if (prepared == nullptr || !preview) {
     if (error_message != nullptr) {
       *error_message = "invalid preview request";
@@ -694,7 +706,8 @@ bool RenderOriginalPreview(PreparedSource* prepared,
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
     if (prepared->data->has_original_preview &&
         prepared->data->original_preview &&
-        LibRawOverridesEqual(prepared->data->cached_libraw_overrides, libraw_overrides)) {
+        LibRawOverridesEqual(prepared->data->original_preview_libraw_overrides,
+                             libraw_overrides)) {
       *preview = *prepared->data->original_preview;
       return true;
     }
@@ -712,7 +725,7 @@ bool RenderOriginalPreview(PreparedSource* prepared,
 
   std::lock_guard<std::mutex> lock(prepared->data->mutex);
   prepared->data->has_original_preview = true;
-  prepared->data->cached_libraw_overrides = libraw_overrides;
+  prepared->data->original_preview_libraw_overrides = libraw_overrides;
   prepared->data->original_preview = preview;
   return true;
 }
@@ -727,7 +740,8 @@ bool TryGetCachedOriginalPreview(const PreparedSource& prepared,
   std::lock_guard<std::mutex> lock(prepared.data->mutex);
   if (!prepared.data->has_original_preview ||
       !prepared.data->original_preview ||
-      !LibRawOverridesEqual(prepared.data->cached_libraw_overrides, libraw_overrides)) {
+      !LibRawOverridesEqual(prepared.data->original_preview_libraw_overrides,
+                            libraw_overrides)) {
     return false;
   }
 
@@ -741,12 +755,10 @@ void ReleasePreviewProcessingCache(PreparedSource* prepared) {
   }
 
   std::lock_guard<std::mutex> lock(prepared->data->mutex);
-  prepared->data->has_converted_full_preview = false;
-  prepared->data->converted_full_preview = PreviewImage();
+  prepared->data->has_processed_full_preview = false;
+  prepared->data->processed_full_preview = PreviewImage();
   prepared->data->has_processing_cache = false;
   prepared->data->processing_cache.reset();
-  prepared->data->has_display_processing_cache = false;
-  prepared->data->display_processing_cache.reset();
 }
 
 size_t GetPreviewCacheBytes(const PreparedSource& prepared) {
@@ -758,7 +770,8 @@ size_t GetPreviewCacheBytes(const PreparedSource& prepared) {
     return image.pixels.size() * sizeof(uint16_t);
   };
   const auto preview_bytes = [](const PreviewImage& image) {
-    return image.pixels.size() * sizeof(uint8_t);
+    return image.pixels.size() * sizeof(uint8_t) +
+           image.recovered_mask.size() * sizeof(uint8_t);
   };
 
   std::lock_guard<std::mutex> lock(prepared.data->mutex);
@@ -766,14 +779,10 @@ size_t GetPreviewCacheBytes(const PreparedSource& prepared) {
   if (prepared.data->original_preview) {
     total += preview_bytes(*prepared.data->original_preview);
   }
-  total += preview_bytes(prepared.data->converted_full_preview);
+  total += preview_bytes(prepared.data->processed_full_preview);
   if (prepared.data->processing_cache) {
     total += raster_bytes(prepared.data->processing_cache->raw_image);
     total += raster_bytes(prepared.data->processing_cache->cfa_guide_image);
-  }
-  if (prepared.data->display_processing_cache) {
-    total += raster_bytes(prepared.data->display_processing_cache->raw_image);
-    total += raster_bytes(prepared.data->display_processing_cache->cfa_guide_image);
   }
   return total;
 }
@@ -786,6 +795,10 @@ bool RenderConvertedCrop(PreparedSource* prepared,
                          ProgressCallback progress,
                          CancelCheck cancel,
                          std::string* error_message) {
+  std::string fallback_error;
+  if (error_message == nullptr) {
+    error_message = &fallback_error;
+  }
   const hiraco::ScopedTimingLog crop_timer("crop", "Render converted crop");
   if (prepared == nullptr || !preview) {
     if (error_message != nullptr) {
@@ -813,9 +826,8 @@ bool RenderConvertedCrop(PreparedSource* prepared,
   // Explicit recovery coordinates for the crop path.  Crop previews render from
   // full-frame resolution processing caches (their source_width stays the full
   // frame), so the represented region is the requested crop in full-frame
-  // coordinates.  Passing it explicitly keeps the mapping correct even if a
-  // future caller reuses a display-resolution cache, whose source_width
-  // BuildDisplayProcessingCache overwrites with the display size.
+  // coordinates.  Passing it explicitly keeps the mapping independent of how
+  // the cache was cropped.
   RecoveryImageCoordinates recovery_coordinates;
   recovery_coordinates.full_width = prepared->image_width;
   recovery_coordinates.full_height = prepared->image_height;
@@ -871,8 +883,6 @@ bool RenderConvertedCrop(PreparedSource* prepared,
     prepared->data->has_processing_cache = true;
     prepared->data->cached_libraw_overrides = libraw_overrides;
     prepared->data->processing_cache = cache;
-    prepared->data->has_display_processing_cache = false;
-    prepared->data->display_processing_cache.reset();
   }
 
   return RenderConvertedCropPreview(*enhancement_metadata,
@@ -897,6 +907,10 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
                                 ProgressCallback progress,
                                 CancelCheck cancel,
                                 std::string* error_message) {
+  std::string fallback_error;
+  if (error_message == nullptr) {
+    error_message = &fallback_error;
+  }
   const hiraco::ScopedTimingLog preview_timer("preview", "Render converted full preview");
   if (prepared == nullptr || !preview) {
     if (error_message != nullptr) {
@@ -915,13 +929,16 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
   const bool highlight_recovery_enabled = prepared->ShouldUseHighlightRecovery();
   {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
-    if (prepared->data->has_converted_full_preview &&
-        prepared->data->converted_full_preview_max_dimension == max_dimension &&
-        prepared->data->converted_full_preview_highlight_recovery == highlight_recovery_enabled &&
-        StageOverridesEqual(prepared->data->converted_full_preview_stage_overrides, stage_overrides) &&
-        LibRawOverridesEqual(prepared->data->converted_full_preview_libraw_overrides,
+    if (prepared->data->has_processed_full_preview &&
+        prepared->data->processed_full_preview_highlight_recovery == highlight_recovery_enabled &&
+        StageOverridesEqual(prepared->data->processed_full_preview_stage_overrides, stage_overrides) &&
+        LibRawOverridesEqual(prepared->data->processed_full_preview_libraw_overrides,
                              libraw_overrides)) {
-      *preview = prepared->data->converted_full_preview;
+      // The cache holds the processed full-resolution result.  Display sizes
+      // are pure resizes, so a zoom change never re-runs the enhancement.
+      *preview = max_dimension == 0
+          ? prepared->data->processed_full_preview
+          : ScalePreviewImageForDisplay(prepared->data->processed_full_preview, max_dimension);
       return true;
     }
   }
@@ -953,12 +970,11 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
 
   auto store_rendered_preview = [&]() {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
-    prepared->data->has_converted_full_preview = true;
-    prepared->data->converted_full_preview = *preview;
-    prepared->data->converted_full_preview_stage_overrides = stage_overrides;
-    prepared->data->converted_full_preview_libraw_overrides = libraw_overrides;
-    prepared->data->converted_full_preview_max_dimension = max_dimension;
-    prepared->data->converted_full_preview_highlight_recovery = highlight_recovery_enabled;
+    prepared->data->has_processed_full_preview = true;
+    prepared->data->processed_full_preview = *preview;
+    prepared->data->processed_full_preview_stage_overrides = stage_overrides;
+    prepared->data->processed_full_preview_libraw_overrides = libraw_overrides;
+    prepared->data->processed_full_preview_highlight_recovery = highlight_recovery_enabled;
   };
 
   std::shared_ptr<const ProcessingCache> source_cache;
@@ -998,46 +1014,14 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
       prepared->data->has_processing_cache = true;
       prepared->data->cached_libraw_overrides = libraw_overrides;
       prepared->data->processing_cache = built_cache;
-      prepared->data->has_display_processing_cache = false;
-      prepared->data->display_processing_cache.reset();
     }
     source_cache = std::move(built_cache);
   }
 
-  std::shared_ptr<const ProcessingCache> display_cache;
-  if (max_dimension == 0) {
-    // No downscale: render directly from the full-resolution source cache.
-    display_cache = source_cache;
-  } else {
-    {
-      std::lock_guard<std::mutex> lock(prepared->data->mutex);
-      if (prepared->data->has_display_processing_cache &&
-          prepared->data->display_processing_cache &&
-          prepared->data->display_processing_cache_max_dimension == max_dimension &&
-          LibRawOverridesEqual(prepared->data->display_processing_cache_libraw_overrides,
-                               libraw_overrides)) {
-        display_cache = prepared->data->display_processing_cache;
-      }
-    }
-
-    if (!display_cache) {
-      auto built_display_cache = std::make_shared<ProcessingCache>();
-      if (!BuildDisplayProcessingCache(*source_cache,
-                                       max_dimension,
-                                       built_display_cache.get(),
-                                       error_message)) {
-        return false;
-      }
-      {
-        std::lock_guard<std::mutex> lock(prepared->data->mutex);
-        prepared->data->has_display_processing_cache = true;
-        prepared->data->display_processing_cache = built_display_cache;
-        prepared->data->display_processing_cache_max_dimension = max_dimension;
-        prepared->data->display_processing_cache_libraw_overrides = libraw_overrides;
-      }
-      display_cache = std::move(built_display_cache);
-    }
-  }
+  // Always process the full-resolution cache.  Fit and 50% are produced by
+  // resizing the finished preview below, so the enhancement/recovery stages
+  // never see a downscaled proxy.
+  const std::shared_ptr<const ProcessingCache>& display_cache = source_cache;
 
   const CropRect source_cache_region = source_cache->has_cached_crop
       ? CropRect{source_cache->region_origin_x,
@@ -1141,6 +1125,12 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
     return false;
   }
   store_rendered_preview();
+  if (max_dimension != 0 &&
+      std::max(preview->width, preview->height) > max_dimension) {
+    // The cache keeps the full-resolution result; the display copy is only a
+    // nearest-neighbour resize.
+    *preview = ScalePreviewImageForDisplay(*preview, max_dimension);
+  }
   return true;
 }
 
@@ -1158,18 +1148,10 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
   }
 
   std::shared_ptr<const PreviewImage> preview_override;
-  double preview_gain = 1.0;
   if (prepared.data) {
     std::lock_guard<std::mutex> lock(prepared.data->mutex);
     if (prepared.data->has_original_preview && prepared.data->original_preview) {
       preview_override = prepared.data->original_preview;
-    }
-    if (prepared.data->has_processing_cache && prepared.data->processing_cache) {
-      preview_gain = prepared.data->processing_cache->preview_auto_bright_gain;
-    } else if (prepared.data->has_preview_auto_bright_gain &&
-               LibRawOverridesEqual(prepared.data->preview_auto_bright_libraw_overrides,
-                                    libraw_overrides)) {
-      preview_gain = prepared.data->preview_auto_bright_gain;
     }
   }
 
@@ -1182,7 +1164,6 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
                                stage_overrides,
                                libraw_overrides,
                                preview_override,
-                               preview_gain,
                                progress,
                                cancel);
 }
@@ -1222,6 +1203,32 @@ std::filesystem::path ResolveOutputPath(const std::string& source_path,
                                         const std::filesystem::path& base_output_dir,
                                         const std::filesystem::path& relative_subdir) {
   return base_output_dir / relative_subdir / (std::filesystem::path(source_path).stem().string() + ".dng");
+}
+
+bool PathsReferToSameFile(const std::filesystem::path& left,
+                          const std::filesystem::path& right) {
+  if (left.empty() || right.empty()) {
+    return false;
+  }
+
+  std::error_code error;
+  // This resolves symlinks and hard links, and compares the actual files when
+  // both already exist.  It fails when either side is missing, so fall back to
+  // a lexical comparison of the canonical paths below.
+  if (std::filesystem::equivalent(left, right, error)) {
+    return true;
+  }
+  error.clear();
+
+  const std::filesystem::path canonical_left = std::filesystem::weakly_canonical(left, error);
+  if (error) {
+    return left.lexically_normal() == right.lexically_normal();
+  }
+  const std::filesystem::path canonical_right = std::filesystem::weakly_canonical(right, error);
+  if (error) {
+    return left.lexically_normal() == right.lexically_normal();
+  }
+  return canonical_left == canonical_right;
 }
 
 OverwriteDecision ResolveOverwriteDecision(OverwritePolicy current_policy,

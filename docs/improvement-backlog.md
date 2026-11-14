@@ -9,6 +9,8 @@ read as done rather than open tasks:
 
 - I-01 (deflate compression) — the DNG writer now honours deflate through the
   bundled SDK patch.
+- I-02 (JPEG-XL progress reporting) — `BeginTimedProgress` reports the
+  compression phase.
 - I-13 (HL Rec in the CLI) — `hiraco-cli convert ... --hl-rec`.
 - The browser UI and its WebAssembly build/deploy pipeline have shipped
   (live site: https://kred.github.io/hiraco/).

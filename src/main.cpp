@@ -96,6 +96,13 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // Writing over the input would destroy the RAW with no way to undo it.
+  if (PathsReferToSameFile(command.source_path, command.output_path)) {
+    std::cerr << "Error: refusing to overwrite the source file: " << command.source_path
+              << "\n";
+    return 2;
+  }
+
   PreparedSource prepared;
   std::string error_message;
   if (!PrepareSource(command.source_path, &prepared, &error_message)) {

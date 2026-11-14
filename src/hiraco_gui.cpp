@@ -38,6 +38,7 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -97,6 +98,13 @@ struct QueueItem {
   ProcessingPreset last_preset = ProcessingPreset::kSmall;
   wxString resolution_label;
   uint64_t preview_cache_access_sequence = 0;
+};
+
+// The resampled queue thumbnail for a source preview.  Keyed by item id so
+// rebuilding the queue does not resample every card on every metadata event.
+struct ThumbnailCache {
+  std::shared_ptr<const PreviewImage> source;
+  wxBitmap bitmap;
 };
 
 struct SelectionReadyPayload {
@@ -493,8 +501,8 @@ std::shared_ptr<PreviewImage> ExtractPreviewRegion(std::shared_ptr<const Preview
   return cropped;
 }
 
-std::shared_ptr<PreviewImage> ScalePreviewImage(std::shared_ptr<const PreviewImage> preview,
-                                                uint32_t max_dimension) {
+std::shared_ptr<const PreviewImage> ScalePreviewImage(
+    std::shared_ptr<const PreviewImage> preview, uint32_t max_dimension) {
   if (!preview || preview->width == 0 || preview->height == 0 || preview->colors == 0 ||
       max_dimension == 0) {
     return nullptr;
@@ -502,7 +510,8 @@ std::shared_ptr<PreviewImage> ScalePreviewImage(std::shared_ptr<const PreviewIma
 
   const uint32_t longest_edge = std::max(preview->width, preview->height);
   if (longest_edge <= max_dimension) {
-    return std::make_shared<PreviewImage>(*preview);
+    // Already small enough: share the cached preview instead of cloning it.
+    return preview;
   }
 
   const double scale = static_cast<double>(max_dimension) / longest_edge;
@@ -533,15 +542,26 @@ std::shared_ptr<PreviewImage> ScalePreviewImage(std::shared_ptr<const PreviewIma
   return scaled;
 }
 
-std::shared_ptr<PreviewImage> MakeComparisonOriginalPreview(
+struct ComparisonPreview {
+  std::shared_ptr<const PreviewImage> image;
+  // Size of the displayed (cropped) image before any zoom-cap downscale.
+  // The canvas uses it as the real-image anchor, so 100% is an exact 1:1
+  // blit instead of stretching the default-cropped raster to the sensor size.
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
+ComparisonPreview MakeComparisonOriginalPreview(
     std::shared_ptr<const PreviewImage> preview,
     const PreparedSource& prepared,
     uint32_t max_dimension) {
   if (!preview || preview->width == 0 || preview->height == 0) {
-    return nullptr;
+    return {};
   }
 
-  std::shared_ptr<PreviewImage> comparison_preview = std::make_shared<PreviewImage>(*preview);
+  // Share the cached preview until a crop or a downscale actually changes it;
+  // a full-resolution copy here costs hundreds of megabytes on 50/80 MP files.
+  std::shared_ptr<const PreviewImage> comparison_preview = std::move(preview);
   const SourceLinearDngMetadata& metadata = prepared.metadata;
   if (metadata.has_default_crop && metadata.default_crop_width > 0 &&
       metadata.default_crop_height > 0 && prepared.image_width > 0 && prepared.image_height > 0 &&
@@ -573,12 +593,14 @@ std::shared_ptr<PreviewImage> MakeComparisonOriginalPreview(
       }
     }
   }
+  const uint32_t base_width = comparison_preview->width;
+  const uint32_t base_height = comparison_preview->height;
   if (max_dimension == 0) {
     // Uncapped request: the comparison preview keeps the source resolution,
     // so 100% zoom shows real image pixels one to one.
-    return comparison_preview;
+    return {std::move(comparison_preview), base_width, base_height};
   }
-  return ScalePreviewImage(comparison_preview, max_dimension);
+  return {ScalePreviewImage(comparison_preview, max_dimension), base_width, base_height};
 }
 
 class PaletteButton final : public wxControl {
@@ -768,10 +790,6 @@ class CompareCanvas final : public wxScrolledWindow {
     Refresh();
   }
 
-  bool ShowsRecoveredPixels() const {
-    return show_recovered_pixels_;
-  }
-
   bool HasRecoveredPixelsToShow() const {
     return converted_preview_ && !converted_preview_->recovered_mask.empty();
   }
@@ -876,14 +894,6 @@ class CompareCanvas final : public wxScrolledWindow {
     } else {
       SetZoomMode(ZoomMode::kFit);
     }
-  }
-
-  bool HasOriginalPreview() const {
-    return original_bitmap_.IsOk();
-  }
-
-  bool HasConvertedPreview() const {
-    return converted_bitmap_.IsOk();
   }
 
  private:
@@ -1056,11 +1066,20 @@ class CompareCanvas final : public wxScrolledWindow {
             HasRecoveredPixelsToShow(),
             comparison_mode_ != ComparisonMode::kOriginal,
             comparison_mode_ != ComparisonMode::kConverted);
-    wxBitmap converted_source =
-        converted_bitmap_.IsOk() ? converted_bitmap_ : original;
-    const wxBitmap& cast = CastBitmap();
-    if (cast_placement.on_converted && cast.IsOk()) {
-      converted_source = cast;
+    wxBitmap converted_source;
+    if (converted_bitmap_.IsOk()) {
+      converted_source = converted_bitmap_;
+    }
+    // Never substitute the original for the converted pane: that shows an
+    // unprocessed image labelled "Converted" while the render is pending.
+    // Building the cast overlay copies the whole preview and allocates a
+    // second full-resolution bitmap, so only do that work when a pane will
+    // actually draw it.
+    if (cast_placement.on_converted && converted_source.IsOk()) {
+      const wxBitmap& cast = CastBitmap();
+      if (cast.IsOk()) {
+        converted_source = cast;
+      }
     }
     const wxBitmap& converted = converted_source;
 
@@ -1098,7 +1117,11 @@ class CompareCanvas final : public wxScrolledWindow {
         dc.DestroyClippingRegion();
       };
       draw_pane(original, left_pane_x, left_pane_width, offset.x);
-      draw_pane(converted, right_pane_x, right_pane_width, left_pane_width + offset.x);
+      if (converted.IsOk()) {
+        draw_pane(converted, right_pane_x, right_pane_width, left_pane_width + offset.x);
+      } else {
+        DrawLabel(gc, dc, "Rendering converted preview...", right_pane_x + 12, view_y + 40);
+      }
       DrawLabel(gc, dc, "Original", left_pane_x + 12, view_y + 12);
       DrawLabel(gc, dc, "Converted", right_pane_x + 12, view_y + 12);
       if (gc != nullptr) {
@@ -1112,10 +1135,14 @@ class CompareCanvas final : public wxScrolledWindow {
     }
 
     if (comparison_mode_ == ComparisonMode::kConverted) {
-      DrawBitmap(gc, dc, converted, offset.x, offset.y, single_size.GetWidth(), single_size.GetHeight());
       int view_x = 0;
       int view_y = 0;
       GetViewStart(&view_x, &view_y);
+      if (converted.IsOk()) {
+        DrawBitmap(gc, dc, converted, offset.x, offset.y, single_size.GetWidth(), single_size.GetHeight());
+      } else {
+        DrawLabel(gc, dc, "Rendering converted preview...", view_x + 12, view_y + 40);
+      }
       DrawLabel(gc, dc, "Converted", view_x + 12, view_y + 12);
       return;
     }
@@ -1128,7 +1155,11 @@ class CompareCanvas final : public wxScrolledWindow {
   }
 
   void OnSize(wxSizeEvent& event) {
-    if (zoom_mode_ == ZoomMode::kFit) {
+    // Side-by-side forces 100% zoom, so it never hits the kFit branch, but its
+    // virtual width includes one half-pane per image and depends on the client
+    // size just the same.
+    if (zoom_mode_ == ZoomMode::kFit ||
+        comparison_mode_ == ComparisonMode::kSideBySide) {
       UpdateVirtualArea();
     }
     Refresh();
@@ -1206,12 +1237,19 @@ class CompareCanvas final : public wxScrolledWindow {
   wxPoint last_pan_point_;
 };
 
-// The maximum dimension the comparison previews carry for a zoom mode.  100%
-// removes the cap (0 = no limit), so the preview keeps the source resolution
-// and the zoom factor refers to real image pixels; every other mode uses the
-// cheap capped proxy bitmap.
-uint32_t ZoomMaxDimensionFor(CompareCanvas::ZoomMode mode) {
-  return mode == CompareCanvas::ZoomMode::k100 ? 0u : kFullPreviewMaxDimension;
+// The output dimension for a zoom mode.  The core always processes the
+// full-resolution image once and caches it; this value only sizes the display
+// copy, which is produced by resizing that cached result.  100% is uncapped
+// (0), 50% asks for half of the source resolution so the resize is 1:1, and fit
+// uses the cheap 2560 cap because it downscales anyway.
+uint32_t ZoomMaxDimensionFor(CompareCanvas::ZoomMode mode, uint32_t oriented_long_edge) {
+  if (mode == CompareCanvas::ZoomMode::k100) {
+    return 0u;
+  }
+  if (mode == CompareCanvas::ZoomMode::k50) {
+    return std::max(kFullPreviewMaxDimension, (oriented_long_edge + 1u) / 2u);
+  }
+  return kFullPreviewMaxDimension;
 }
 
 class OverwriteDialog final : public wxDialog {
@@ -1824,11 +1862,13 @@ class HiracoMainFrame final : public wxFrame {
       compare_canvas_->SetComparisonMode(CompareCanvas::ComparisonMode::kConverted);
       UpdateCompareButtons();
       UpdateZoomButtons();
+      ScheduleConvertedPreview();
     });
     side_by_side_mode_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
       compare_canvas_->SetComparisonMode(CompareCanvas::ComparisonMode::kSideBySide);
       UpdateCompareButtons();
       UpdateZoomButtons();
+      ScheduleConvertedPreview();
     });
     zoom_out_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
       compare_canvas_->ZoomOut();
@@ -2241,14 +2281,6 @@ class HiracoMainFrame final : public wxFrame {
   StageOverrideSet* SelectedStageOverrides() {
     QueueItem* item = SelectedItem();
     return item == nullptr ? nullptr : &item->stage_overrides;
-  }
-
-  std::vector<int> GetSelectedRows() const {
-    std::vector<int> rows(selected_rows_.begin(), selected_rows_.end());
-    if (rows.empty() && selected_row_ >= 0 && selected_row_ < static_cast<int>(queue_.size())) {
-      rows.push_back(selected_row_);
-    }
-    return rows;
   }
 
   void RefreshConvertedPreviewIfPossible() {
@@ -2667,7 +2699,21 @@ class HiracoMainFrame final : public wxFrame {
           cached_preview.reset();
         }
       }
-      const wxBitmap thumbnail = MakeThumbnailBitmap(cached_preview, 280, 150);
+      // Rebuilding the queue must not resample every thumbnail: a metadata
+      // probe for each imported file rebuilds all cards, so the sampling cost
+      // would grow quadratically with the queue size.
+      const wxBitmap* cached_thumbnail = nullptr;
+      if (cached_preview) {
+        auto cached = thumbnail_cache_.find(item.id);
+        if (cached == thumbnail_cache_.end() || cached->second.source != cached_preview) {
+          ThumbnailCache entry;
+          entry.source = cached_preview;
+          entry.bitmap = MakeThumbnailBitmap(cached_preview, 280, 150);
+          cached = thumbnail_cache_.insert_or_assign(item.id, std::move(entry)).first;
+        }
+        cached_thumbnail = &cached->second.bitmap;
+      }
+      const wxBitmap thumbnail = cached_thumbnail != nullptr ? *cached_thumbnail : wxBitmap();
       wxWindow* preview_window = nullptr;
       if (thumbnail.IsOk()) {
         auto* image = new wxStaticBitmap(card, wxID_ANY, thumbnail);
@@ -2839,11 +2885,13 @@ class HiracoMainFrame final : public wxFrame {
     if (rows.empty()) {
       return;
     }
+    InvalidateSelectionRequests();
     InvalidateConvertedPreviewRequests();
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
     for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
       if (*it >= 0 && *it < static_cast<int>(queue_.size())) {
+        thumbnail_cache_.erase(queue_[*it].id);
         queue_.erase(queue_.begin() + *it);
       }
     }
@@ -2923,7 +2971,10 @@ class HiracoMainFrame final : public wxFrame {
         compare_canvas_->SetConvertedPreview(nullptr);
         queue_[selected_row_].resolution_label = ResolutionLabelForPrepared(*item_copy.prepared);
         RefreshQueueRow(selected_row_);
-        status_label_->SetLabel("Original preview ready. Rendering converted preview...");
+        status_label_->SetLabel(
+            compare_canvas_->GetComparisonMode() == CompareCanvas::ComparisonMode::kOriginal
+                ? "Original preview ready."
+                : "Original preview ready. Rendering converted preview...");
         UpdateResolvedSliderValues();
         UpdateButtons();
         NotePreviewCacheUse(selected_row_);
@@ -2944,10 +2995,10 @@ class HiracoMainFrame final : public wxFrame {
       payload.item_id = item_id;
       payload.request_id = request_id;
 
-      auto report_progress = [this, item_id, request_id](const ProcessingProgress& progress) {
+      auto report_progress = [this, request_id](const ProcessingProgress& progress) {
         const double normalized = NormalizeSelectionProgress(progress);
         const std::string message = progress.message;
-        CallAfter([this, item_id, request_id, normalized, message]() {
+        CallAfter([this, request_id, normalized, message]() {
           if (close_requested_.load() || conversion_running_ || request_id != selection_request_id_) {
             return;
           }
@@ -3017,10 +3068,12 @@ class HiracoMainFrame final : public wxFrame {
         prepared.image_width, prepared.image_height, prepared.metadata.libraw_flip);
     const uint32_t oriented_height = OrientedImageHeight(
         prepared.image_width, prepared.image_height, prepared.metadata.libraw_flip);
-    compare_canvas_->SetOriginalPreview(
-        MakeComparisonOriginalPreview(cached_preview, prepared, ZoomMaxDimensionFor(mode)),
-        oriented_width,
-        oriented_height);
+    const ComparisonPreview comparison = MakeComparisonOriginalPreview(
+        cached_preview, prepared,
+        ZoomMaxDimensionFor(mode, std::max(oriented_width, oriented_height)));
+    compare_canvas_->SetOriginalPreview(comparison.image,
+                                        comparison.width,
+                                        comparison.height);
   }
 
   void OnCanvasZoomChanged(CompareCanvas::ZoomMode mode) {
@@ -3038,6 +3091,12 @@ class HiracoMainFrame final : public wxFrame {
   void ScheduleConvertedPreview() {
     if (close_requested_.load() ||
         selected_row_ < 0 || selected_row_ >= static_cast<int>(queue_.size())) {
+      return;
+    }
+    // Original mode never draws the converted pane.  Rendering it anyway would
+    // run the full enhancement pipeline (up to full resolution at 100%) for an
+    // invisible result and delay the next selection.
+    if (compare_canvas_->GetComparisonMode() == CompareCanvas::ComparisonMode::kOriginal) {
       return;
     }
     ++converted_preview_request_id_;
@@ -3071,8 +3130,15 @@ class HiracoMainFrame final : public wxFrame {
     prepared.enable_highlight_recovery = item.enable_highlight_recovery;
     const StageOverrideSet stage_overrides = ResolveEffectiveStageOverrides(item.stage_overrides);
     // The preview serves the zoom active when the request is queued; a later
-    // zoom change bumps the request id and re-queues at the new size.
-    const uint32_t preview_max_dimension = ZoomMaxDimensionFor(compare_canvas_->GetZoomMode());
+    // zoom change bumps the request id and re-queues at the new output size.
+    // The core keeps the processed full-resolution result cached, so those
+    // later requests only resize it.
+    const uint32_t oriented_width = OrientedImageWidth(
+        prepared.image_width, prepared.image_height, prepared.metadata.libraw_flip);
+    const uint32_t oriented_height = OrientedImageHeight(
+        prepared.image_width, prepared.image_height, prepared.metadata.libraw_flip);
+    const uint32_t preview_max_dimension = ZoomMaxDimensionFor(
+        compare_canvas_->GetZoomMode(), std::max(oriented_width, oriented_height));
     BeginStatusActivity("Rendering converted preview...");
 
     LaunchWorker(WorkerPriority::kInteractive, [this, item_id, request_id, prepared, stage_overrides,
@@ -3090,10 +3156,10 @@ class HiracoMainFrame final : public wxFrame {
         return;
       }
 
-      auto report_progress = [this, item_id, request_id](const ProcessingProgress& progress) {
+      auto report_progress = [this, request_id](const ProcessingProgress& progress) {
         const double normalized = NormalizeConvertedPreviewProgress(progress);
         const std::string message = progress.message;
-        CallAfter([this, item_id, request_id, normalized, message]() {
+        CallAfter([this, request_id, normalized, message]() {
           if (close_requested_.load() || conversion_running_ ||
               request_id != converted_preview_request_id_) {
             return;
@@ -3175,6 +3241,11 @@ class HiracoMainFrame final : public wxFrame {
     if (discarded_tasks != 0) {
       active_workers_.fetch_sub(static_cast<int>(discarded_tasks));
     }
+    // A queued conversion task is discarded above and never gets to clear its
+    // running flag.  Closing cancels the run either way, so clear it here;
+    // a conversion that is already executing still keeps active_workers_ above
+    // zero until its worker finishes.
+    conversion_running_ = false;
     shutdown_timer_.Start(100);
     status_label_->SetLabel("Closing...");
     Disable();
@@ -3215,8 +3286,10 @@ class HiracoMainFrame final : public wxFrame {
   }
 
   void OnClearQueue(wxCommandEvent&) {
+    InvalidateSelectionRequests();
     InvalidateConvertedPreviewRequests();
     queue_.clear();
+    thumbnail_cache_.clear();
     selected_row_ = -1;
     selected_rows_.clear();
     compare_canvas_->SetOriginalPreview(nullptr);
@@ -3256,7 +3329,9 @@ class HiracoMainFrame final : public wxFrame {
     for (QueueItem& item : queue_) {
       item.target_path = ResolveOutputPathForMode(item.source_path);
     }
-    RefreshQueue();
+    // The target path is not shown on the queue cards, so rebuilding every
+    // card here (and resampling every thumbnail) would only freeze the UI for
+    // an invisible change.  This runs on every keystroke in the subfolder field.
   }
 
   void OnCompressionChanged(wxCommandEvent&) {
@@ -3275,11 +3350,6 @@ class HiracoMainFrame final : public wxFrame {
         break;
     }
     SaveAppSettings();
-  }
-
-  void OnZoomChanged(wxCommandEvent&) {
-    compare_canvas_->SetZoomMode(CompareCanvas::ZoomMode::kFit);
-    UpdateZoomButtons();
   }
 
   void OnResetStage1Defaults(wxCommandEvent&) {
@@ -3475,7 +3545,10 @@ class HiracoMainFrame final : public wxFrame {
                                     compare_canvas_->GetZoomMode(),
                                     payload.original_preview);
       compare_canvas_->SetConvertedPreview(nullptr);
-      status_label_->SetLabel("Original preview ready. Rendering converted preview...");
+      status_label_->SetLabel(
+          compare_canvas_->GetComparisonMode() == CompareCanvas::ComparisonMode::kOriginal
+              ? "Original preview ready."
+              : "Original preview ready. Rendering converted preview...");
       UpdateResolvedSliderValues();
       ScheduleConvertedPreview();
     }
@@ -3543,6 +3616,25 @@ class HiracoMainFrame final : public wxFrame {
       return;
     }
 
+    // Refuse a batch whose output path names the source itself (for example a
+    // .dng input saved next to itself): the writer would replace the RAW.
+    std::vector<std::filesystem::path> conflicts;
+    for (const QueueItem& item : queue_) {
+      if (PathsReferToSameFile(item.source_path, item.target_path)) {
+        conflicts.push_back(item.target_path);
+      }
+    }
+    if (!conflicts.empty()) {
+      wxString message = "The output would overwrite the source file:\n" +
+                         WxStringFromPath(conflicts.front());
+      if (conflicts.size() > 1) {
+        message += "\n(and " + wxString(std::to_string(conflicts.size() - 1)) + " more)";
+      }
+      message += "\n\nChoose a different output location.";
+      wxMessageBox(message, "Cannot overwrite source", wxOK | wxICON_ERROR, this);
+      return;
+    }
+
     InvalidateSelectionRequests();
     InvalidateConvertedPreviewRequests();
 
@@ -3564,8 +3656,12 @@ class HiracoMainFrame final : public wxFrame {
     UpdateButtons();
 
     const std::vector<QueueItem> queue_snapshot = queue_;
+    // Snapshot the compression mode: the choice control must not be able to
+    // change the mode of a batch that is already running (and reading a plain
+    // member from the worker while the UI writes it is a data race).
+    const HiracoCompression compression = compression_;
 
-    LaunchWorker(WorkerPriority::kBackground, [this, queue_snapshot]() {
+    LaunchWorker(WorkerPriority::kBackground, [this, queue_snapshot, compression]() {
       for (size_t item_index = 0; item_index < queue_snapshot.size(); ++item_index) {
         if (conversion_cancel_.load()) {
           break;
@@ -3621,7 +3717,7 @@ class HiracoMainFrame final : public wxFrame {
 
         DngWriteResult result = ConvertToDng(prepared,
                      item.target_path,
-                     compression_,
+                     compression,
                      ResolveEffectiveStageOverrides(item.stage_overrides),
                                              {},
                                              [this, item_index, total = queue_snapshot.size()](const ProcessingProgress& progress) {
@@ -3739,6 +3835,7 @@ class HiracoMainFrame final : public wxFrame {
   SliderControl stage3_gain_;
 
   std::vector<QueueItem> queue_;
+  std::unordered_map<uint64_t, ThumbnailCache> thumbnail_cache_;
   std::filesystem::path base_output_dir_;
   std::filesystem::path relative_subdir_;
   StageOverrideSet app_stage_defaults_;

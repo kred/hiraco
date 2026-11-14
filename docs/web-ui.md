@@ -57,12 +57,20 @@ npm run test      # vitest unit tests
 npm run e2e       # Playwright end to end test
 ```
 
+The end-to-end tests use `sample/_8142490.ORI` and
+`build/reference/_8142490-deflate.dng`.  Both are generated files, not
+committed; regenerate the reference with `scripts/make_reference_dngs.sh`
+after changing the writer, otherwise the pixel comparison is against a stale
+baseline.  `HIRACO_E2E_RAW` and `HIRACO_E2E_REFERENCE` override the two paths,
+and `HIRACO_PYTHON` selects the interpreter used for the DNG comparison.
+
 ## Supported browsers
 
 The module is compiled for wasm64 with a 64 bit shared memory, so the browser
 has to support 64 bit WebAssembly memory and the page has to be
-cross-origin isolated.  Current Chrome, Edge, Firefox and Safari do.  The
-application probes for this on startup and shows an actionable message when
-it is missing; it does not fall back to a 32 bit build, because a 10386 x
-7792 sensor-shift capture peaks at about 8 GB of resident memory and does
-not fit in a 32 bit address space.
+cross-origin isolated.  Current Chrome and Edge support both; Firefox support
+depends on its wasm64 memory implementation, and Safari does not support
+wasm64 yet.  The application probes for this on startup and shows an
+actionable message when it is missing; it does not fall back to a 32 bit
+build, because a 10386 x 7792 sensor-shift capture peaks at about 8 GB of
+resident memory and does not fit in a 32 bit address space.
