@@ -312,9 +312,16 @@ void TestMalformedMakerNoteDoesNotReadOutOfBounds() {
 
   {
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    Expect(static_cast<bool>(file), "the malformed MakerNote temp file should open");
     file.write(reinterpret_cast<const char*>(data.data()),
                static_cast<std::streamsize>(data.size()));
+    Expect(file.good(), "the malformed MakerNote temp file should be written completely");
   }
+  std::error_code size_error;
+  const uintmax_t written = std::filesystem::file_size(path, size_error);
+  Expect(!size_error && written == data.size(),
+         "the malformed MakerNote temp file should contain the whole fixture");
+
   const VendorMakerNoteResult result = ReadVendorMakerNote(path.string());
   Expect(!result.ok, "a malformed MakerNote must fail instead of reading out of bounds");
   std::error_code error;
