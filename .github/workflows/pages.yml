@@ -43,12 +43,12 @@ jobs:
           curl -sSL --retry 3 --fail -o /tmp/halide.tar.gz "${HALIDE_URL}"
           mkdir -p /opt/halide
           tar xzf /tmp/halide.tar.gz -C /opt/halide --strip-components=1
-          halide_cmake_dir="$(dirname "$(find /opt/halide -name HalideConfig.cmake -print -quit)")"
-          if [ -z "${halide_cmake_dir}" ]; then
+          halide_config="$(find /opt/halide -name HalideConfig.cmake -print -quit)"
+          if [ -z "${halide_config}" ]; then
             echo "::error::HalideConfig.cmake not found in the Halide archive"
             exit 1
           fi
-          echo "HIRACO_HALIDE_DIR=${halide_cmake_dir}" >> "${GITHUB_ENV}"
+          echo "HIRACO_HALIDE_DIR=$(dirname "${halide_config}")" >> "${GITHUB_ENV}"
           test -n "$(find /opt/halide -name 'libHalide_GenGen.a' -print -quit)"
 
       - name: Fetch the Adobe DNG SDK

@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -27,14 +28,54 @@
 namespace {
 
 // Where the bridge stages its input and output inside the virtual file
-// system.  The names are fixed so that a browser page can pre-load a file
-// under a known name, and so that repeated calls do not accumulate files.
+// system.  Every session gets its own directory: sessions stay usable while
+// another file is opened, and closing a session can remove every staged byte.
 constexpr const char* kInputDirectory = "/hiraco";
-constexpr const char* kOutputPath = "/hiraco/output.dng";
+constexpr const char* kSessionDirectory = "/hiraco/sessions";
 
 std::string& LastError() {
   static std::string message;
   return message;
+}
+
+// Removes a staging directory when it goes out of scope, unless the owner
+// explicitly releases it.  Every open path uses it, so a failed or partially
+// staged session cannot leave RAW bytes behind in the virtual file system.
+class ScopedDirectoryCleanup {
+ public:
+  explicit ScopedDirectoryCleanup(std::filesystem::path path) : path_(std::move(path)) {}
+  ~ScopedDirectoryCleanup() {
+    if (!active_) {
+      return;
+    }
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+
+  ScopedDirectoryCleanup(const ScopedDirectoryCleanup&) = delete;
+  ScopedDirectoryCleanup& operator=(const ScopedDirectoryCleanup&) = delete;
+
+  void Release() { active_ = false; }
+
+ private:
+  std::filesystem::path path_;
+  bool active_ = true;
+};
+
+void RemoveDirectory(const std::filesystem::path& path) {
+  if (path.empty()) {
+    return;
+  }
+  std::error_code error;
+  std::filesystem::remove_all(path, error);
+}
+
+void RemoveFile(const std::filesystem::path& path) {
+  if (path.empty()) {
+    return;
+  }
+  std::error_code error;
+  std::filesystem::remove(path, error);
 }
 
 bool WriteWholeFile(const std::filesystem::path& path, const uint8_t* data, size_t size) {
@@ -70,9 +111,9 @@ bool ReadWholeFile(const std::filesystem::path& path, std::vector<uint8_t>* out)
   return true;
 }
 
-// The name of the staged input file, derived from the caller's name so that
+// The file name of a staged input, derived from the caller's name so that
 // LibRaw sees the right extension.
-std::string StagedInputPath(const char* input_name) {
+std::string StagedFileName(const char* input_name) {
   std::string name = input_name != nullptr ? input_name : "input.raw";
   // Keep only the file name; a path from the caller must not escape the
   // staging directory.
@@ -83,7 +124,11 @@ std::string StagedInputPath(const char* input_name) {
   if (name.empty()) {
     name = "input.raw";
   }
-  return std::string(kInputDirectory) + "/" + name;
+  return name;
+}
+
+std::string StagedInputPath(const std::filesystem::path& directory, const char* input_name) {
+  return (directory / StagedFileName(input_name)).string();
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +145,7 @@ constexpr size_t kStageValueCount = HIRACO_WASM_STAGE_VALUE_COUNT;
 
 struct WasmSession {
   PreparedSource prepared;
+  std::string staging_dir;
   std::string output_path;
   std::shared_ptr<std::atomic<bool>> cancel_requested = std::make_shared<std::atomic<bool>>(false);
 };
@@ -367,22 +413,6 @@ const char* hiraco_wasm_get_dng_status() {
   return status.c_str();
 }
 
-int hiraco_wasm_get_writer_summary(char* out_buffer, size_t out_buffer_size,
-                                  const char* compression) {
-  if (out_buffer == nullptr || out_buffer_size == 0) {
-    return 0;
-  }
-
-  const std::string requested = compression != nullptr ? compression : "deflate";
-  const DngWriterConfigSummary summary = BuildDngWriterConfigSummary(requested);
-  const std::string message = summary.enabled ? summary.status : "Adobe DNG SDK integration not enabled in this build";
-
-  const size_t available = std::min<size_t>(message.size(), out_buffer_size - 1U);
-  std::memcpy(out_buffer, message.c_str(), available);
-  out_buffer[available] = '\0';
-  return static_cast<int>(available);
-}
-
 int hiraco_wasm_convert(const uint8_t* raw_bytes, size_t raw_size,
                         const char* input_name, const char* compression,
                         uint8_t** out_dng, size_t* out_size) {
@@ -398,7 +428,9 @@ int hiraco_wasm_convert(const uint8_t* raw_bytes, size_t raw_size,
     return 1;
   }
 
-  const std::string input_path = StagedInputPath(input_name);
+  const std::string staging_dir = std::string(kInputDirectory) + "/legacy";
+  ScopedDirectoryCleanup cleanup(staging_dir);
+  const std::string input_path = StagedInputPath(staging_dir, input_name);
   if (!WriteWholeFile(input_path, raw_bytes, raw_size)) {
     LastError() = "could not stage the input file in the virtual file system";
     return 1;
@@ -422,8 +454,9 @@ int hiraco_wasm_convert(const uint8_t* raw_bytes, size_t raw_size,
   // because it is a separate file next to the source, so that stage stays
   // off here; the command line tool enables it when it finds the companion.
 
+  const std::string output_path = staging_dir + "/output.dng";
   const DngWriteResult result = ConvertToDng(prepared,
-                                             std::filesystem::path(kOutputPath),
+                                             std::filesystem::path(output_path),
                                              mode,
                                              StageOverrideSet(),
                                              LibRawOverrideSet());
@@ -433,7 +466,7 @@ int hiraco_wasm_convert(const uint8_t* raw_bytes, size_t raw_size,
   }
 
   std::vector<uint8_t> dng;
-  if (!ReadWholeFile(kOutputPath, &dng)) {
+  if (!ReadWholeFile(output_path, &dng)) {
     LastError() = "the DNG could not be read back from the virtual file system";
     return 1;
   }
@@ -474,7 +507,13 @@ uint32_t hiraco_wasm_open_session(const uint8_t* raw_bytes, size_t raw_size,
     return 0;
   }
 
-  const std::string input_path = StagedInputPath(input_name);
+  try {
+  const uint32_t session_id = NextSessionId()++;
+  const std::string staging_dir =
+      std::string(kSessionDirectory) + "/" + std::to_string(session_id);
+  ScopedDirectoryCleanup cleanup(staging_dir);
+
+  const std::string input_path = StagedInputPath(staging_dir, input_name);
   if (!WriteWholeFile(input_path, raw_bytes, raw_size)) {
     LastError() = "could not stage the input file in the virtual file system";
     return 0;
@@ -484,7 +523,13 @@ uint32_t hiraco_wasm_open_session(const uint8_t* raw_bytes, size_t raw_size,
   if (companion_bytes != nullptr && companion_size > 0) {
     const char* companion_file_name =
         companion_name != nullptr && companion_name[0] != '\0' ? companion_name : "companion.ORI";
-    companion_path = StagedInputPath(companion_file_name);
+    companion_path = StagedInputPath(staging_dir, companion_file_name);
+    if (companion_path == input_path) {
+      // Both files would share one staging path and the second write would
+      // destroy the RAW.
+      LastError() = "the companion file must have a different name than the source file";
+      return 0;
+    }
     if (!WriteWholeFile(companion_path, companion_bytes, companion_size)) {
       LastError() = "could not stage the highlight recovery companion in the virtual file system";
       return 0;
@@ -510,18 +555,31 @@ uint32_t hiraco_wasm_open_session(const uint8_t* raw_bytes, size_t raw_size,
     prepared.enable_highlight_recovery = true;
   }
 
-  const uint32_t session_id = NextSessionId()++;
   WasmSession session;
   session.prepared = std::move(prepared);
   session.cancel_requested = cancel_requested;
-  session.output_path =
-      std::string(kInputDirectory) + "/output-" + std::to_string(session_id) + ".dng";
+  session.staging_dir = staging_dir;
+  session.output_path = staging_dir + "/output.dng";
   Sessions().emplace(session_id, std::move(session));
+  cleanup.Release();
   return session_id;
+  } catch (const std::exception& error) {
+    LastError() = std::string("unhandled error: ") + error.what();
+    return 0;
+  } catch (...) {
+    LastError() = "unhandled unknown error";
+    return 0;
+  }
 }
 
 void hiraco_wasm_close_session(uint32_t session_id) {
-  Sessions().erase(session_id);
+  auto entry = Sessions().find(session_id);
+  if (entry == Sessions().end()) {
+    return;
+  }
+  const std::string staging_dir = entry->second.staging_dir;
+  Sessions().erase(entry);
+  RemoveDirectory(staging_dir);
 }
 
 int hiraco_wasm_get_image_size(uint32_t session_id, uint32_t* out_width, uint32_t* out_height) {
@@ -558,18 +616,6 @@ int hiraco_wasm_get_metadata_json(uint32_t session_id, char* out_buffer, size_t 
   return static_cast<int>(available);
 }
 
-int hiraco_wasm_set_highlight_recovery(uint32_t session_id, int enabled) {
-  LastError().clear();
-  WasmSession* session = FindSession(session_id);
-  if (session == nullptr) {
-    LastError() = "unknown session";
-    return 1;
-  }
-  session->prepared.enable_highlight_recovery =
-      enabled != 0 && session->prepared.HasHighlightRecoverySource();
-  return 0;
-}
-
 int hiraco_wasm_get_original_preview(uint32_t session_id, uint32_t max_dimension,
                                      uint8_t** out_pixels, size_t* out_size,
                                      uint32_t* out_width, uint32_t* out_height) {
@@ -590,13 +636,21 @@ int hiraco_wasm_get_original_preview(uint32_t session_id, uint32_t max_dimension
   session->cancel_requested->store(false);
   std::shared_ptr<PreviewImage> preview = std::make_shared<PreviewImage>();
   std::string error_message;
-  if (!RenderOriginalPreview(&session->prepared,
-                             preview,
-                             LibRawOverrideSet(),
-                             ReportProgress,
-                             [session]() { return session->cancel_requested->load(); },
-                             &error_message)) {
-    LastError() = error_message.empty() ? "the original preview could not be rendered" : error_message;
+  try {
+    if (!RenderOriginalPreview(&session->prepared,
+                               preview,
+                               LibRawOverrideSet(),
+                               ReportProgress,
+                               [session]() { return session->cancel_requested->load(); },
+                               &error_message)) {
+      LastError() = error_message.empty() ? "the original preview could not be rendered" : error_message;
+      return 1;
+    }
+  } catch (const std::exception& error) {
+    LastError() = std::string("unhandled error: ") + error.what();
+    return 1;
+  } catch (...) {
+    LastError() = "unhandled unknown error";
     return 1;
   }
 
@@ -689,6 +743,11 @@ int hiraco_wasm_get_converted_preview(uint32_t session_id, uint32_t max_dimensio
 
   if (out_mask != nullptr && out_mask_size != nullptr && !preview->recovered_mask.empty()) {
     if (!HandOutBuffer(preview->recovered_mask, out_mask, out_mask_size)) {
+      // The pixel buffer was already handed out; the caller only frees it on
+      // success, so release it here instead of leaking a full preview.
+      std::free(*out_pixels);
+      *out_pixels = nullptr;
+      *out_size = 0;
       LastError() = "out of memory";
       return 1;
     }
@@ -700,8 +759,12 @@ int hiraco_wasm_get_resolved_stage_settings(uint32_t session_id,
                                             const double* stage_overrides, size_t stage_override_count,
                                             double* out_values, size_t out_value_count) {
   LastError().clear();
-  if (out_values == nullptr || out_value_count < kStageValueCount) {
+  if (out_values == nullptr) {
     LastError() = "no output buffer was provided";
+    return 1;
+  }
+  if (out_value_count < kStageValueCount) {
+    LastError() = "the output buffer is too small for the resolved stage settings";
     return 1;
   }
 
@@ -754,15 +817,20 @@ int hiraco_wasm_convert_session(uint32_t session_id, const char* compression,
                                              ReportProgress,
                                              [session]() { return session->cancel_requested->load(); });
   if (!result.ok) {
+    RemoveFile(session->output_path);
     LastError() = result.message.empty() ? "the DNG could not be written" : result.message;
     return 1;
   }
 
   std::vector<uint8_t> dng;
   if (!ReadWholeFile(session->output_path, &dng)) {
+    RemoveFile(session->output_path);
     LastError() = "the DNG could not be read back from the virtual file system";
     return 1;
   }
+  // The output has been copied into the caller's buffer; keeping the staged
+  // copy would retain the whole DNG in the virtual file system.
+  RemoveFile(session->output_path);
   if (dng.empty()) {
     LastError() = "the DNG writer produced an empty file";
     return 1;
@@ -772,14 +840,6 @@ int hiraco_wasm_convert_session(uint32_t session_id, const char* compression,
     return 1;
   }
   return 0;
-}
-
-void hiraco_wasm_request_cancel(uint32_t session_id) {
-  WasmSession* session = FindSession(session_id);
-  if (session == nullptr) {
-    return;
-  }
-  session->cancel_requested->store(true);
 }
 
 }  // extern "C"

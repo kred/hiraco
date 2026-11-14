@@ -18,6 +18,29 @@ const reference =
 const outputDir = path.join(repoRoot, 'build', 'web-e2e');
 const output = path.join(outputDir, 'browser.dng');
 
+/** Picks an interpreter that can actually run compare_dng.py. */
+function findPythonWithNumpy(): string {
+  if (process.env.HIRACO_PYTHON) {
+    return process.env.HIRACO_PYTHON;
+  }
+  const candidates = [
+    path.join(repoRoot, '.venv', 'bin', 'python3'),
+    path.join(repoRoot, '.venv-ci', 'bin', 'python3'),
+    'python3',
+  ];
+  for (const candidate of candidates) {
+    try {
+      execFileSync(candidate, ['-c', 'import numpy'], { stdio: 'ignore' });
+      return candidate;
+    } catch {
+      // Try the next interpreter.
+    }
+  }
+  // Let compare_dng.py report the missing dependency instead of silently
+  // skipping the pixel comparison.
+  return 'python3';
+}
+
 test('converts a RAW file in the browser and matches the native output', async ({
   page,
 }) => {
@@ -60,11 +83,7 @@ test('converts a RAW file in the browser and matches the native output', async (
     !existsSync(reference),
     `the native reference ${reference} is not available`,
   );
-  const python =
-    process.env.HIRACO_PYTHON ??
-    (existsSync(path.join(repoRoot, '.venv', 'bin', 'python3'))
-      ? path.join(repoRoot, '.venv', 'bin', 'python3')
-      : 'python3');
+  const python = findPythonWithNumpy();
   const report = execFileSync(
     python,
     [

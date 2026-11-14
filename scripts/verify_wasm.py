@@ -26,6 +26,7 @@ Exit status:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -165,6 +166,11 @@ def main() -> int:
     fixtures = [f for f in args.fixtures.split(",") if f]
     modes = [m for m in args.modes.split(",") if m]
 
+    # A native reference is only valid for the native binary that produced it.
+    # Keep a sidecar hash so changing the writer cannot silently compare
+    # against an old baseline.
+    native_hash = hashlib.sha256(native.read_bytes()).hexdigest()
+
     print(f"native     : {native}")
     print(f"wasm       : {wasm}")
     print(f"fixtures   : {', '.join(fixtures)}")
@@ -183,14 +189,21 @@ def main() -> int:
         pixel_verdict: Optional[bool] = None
         for mode in modes:
             reference = reference_dir / f"{stem}-{mode}.dng"
+            reference_hash = reference.with_suffix(reference.suffix + ".native-sha256")
             candidate = output_dir / f"{stem}-{mode}.dng"
 
-            if not reference.exists():
+            reference_is_current = (
+                reference.exists()
+                and reference_hash.exists()
+                and reference_hash.read_text().strip() == native_hash
+            )
+            if not reference_is_current:
                 ok, message, _ = run_conversion([str(native)], source, reference, mode)
                 if not ok:
                     print(f"{fixture:20s} {mode:14s} REFERENCE FAILED: {message}")
                     failures += 1
                     continue
+                reference_hash.write_text(native_hash + "\n")
 
             ok, message, elapsed = run_conversion(["node", str(wasm)], source, candidate, mode)
             if not ok:
@@ -203,7 +216,8 @@ def main() -> int:
             print(f"{fixture:20s} {mode:14s} {status}  {elapsed:6.1f}s  {detail}")
             if not matched:
                 failures += 1
-            elif mode != "jpeg-xl":
+                pixel_verdict = False
+            elif mode != "jpeg-xl" and pixel_verdict is None:
                 pixel_verdict = True
 
     print()

@@ -37,7 +37,6 @@ export interface SourceMetadata {
   iso?: number;
   shutterSpeed?: string;
   aperture?: number;
-  focalLength?: number;
   workingWidth: number;
   workingHeight: number;
 }
@@ -74,9 +73,6 @@ export interface AppState {
   showRecoveredPixels: boolean;
   activity: Activity;
   error: string | null;
-  /** The Linear DNG produced by the last conversion, as a blob. */
-  result: Blob | null;
-  resultName: string | null;
   /** The state of the WebAssembly module. */
   moduleStatus: ModuleStatus;
   /** Why the module cannot run, when it cannot. */
@@ -101,8 +97,6 @@ export const initialAppState: AppState = {
   showRecoveredPixels: false,
   activity: { state: 'idle', message: 'Ready', fraction: null },
   error: null,
-  result: null,
-  resultName: null,
   moduleStatus: 'unknown',
   moduleMessage: null,
 };
@@ -115,7 +109,6 @@ export type AppAction =
   | { type: 'converted-preview'; preview: PreviewBuffer }
   | { type: 'settings-changed'; settings: StageSettings; overrides: StageOverrides }
   | { type: 'preset-applied'; preset: PresetId; settings: StageSettings; overrides: StageOverrides }
-  | { type: 'base-settings-changed'; baseSettings: StageSettings }
   | { type: 'compression-changed'; compression: CompressionMode }
   | { type: 'compare-mode-changed'; compareMode: CompareMode }
   | { type: 'zoom-mode-changed'; zoomMode: ZoomMode }
@@ -123,6 +116,4 @@ export type AppAction =
   | { type: 'activity'; activity: Activity }
   | { type: 'activity-progress'; message: string; fraction: number | null }
   | { type: 'error'; message: string | null }
-  | { type: 'module-status'; status: ModuleStatus; message: string | null }
-  | { type: 'result'; blob: Blob; name: string }
-  | { type: 'reset' };
+  | { type: 'module-status'; status: ModuleStatus; message: string | null };
