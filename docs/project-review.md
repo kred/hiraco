@@ -4,6 +4,12 @@ A verified, code-grounded account of what Hiraco is trying to achieve and how th
 current implementation actually achieves it. Written 2026-10-09 against commit
 `d6f5e2f` ("UI improvements").
 
+> **2026-11 update.** The converted-preview pipeline now processes the
+> full-resolution raster once, caches the result, and derives fit/50% by
+> resizing. `BuildDisplayProcessingCache` and its display-resolution derivative
+> have been removed; statements below that describe previews running on a
+> display-sized cache are historical.
+
 ## 1. Scope And Method
 
 This review covers the repository as it stands at the audited commit: `src/`,
@@ -149,13 +155,16 @@ and the most intricate orchestration in the core.
 4. Reuses the full-resolution `ProcessingCache` if it covers the crop
    (`ProcessingCacheCoversCrop`, `:181`); otherwise builds one via
    `BuildProcessingCacheFromRaw` (`src/dng_writer_bridge.cpp:4030-4121`).
-5. Builds a **display-resolution derivative** via `BuildDisplayProcessingCache`
-   (`:4123-4165`) — the expensive enhancement work is bounded by the canvas, not
-   by the 50/80 MP source.
-6. Maps the crop into display coordinates and computes
-   `RecoveryImageCoordinates` so the ORI companion can be sampled in source
-   coordinates even though the preview runs at display resolution.
-7. Calls `RenderConvertedCropPreview` (`:4184-4351`) on the display cache.
+5. Runs the expensive enhancement, camera transform and ORI recovery on that
+   full-resolution cache and stores the finished preview in
+   `processed_full_preview` (keyed by stage settings, LibRaw overrides and the
+   recovery flag).
+6. Maps the crop into source coordinates and computes
+   `RecoveryImageCoordinates` from the full-resolution raster.
+7. Calls `RenderConvertedCropPreview` (`:4184-4351`) on the full cache.
+8. For fit and 50%, resizes the cached full preview with an area-average filter
+   (`ScalePreviewImageForDisplay`); the mask is reduced with the same boxes.
+   Zoom changes only repeat this resize, never the processing stages.
 
 `RenderConvertedCropPreview` applies the same enhancement and recovery stages as
 full conversion, then `BuildDisplayPreviewFromRaster` (`:3607`) produces the
