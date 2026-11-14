@@ -10,6 +10,9 @@ constexpr float kStage2GainMax = 4.0f;
 constexpr float kStage2FineFromSmallScale = 1.6f;
 
 inline float ClampStage2Gain(float gain) {
+  if (!std::isfinite(gain)) {
+    return 1.0f;
+  }
   return std::clamp(gain, kStage2GainMin, kStage2GainMax);
 }
 
@@ -58,6 +61,16 @@ inline float ClampStage2Gain(float gain) {
 #include "hiraco_guided_filter.h"
 
 namespace {
+
+struct LibRawProcessedImageDeleter {
+  void operator()(libraw_processed_image_t* image) const {
+    if (image != nullptr) {
+      LibRaw::dcraw_clear_mem(image);
+    }
+  }
+};
+using LibRawProcessedImagePtr =
+    std::unique_ptr<libraw_processed_image_t, LibRawProcessedImageDeleter>;
 
 struct LinearDngPayload {
   RasterImage raw_image;
@@ -141,9 +154,14 @@ void FinalizeStage2Settings(ResolvedStageSettings* settings) {
   settings->stage2_gain3 = ClampStage2Gain(settings->stage2_gain3);
 }
 
+float SanitizeStageValue(float value, float fallback, float minimum, float maximum) {
+  if (!std::isfinite(value)) {
+    return fallback;
+  }
+  return std::clamp(value, minimum, maximum);
+}
+
 ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMetadata& metadata,
-                                                       uint32_t width,
-                                                       uint32_t height,
                                                        const StageOverrideSet& overrides) {
   (void) metadata;
 
@@ -175,6 +193,18 @@ ResolvedStageSettings ResolveStageSettingsForImageImpl(const SourceLinearDngMeta
   }
 
   FinalizeStage2Settings(&settings);
+
+  // Overrides come from environment variables and from the browser, so they
+  // can contain NaN, infinities or values outside the UI ranges.  Clamping
+  // here keeps a typo from turning into NaN pixels or a negative Halide loop
+  // extent.
+  settings.stage1_psf_sigma =
+      SanitizeStageValue(settings.stage1_psf_sigma, 1.0f, 0.5f, 4.0f);
+  settings.stage1_nsr = SanitizeStageValue(settings.stage1_nsr, 0.09f, 0.0f, 0.2f);
+  settings.stage2_denoise =
+      SanitizeStageValue(settings.stage2_denoise, 0.33f, 0.0f, 1.0f);
+  settings.stage3_radius = std::clamp(settings.stage3_radius, 1, 16);
+  settings.stage3_gain = SanitizeStageValue(settings.stage3_gain, 0.5f, 0.0f, 4.0f);
 
   return settings;
 }
@@ -836,56 +866,24 @@ RenderSettings BuildLinearPreviewProbeSettings(const SourceLinearDngMetadata& me
   return settings;
 }
 
-RenderSettings BuildCfaGuideRenderSettings(const SourceLinearDngMetadata& metadata,
-                                          const LibRawOverrideSet& libraw_overrides) {
-  return BuildRawRenderSettings(metadata, libraw_overrides);
+bool IsOm3HighResGeometry(const SourceLinearDngMetadata& metadata, const RasterImage& image) {
+  if (!IsOm3HighResMetadata(metadata) || image.colors != 3) {
+    return false;
+  }
+  if (metadata.default_crop_width == 8160) {
+    return image.width == 8172 && image.height == 6132;
+  }
+  return image.width == 10386 && image.height == 7792;
 }
 
 bool ShouldApplyOm3SourceDrivenLinearTransform(const SourceLinearDngMetadata& metadata,
                                                const RasterImage& image) {
-  if (!metadata.has_black_level || !metadata.has_as_shot_neutral) {
-    return false;
-  }
-
-  const bool is_50mp_high_res = metadata.default_crop_origin_h == 6 &&
-                                metadata.default_crop_origin_v == 6 &&
-                                metadata.default_crop_width == 8160 &&
-                                metadata.default_crop_height == 6120 &&
-                                image.width == 8172 &&
-                                image.height == 6132;
-  const bool is_80mp_high_res = metadata.default_crop_origin_h == 8 &&
-                                metadata.default_crop_origin_v == 8 &&
-                                metadata.default_crop_width == 10368 &&
-                                metadata.default_crop_height == 7776 &&
-                                image.width == 10386 &&
-                                image.height == 7792;
-  const bool is_standard_20mp = metadata.default_crop_origin_h == 12 &&
-                                metadata.default_crop_origin_v == 12 &&
-                                metadata.default_crop_width == 5184 &&
-                                metadata.default_crop_height == 3888 &&
-                                image.width == 5220 &&
-                                image.height == 3912;
-  return is_50mp_high_res || is_80mp_high_res || is_standard_20mp;
-}
-
-bool IsOm3HighResRaster(const SourceLinearDngMetadata& metadata,
-                        const RasterImage& image) {
-  if (image.colors != 3) return false;
-  // 50 MP hand-held
-  if (metadata.default_crop_origin_h == 6 &&
-      metadata.default_crop_origin_v == 6 &&
-      metadata.default_crop_width == 8160 &&
-      metadata.default_crop_height == 6120 &&
-      image.width == 8172 &&
-      image.height == 6132) return true;
-  // 80 MP tripod
-  if (metadata.default_crop_origin_h == 8 &&
-      metadata.default_crop_origin_v == 8 &&
-      metadata.default_crop_width == 10368 &&
-      metadata.default_crop_height == 7776 &&
-      image.width == 10386 &&
-      image.height == 7792) return true;
-  return false;
+  // Only the custom raw-domain high-resolution path produces camera-space
+  // pixels.  The standard LibRaw path is already white balanced and colour
+  // matrixed (use_camera_wb/use_camera_matrix in BuildRawRenderSettings), so
+  // dividing it by the camera neutral again corrupts its colour.
+  return metadata.has_black_level && metadata.has_as_shot_neutral &&
+         IsOm3HighResGeometry(metadata, image);
 }
 
 bool ShouldApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
@@ -898,36 +896,10 @@ bool ShouldApplyPredictedDetailGain(const SourceLinearDngMetadata& metadata,
 
 bool ShouldUseOm3AdobeMetadata(const SourceLinearDngMetadata& metadata,
                                const RasterImage& image) {
-  if (!metadata.has_black_level || !metadata.has_as_shot_neutral) {
-    return false;
-  }
-
-  const bool is_50mp_high_res = metadata.default_crop_origin_h == 6 &&
-                                metadata.default_crop_origin_v == 6 &&
-                                metadata.default_crop_width == 8160 &&
-                                metadata.default_crop_height == 6120 &&
-                                image.width == 8172 &&
-                                image.height == 6132;
-  const bool is_80mp_high_res = metadata.default_crop_origin_h == 8 &&
-                                metadata.default_crop_origin_v == 8 &&
-                                metadata.default_crop_width == 10368 &&
-                                metadata.default_crop_height == 7776 &&
-                                image.width == 10386 &&
-                                image.height == 7792;
-  const bool is_standard_20mp = metadata.default_crop_origin_h == 12 &&
-                                metadata.default_crop_origin_v == 12 &&
-                                metadata.default_crop_width == 5184 &&
-                                metadata.default_crop_height == 3888 &&
-                                image.width == 5220 &&
-                                image.height == 3912;
-  return is_50mp_high_res || is_80mp_high_res || is_standard_20mp;
-}
-
-double SourceDrivenBaselineExposure(const SourceLinearDngMetadata& metadata,
-                                    const RasterImage& image) {
-  (void)metadata;
-  (void)image;
-  return 0.0;
+  // The camera-space profile is only valid for the raw-domain high-resolution
+  // path; the standard LibRaw path writes display-referred sRGB data.
+  return metadata.has_black_level && metadata.has_as_shot_neutral &&
+         IsOm3HighResGeometry(metadata, image);
 }
 
 void ApplySourceDrivenLinearPreviewTransform(const SourceLinearDngMetadata& metadata,
@@ -985,41 +957,34 @@ void ApplySourceDrivenLinearPreviewTransform(const SourceLinearDngMetadata& meta
   }
 }
 
+const std::array<uint16_t, 65536>& SrgbGammaLut() {
+  static const std::array<uint16_t, 65536> lut = []() {
+    std::array<uint16_t, 65536> table{};
+    for (size_t index = 0; index < table.size(); ++index) {
+      const double linear = static_cast<double>(index) / 65535.0;
+      const double srgb = linear <= 0.0031308
+          ? linear * 12.92
+          : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
+      table[index] = static_cast<uint16_t>(
+          std::clamp(srgb * 65535.0, 0.0, 65535.0));
+    }
+    return table;
+  }();
+  return lut;
+}
+
 void ApplyLinearSrgbGamma(RasterImage* image) {
   if (image == nullptr || image->colors < 3) {
     return;
   }
 
+  const auto& lut = SrgbGammaLut();
   const size_t pixel_count = static_cast<size_t>(image->width) * image->height;
   #pragma omp parallel for schedule(static) if(pixel_count > 100000)
   for (size_t index = 0; index < pixel_count; ++index) {
     const size_t sample_index = index * image->colors;
     for (size_t channel = 0; channel < 3; ++channel) {
-      const double linear = static_cast<double>(image->pixels[sample_index + channel]) / 65535.0;
-      const double srgb = linear <= 0.0031308
-          ? linear * 12.92
-          : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
-      image->pixels[sample_index + channel] = static_cast<uint16_t>(
-          std::clamp(srgb * 65535.0, 0.0, 65535.0));
-    }
-  }
-}
-
-void ApplyLinearExposureCompensation(double exposure_ev, RasterImage* image) {
-  if (image == nullptr || image->colors < 3 || std::abs(exposure_ev) < 1e-9) {
-    return;
-  }
-
-  const double multiplier = std::pow(2.0, exposure_ev);
-  const size_t pixel_count = static_cast<size_t>(image->width) * image->height;
-  #pragma omp parallel for schedule(static) if(pixel_count > 100000)
-  for (size_t index = 0; index < pixel_count; ++index) {
-    const size_t sample_index = index * image->colors;
-    for (size_t channel = 0; channel < 3; ++channel) {
-      image->pixels[sample_index + channel] = static_cast<uint16_t>(
-          std::clamp(static_cast<double>(image->pixels[sample_index + channel]) * multiplier,
-                     0.0,
-                     65535.0));
+      image->pixels[sample_index + channel] = lut[image->pixels[sample_index + channel]];
     }
   }
 }
@@ -1794,7 +1759,7 @@ bool IsSupportedWriteCompression(const std::string& compression) {
   return compression == "uncompressed" || compression == "deflate" || compression == "jpeg-xl";
 }
 
-std::string UnsupportedCompressionMessage(const std::string& compression) {
+std::string UnsupportedCompressionMessage(const std::string&) {
   return "Unsupported compression requested for the current DNG writer path";
 }
 
@@ -2038,14 +2003,13 @@ bool RenderLibRawImage(const std::string& source_path,
   }
 
   int mem_error = LIBRAW_SUCCESS;
-  libraw_processed_image_t* processed = nullptr;
+  LibRawProcessedImagePtr processed;
   {
     const hiraco::ScopedTimingLog step_timer("libraw", "dcraw_make_mem_image");
-    processed = processor->dcraw_make_mem_image(&mem_error);
+    processed.reset(processor->dcraw_make_mem_image(&mem_error));
   }
-  if (processed == nullptr || mem_error != LIBRAW_SUCCESS) {
+  if (!processed || mem_error != LIBRAW_SUCCESS) {
     *error_message = std::string("LibRaw dcraw_make_mem_image failed: ") + libraw_strerror(mem_error);
-    LibRaw::dcraw_clear_mem(processed);
     processor->recycle();
     return false;
   }
@@ -2053,7 +2017,6 @@ bool RenderLibRawImage(const std::string& source_path,
   if (processed->bits != 16 ||
       (expected_colors > 0 && processed->colors != expected_colors)) {
     *error_message = "LibRaw produced an unexpected processed image format";
-    LibRaw::dcraw_clear_mem(processed);
     processor->recycle();
     return false;
   }
@@ -2066,6 +2029,11 @@ bool RenderLibRawImage(const std::string& source_path,
   const size_t sample_count = static_cast<size_t>(processed->width) *
                               static_cast<size_t>(processed->height) *
                               static_cast<size_t>(processed->colors);
+  if (processed->data_size < sample_count * sizeof(uint16_t)) {
+    *error_message = "LibRaw returned fewer samples than the image dimensions require";
+    processor->recycle();
+    return false;
+  }
   output->pixels.resize(sample_count);
 
   {
@@ -2074,7 +2042,6 @@ bool RenderLibRawImage(const std::string& source_path,
     std::copy(source_pixels, source_pixels + sample_count, output->pixels.begin());
   }
 
-  LibRaw::dcraw_clear_mem(processed);
   processor->recycle();
   return true;
 }
@@ -3837,6 +3804,46 @@ void ApplyLibRawOrientationToPreview(int libraw_flip, PreviewImage* preview) {
   preview->pixels = std::move(rotated);
 }
 
+void ApplyLibRawOrientationToMask(int libraw_flip,
+                                  uint32_t source_width,
+                                  uint32_t source_height,
+                                  std::vector<uint8_t>* mask) {
+  if (mask == nullptr || source_width == 0 || source_height == 0 ||
+      mask->size() != static_cast<size_t>(source_width) * source_height) {
+    return;
+  }
+
+  const int normalized_flip = NormalizeLibRawFlip(libraw_flip);
+  if (normalized_flip == 0) {
+    return;
+  }
+
+  const uint32_t target_width = OrientedImageWidth(source_width, source_height, normalized_flip);
+  const uint32_t target_height = OrientedImageHeight(source_width, source_height, normalized_flip);
+  std::vector<uint8_t> rotated(static_cast<size_t>(target_width) * target_height, 0);
+
+  #pragma omp parallel for schedule(static) if(source_height > 400)
+  for (uint32_t row = 0; row < source_height; ++row) {
+    for (uint32_t col = 0; col < source_width; ++col) {
+      uint32_t target_col = col;
+      uint32_t target_row = row;
+      if ((normalized_flip & 1) != 0) {
+        target_col = source_width - 1 - target_col;
+      }
+      if ((normalized_flip & 2) != 0) {
+        target_row = source_height - 1 - target_row;
+      }
+      if ((normalized_flip & 4) != 0) {
+        std::swap(target_col, target_row);
+      }
+      rotated[static_cast<size_t>(target_row) * target_width + target_col] =
+          (*mask)[static_cast<size_t>(row) * source_width + col];
+    }
+  }
+
+  *mask = std::move(rotated);
+}
+
 int InverseLibRawFlip(int libraw_flip) {
   switch (NormalizeLibRawFlip(libraw_flip)) {
     case 5:
@@ -3862,8 +3869,6 @@ PreviewImage BuildDisplayPreviewFromRaster(const SourceLinearDngMetadata& metada
   }
   if (source_is_camera_space) {
     ApplySourceDrivenLinearPreviewTransform(metadata, &preview_raster);
-    ApplyLinearExposureCompensation(SourceDrivenBaselineExposure(metadata, preview_raster),
-                                    &preview_raster);
   }
   ApplyLinearGain(extra_linear_gain, &preview_raster);
   ApplyLinearSrgbGamma(&preview_raster);
@@ -3903,6 +3908,9 @@ RasterImage CropRasterImageWithBorder(const RasterImage& source,
                                       const CropRect& crop,
                                       uint32_t border) {
   RasterImage result;
+  if (source.width == 0 || source.height == 0 || source.colors == 0) {
+    return result;
+  }
   result.width = crop.width + 2 * border;
   result.height = crop.height + 2 * border;
   result.colors = source.colors;
@@ -3934,8 +3942,15 @@ RasterImage CropRasterImageWithBorder(const RasterImage& source,
 RasterImage CropRasterImage(const RasterImage& source,
                            const CropRect& crop) {
   RasterImage result;
-  result.width = crop.width;
-  result.height = crop.height;
+  if (source.width == 0 || source.height == 0 || source.colors == 0) {
+    return result;
+  }
+  // Crop rectangles can originate in raw-sensor coordinates while the
+  // rendered raster uses LibRaw's active-area dimensions.  Clamp instead of
+  // indexing past the source when the two differ.
+  const CropRect safe = ClampCropRectToBounds(crop, source.width, source.height);
+  result.width = safe.width;
+  result.height = safe.height;
   result.colors = source.colors;
   result.bits = source.bits;
   result.pixels.resize(static_cast<size_t>(result.width) * result.height * result.colors, 0);
@@ -3944,10 +3959,10 @@ RasterImage CropRasterImage(const RasterImage& source,
   // without any synchronization.
   #pragma omp parallel for schedule(static) if(result.height > 100)
   for (uint32_t row = 0; row < result.height; ++row) {
-    const size_t src_row = static_cast<size_t>(crop.y + row) * source.width;
+    const size_t src_row = static_cast<size_t>(safe.y + row) * source.width;
     const size_t dst_row = static_cast<size_t>(row) * result.width;
     for (uint32_t col = 0; col < result.width; ++col) {
-      const size_t src_index = (src_row + crop.x + col) * source.colors;
+      const size_t src_index = (src_row + safe.x + col) * source.colors;
       const size_t dst_index = (dst_row + col) * result.colors;
       for (uint32_t channel = 0; channel < result.colors; ++channel) {
         result.pixels[dst_index + channel] = source.pixels[src_index + channel];
@@ -4046,8 +4061,7 @@ void PopulateLinearRawNegative(dng_host& host,
                                const std::string& source_path,
                                const RasterImage& raw_image,
                                const SourceLinearDngMetadata& metadata,
-                               dng_negative& negative,
-                               double preview_auto_bright_gain) {
+                               dng_negative& negative) {
   const std::string model_name = metadata.unique_camera_model.empty() ? "hiraco" : metadata.unique_camera_model;
   const std::string local_name = metadata.model.empty() ? "hiraco" : metadata.model;
 
@@ -4057,8 +4071,15 @@ void PopulateLinearRawNegative(dng_host& host,
   negative.SetColorChannels(raw_image.colors);
   negative.SetBaseOrientation(dng_orientation::TIFFtoDNG(LibRawFlipToTiffOrientation(metadata.libraw_flip)));
   if (metadata.has_default_crop) {
-    negative.SetDefaultCropOrigin(metadata.default_crop_origin_h, metadata.default_crop_origin_v);
-    negative.SetDefaultCropSize(metadata.default_crop_width, metadata.default_crop_height);
+    const CropRect crop = ClampCropRectToBounds(
+        CropRect{metadata.default_crop_origin_h,
+                 metadata.default_crop_origin_v,
+                 metadata.default_crop_width,
+                 metadata.default_crop_height},
+        raw_image.width,
+        raw_image.height);
+    negative.SetDefaultCropOrigin(crop.x, crop.y);
+    negative.SetDefaultCropSize(crop.width, crop.height);
   } else {
     negative.SetDefaultCropOrigin(0, 0);
     negative.SetDefaultCropSize(raw_image.width, raw_image.height);
@@ -4074,7 +4095,7 @@ void PopulateLinearRawNegative(dng_host& host,
   }
   negative.SetWhiteLevel((1u << raw_image.bits) - 1);
   // BaselineExposure 0: pixel values are already correctly normalised to [BlackLevel, WhiteLevel].
-  // preview_auto_bright_gain is a GUI display convenience only — embedding it here would
+  // The GUI preview gain is a display convenience only — embedding it here would
   // make downstream apps render the DNG several EV brighter than the original raw.
   negative.SetBaselineExposure(0.0);
   negative.SetLinearResponseLimit(1.0);
@@ -4177,7 +4198,11 @@ ResolvedStageSettings ResolveStageSettingsForImage(const SourceLinearDngMetadata
                                                    uint32_t width,
                                                    uint32_t height,
                                                    const StageOverrideSet& overrides) {
-  return ResolveStageSettingsForImageImpl(metadata, width, height, overrides);
+  // Width and height are part of the public API so a future image-dependent
+  // default can use them; the current defaults are global.
+  (void)width;
+  (void)height;
+  return ResolveStageSettingsForImageImpl(metadata, overrides);
 }
 
 namespace {
@@ -4422,7 +4447,13 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
                                             kCropPreviewProcessingBorder);
     cache->region_origin_x = cache_region.x;
     cache->region_origin_y = cache_region.y;
-    cache->has_cached_crop = true;
+    // A cache that already covers the whole frame must not enter the
+    // "cached sub-region" path: that path copies the whole raster and runs the
+    // enhancement pipeline on it before cropping.  Leaving the flag false lets
+    // a small crop use the crop-first path instead.
+    cache->has_cached_crop =
+        !(cache_region.x == 0 && cache_region.y == 0 &&
+          cache_region.width == source_width && cache_region.height == source_height);
   }
 
   if (IsOm3HighResMetadata(metadata)) {
@@ -4447,6 +4478,26 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
       }
     }
 
+    // LibRaw can return the active area while the prepared source carries the
+    // raw-sensor dimensions.  Re-anchor the crop and the cache region to what
+    // was actually rendered before cropping, so a later crop cannot address
+    // outside the raster.
+    if (rendered_image.width != 0 && rendered_image.height != 0 &&
+        (cache->source_width != rendered_image.width ||
+         cache->source_height != rendered_image.height)) {
+      cache->source_width = rendered_image.width;
+      cache->source_height = rendered_image.height;
+      if (cache->has_cached_crop) {
+        cache->cached_crop_rect = ClampCropRectToBounds(
+            cache->cached_crop_rect, cache->source_width, cache->source_height);
+        cache_region = ExpandCropRectWithBorder(cache->cached_crop_rect,
+                                                cache->source_width,
+                                                cache->source_height,
+                                                kCropPreviewProcessingBorder);
+        cache->region_origin_x = cache_region.x;
+        cache->region_origin_y = cache_region.y;
+      }
+    }
     if (cache->has_cached_crop) {
       cache->raw_image = CropRasterImage(rendered_image, cache_region);
     } else {
@@ -4693,15 +4744,24 @@ bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
     ReapplyCameraSpacePedestal(camera_pedestal, &final_crop);
   }
 
+  const uint32_t mask_source_width = final_crop.width;
+  const uint32_t mask_source_height = final_crop.height;
   *preview = BuildDisplayPreviewFromRaster(metadata,
                                            std::move(final_crop),
                                            cache.raw_image_is_camera_space,
                                            max_dimension,
                                            cache.preview_auto_bright_gain);
   // The mask is taken in the crop raster's coordinates, which are the preview's
-  // coordinates as long as no downscaling happened between them.  Only attach it
-  // when the dimensions still agree, so a caller can never be handed a mask with
-  // a different index space than the pixels it is drawn over.
+  // coordinates only when the preview was neither scaled nor rotated.  Rotate
+  // it with the image first; a 90°/270° flip keeps the pixel count, so a
+  // size check alone would accept a mask indexing the wrong pixels.
+  if (!recovered_mask.empty() &&
+      recovered_mask.size() == static_cast<size_t>(mask_source_width) * mask_source_height) {
+    ApplyLibRawOrientationToMask(metadata.libraw_flip,
+                                 mask_source_width,
+                                 mask_source_height,
+                                 &recovered_mask);
+  }
   if (!recovered_mask.empty() && preview->width != 0 && preview->height != 0 &&
       recovered_mask.size() ==
           static_cast<size_t>(preview->width) * preview->height) {
@@ -4763,11 +4823,26 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const StageOverrideSet& stage_overrides,
                                      const LibRawOverrideSet& libraw_overrides,
                                      std::shared_ptr<const PreviewImage> preview_override,
-                                     double preview_auto_bright_gain,
                                      ProgressCallback progress,
                                      CancelCheck cancel) {
   const hiraco::ScopedTimingLog convert_timer("convert", "Write linear DNG from raw");
   DngWriteResult result;
+
+  // Write to a sibling temporary file and publish it only after the writer
+  // succeeds.  A cancelled or failed run must not leave a truncated DNG at the
+  // user's target path (the next run might skip it as "already converted").
+  const std::filesystem::path output_fs_path(output_path);
+  std::filesystem::path temporary_fs_path = output_fs_path;
+  temporary_fs_path += ".tmp";
+  const std::string temporary_output_path = temporary_fs_path.string();
+  {
+    std::error_code remove_error;
+    std::filesystem::remove(temporary_fs_path, remove_error);
+  }
+  const auto remove_temporary = [&temporary_fs_path]() {
+    std::error_code remove_error;
+    std::filesystem::remove(temporary_fs_path, remove_error);
+  };
 
   if (!IsSupportedWriteCompression(compression)) {
     result.message = UnsupportedCompressionMessage(compression);
@@ -4891,46 +4966,64 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
     ConfigureHost(host, compression);
 
     AutoPtr<dng_negative> negative(host.Make_dng_negative());
-    PopulateLinearRawNegative(host, source_path, payload.raw_image, metadata, *negative.Get(), preview_auto_bright_gain);
+    if (!negative.Get()) {
+      result.message = "the DNG SDK could not allocate a negative";
+      return result;
+    }
+    PopulateLinearRawNegative(host, source_path, payload.raw_image, metadata, *negative.Get());
 
     dng_preview_list preview_list;
     AppendImagePreview(host, preview_image, &preview_list);
 
-    const std::filesystem::path output_fs_path(output_path);
     if (!output_fs_path.parent_path().empty()) {
       std::filesystem::create_directories(output_fs_path.parent_path());
     }
 
-    dng_file_stream stream(output_path.c_str(), true);
-    dng_image_writer writer;
-    if (compression == "jpeg-xl") {
-      ReportProgress(progress, "convert", 0.92, "Compressing JPEG-XL");
-      sniffer.BeginTimedProgress("Compressing JPEG-XL", 0.92, 0.95, 8.0);
-      {
-        const hiraco::ScopedTimingLog timer("convert", "LosslessCompressJXL");
-        negative->LosslessCompressJXL(host, writer, false);
+    {
+      dng_file_stream stream(temporary_output_path.c_str(), true);
+      dng_image_writer writer;
+      if (compression == "jpeg-xl") {
+        ReportProgress(progress, "convert", 0.92, "Compressing JPEG-XL");
+        sniffer.BeginTimedProgress("Compressing JPEG-XL", 0.92, 0.95, 8.0);
+        {
+          const hiraco::ScopedTimingLog timer("convert", "LosslessCompressJXL");
+          negative->LosslessCompressJXL(host, writer, false);
+        }
+        sniffer.EndTimedProgress();
       }
-      sniffer.EndTimedProgress();
+
+      ReportProgress(progress, "convert", 0.95, "Writing DNG");
+      {
+        const hiraco::ScopedTimingLog timer("convert", "Write DNG stream");
+        writer.WriteDNG(host,
+                        stream,
+                        *negative.Get(),
+                        &preview_list,
+                        DngVersionForCompression(compression),
+                        compression == "uncompressed");
+        stream.Flush();
+      }
     }
 
-    ReportProgress(progress, "convert", 0.95, "Writing DNG");
-    {
-      const hiraco::ScopedTimingLog timer("convert", "Write DNG stream");
-      writer.WriteDNG(host,
-                      stream,
-                      *negative.Get(),
-                      &preview_list,
-                      DngVersionForCompression(compression),
-                      compression == "uncompressed");
-      stream.Flush();
+    std::error_code rename_error;
+    // On Windows rename does not replace an existing target.
+    std::filesystem::remove(output_fs_path, rename_error);
+    rename_error.clear();
+    std::filesystem::rename(temporary_fs_path, output_fs_path, rename_error);
+    if (rename_error) {
+      remove_temporary();
+      result.message = "could not publish the written DNG: " + rename_error.message();
+      return result;
     }
 
     result.ok = true;
     result.message = "native linear DNG write succeeded";
     ReportProgress(progress, "convert", 1.0, "Conversion complete");
   } catch (const dng_exception& exc) {
+    remove_temporary();
     result.message = exc.what();
   } catch (const std::exception& exc) {
+    remove_temporary();
     result.message = exc.what();
   }
 

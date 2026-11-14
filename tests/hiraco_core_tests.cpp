@@ -1,12 +1,15 @@
 #include "dng_writer_bridge.h"
 #include "dng_sdk_bridge.h"
 #include "hiraco_core.h"
+#include "vendor_makernote.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -279,6 +282,71 @@ void TestResolveOutputPath() {
   const auto resolved = ResolveOutputPath("/tmp/input/scene.ORF", "/tmp/output", "session-a");
   Expect(resolved == std::filesystem::path("/tmp/output/session-a/scene.dng"),
          "output path should use chosen base directory and relative subfolder");
+}
+
+void TestMalformedMakerNoteDoesNotReadOutOfBounds() {
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() / "hiraco-malformed-makernote.orf";
+  std::vector<uint8_t> data(26, 0);
+  const auto put16 = [&data](size_t offset, uint16_t value) {
+    data[offset] = static_cast<uint8_t>(value & 0xFF);
+    data[offset + 1] = static_cast<uint8_t>(value >> 8);
+  };
+  const auto put32 = [&data](size_t offset, uint32_t value) {
+    for (size_t index = 0; index < 4; ++index) {
+      data[offset + index] = static_cast<uint8_t>((value >> (8 * index)) & 0xFF);
+    }
+  };
+  data[0] = 'I';
+  data[1] = 'I';
+  put16(2, 42);
+  put32(4, 8);
+  // One IFD0 entry: an EXIF pointer whose out-of-line value sits far past the
+  // end of the file.  Before the bounds checks this crashed inside ReadU32.
+  put16(8, 1);
+  put16(10, 0x8769);
+  put16(12, 5);          // RATIONAL
+  put32(14, 1);
+  put32(18, 0xFFFFFFF0);
+  put32(22, 0);
+
+  {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(data.data()),
+               static_cast<std::streamsize>(data.size()));
+  }
+  const VendorMakerNoteResult result = ReadVendorMakerNote(path.string());
+  Expect(!result.ok, "a malformed MakerNote must fail instead of reading out of bounds");
+  std::error_code error;
+  std::filesystem::remove(path, error);
+}
+
+void TestPathsReferToSameFile() {
+  const std::filesystem::path directory =
+      std::filesystem::temp_directory_path() / "hiraco-paths-refer-test";
+  std::error_code error;
+  std::filesystem::remove_all(directory, error);
+  std::filesystem::create_directories(directory, error);
+  Expect(!error, "the path test needs a writable temporary directory");
+
+  const std::filesystem::path source = directory / "scene.ORF";
+  {
+    std::ofstream file(source);
+    file << "fixture";
+  }
+
+  Expect(PathsReferToSameFile(source, directory / "." / "scene.ORF"),
+         "a path spelled with a dot component should still name the source");
+  Expect(PathsReferToSameFile(source, directory / "nested" / ".." / "scene.ORF"),
+         "a path traversing a missing directory with .. should still name the source");
+  Expect(!PathsReferToSameFile(source, directory / "scene.dng"),
+         "a different target must not be reported as the source");
+  Expect(PathsReferToSameFile(directory / "new.dng", directory / "nested" / ".." / "new.dng"),
+         "two spellings of a not-yet-existing target should compare equal");
+  Expect(!PathsReferToSameFile({}, source),
+         "an empty path must never be reported as the source");
+
+  std::filesystem::remove_all(directory, error);
 }
 
 void TestOverwriteDecision() {
@@ -751,6 +819,51 @@ void TestFullPreviewObeysDisplayDimension() {
     Expect(std::abs(actual_aspect - expected_aspect) < 0.02,
            "full preview should preserve the source aspect ratio");
   }
+}
+
+void TestStandard20MpPreviewColourIsStableAcrossZoom() {
+  // The standard 20 MP path is rendered by LibRaw, which already applies the
+  // camera white balance and colour matrix.  Applying the camera-space
+  // transform on top of that multiplied the red and blue channels again and
+  // made the 100% preview differ in colour from the fit-sized one.
+  const std::filesystem::path source_path = RealOrfFixturePath("sample/_8142489_.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
+
+  PreparedSource prepared;
+  std::string error_message;
+  Expect(PrepareSource(source_path.string(), &prepared, &error_message),
+         "standard 20 MP test should prepare source: " + error_message);
+
+  const auto channel_ratio = [](const PreviewImage& preview) {
+    std::array<double, 3> sums = {0.0, 0.0, 0.0};
+    const size_t count = static_cast<size_t>(preview.width) * preview.height;
+    for (size_t index = 0; index < count; ++index) {
+      for (size_t channel = 0; channel < 3; ++channel) {
+        sums[channel] += preview.pixels[index * preview.colors + channel];
+      }
+    }
+    return std::array<double, 2>{sums[0] / sums[1], sums[2] / sums[1]};
+  };
+
+  auto display_preview = std::make_shared<PreviewImage>();
+  Expect(RenderConvertedFullPreview(&prepared, {}, 512, display_preview, {}, {}, {},
+                                    &error_message),
+         "standard 20 MP fit preview should succeed: " + error_message);
+  auto full_preview = std::make_shared<PreviewImage>();
+  Expect(RenderConvertedFullPreview(&prepared, {}, 0, full_preview, {}, {}, {},
+                                    &error_message),
+         "standard 20 MP 100% preview should succeed: " + error_message);
+
+  const std::array<double, 2> display_ratio = channel_ratio(*display_preview);
+  const std::array<double, 2> full_ratio = channel_ratio(*full_preview);
+  Expect(std::abs(display_ratio[0] - full_ratio[0]) < 0.03 &&
+             std::abs(display_ratio[1] - full_ratio[1]) < 0.03,
+         "standard 20 MP preview colour must not change with zoom (fit R/G " +
+             std::to_string(display_ratio[0]) + " vs full R/G " +
+             std::to_string(full_ratio[0]) + ", fit B/G " +
+             std::to_string(display_ratio[1]) + " vs full B/G " +
+             std::to_string(full_ratio[1]) + ")");
 }
 
 void TestFullPreviewOrientationMatchesLibRawFlip() {
@@ -1407,6 +1520,8 @@ void TestApplyRecoveredPixelCast() {
 int main() {
   try {
     TestResolveOutputPath();
+    TestPathsReferToSameFile();
+    TestMalformedMakerNoteDoesNotReadOutOfBounds();
     TestOverwriteDecision();
     TestCropHelpers();
     TestResolvedStageDefaults();
@@ -1417,6 +1532,7 @@ int main() {
     TestLocalOm3RecoveryFullPreviewSmoke();
     TestLocalOm3RecoveryCropPreviewMapping();
     TestFullPreviewObeysDisplayDimension();
+    TestStandard20MpPreviewColourIsStableAcrossZoom();
     TestFullPreviewOrientationMatchesLibRawFlip();
     TestFullPreviewHonoursCancellation();
     TestFullPreviewReusesCachedPreview();

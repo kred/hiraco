@@ -132,6 +132,12 @@ std::filesystem::path ResolveOutputPath(const std::string& source_path,
                                         const std::filesystem::path& base_output_dir,
                                         const std::filesystem::path& relative_subdir);
 
+// Whether two paths name the same file, including through symlinks, hard links
+// or a not-yet-existing target reached by different spellings.  Used to refuse
+// conversions whose output would overwrite the source RAW.
+bool PathsReferToSameFile(const std::filesystem::path& left,
+                          const std::filesystem::path& right);
+
 OverwriteDecision ResolveOverwriteDecision(OverwritePolicy current_policy,
                                            bool target_exists,
                                            OverwriteResponse response);

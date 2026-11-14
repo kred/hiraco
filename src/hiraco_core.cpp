@@ -307,7 +307,11 @@ SourceLinearDngMetadata BuildMetadataFromLibRaw(const std::string& source_path,
 
   const unsigned raw_white = decode_summary.white_level;
   if (raw_white > 0) {
-    const unsigned raw_bits = 32u - static_cast<unsigned>(__builtin_clz(raw_white));
+    // Portable bit width: __builtin_clz is not available in MSVC builds.
+    unsigned raw_bits = 0;
+    for (unsigned value = raw_white; value != 0; value >>= 1) {
+      ++raw_bits;
+    }
     const unsigned shift = std::max(0, 16 - static_cast<int>(raw_bits));
     metadata.has_black_level = true;
     metadata.black_level = static_cast<double>(decode_summary.black_level) * (1u << shift);
@@ -491,6 +495,7 @@ struct PreparedSourceData {
   std::mutex mutex;
   bool has_original_preview = false;
   std::shared_ptr<const PreviewImage> original_preview;
+  LibRawOverrideSet original_preview_libraw_overrides;
   bool has_converted_full_preview = false;
   PreviewImage converted_full_preview;
   StageOverrideSet converted_full_preview_stage_overrides;
@@ -629,7 +634,12 @@ bool PrepareSource(const std::string& source_path,
     return false;
   }
 
-  if (!std::filesystem::exists(source_path)) {
+  std::error_code exists_error;
+  if (!std::filesystem::exists(source_path, exists_error)) {
+    if (exists_error) {
+      *error_message = "could not inspect the source file: " + exists_error.message();
+      return false;
+    }
     *error_message = "source file does not exist: " + source_path;
     return false;
   }
@@ -676,6 +686,10 @@ bool RenderOriginalPreview(PreparedSource* prepared,
                            ProgressCallback progress,
                            CancelCheck cancel,
                            std::string* error_message) {
+  std::string fallback_error;
+  if (error_message == nullptr) {
+    error_message = &fallback_error;
+  }
   if (prepared == nullptr || !preview) {
     if (error_message != nullptr) {
       *error_message = "invalid preview request";
@@ -694,7 +708,8 @@ bool RenderOriginalPreview(PreparedSource* prepared,
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
     if (prepared->data->has_original_preview &&
         prepared->data->original_preview &&
-        LibRawOverridesEqual(prepared->data->cached_libraw_overrides, libraw_overrides)) {
+        LibRawOverridesEqual(prepared->data->original_preview_libraw_overrides,
+                             libraw_overrides)) {
       *preview = *prepared->data->original_preview;
       return true;
     }
@@ -712,7 +727,7 @@ bool RenderOriginalPreview(PreparedSource* prepared,
 
   std::lock_guard<std::mutex> lock(prepared->data->mutex);
   prepared->data->has_original_preview = true;
-  prepared->data->cached_libraw_overrides = libraw_overrides;
+  prepared->data->original_preview_libraw_overrides = libraw_overrides;
   prepared->data->original_preview = preview;
   return true;
 }
@@ -727,7 +742,8 @@ bool TryGetCachedOriginalPreview(const PreparedSource& prepared,
   std::lock_guard<std::mutex> lock(prepared.data->mutex);
   if (!prepared.data->has_original_preview ||
       !prepared.data->original_preview ||
-      !LibRawOverridesEqual(prepared.data->cached_libraw_overrides, libraw_overrides)) {
+      !LibRawOverridesEqual(prepared.data->original_preview_libraw_overrides,
+                            libraw_overrides)) {
     return false;
   }
 
@@ -758,7 +774,8 @@ size_t GetPreviewCacheBytes(const PreparedSource& prepared) {
     return image.pixels.size() * sizeof(uint16_t);
   };
   const auto preview_bytes = [](const PreviewImage& image) {
-    return image.pixels.size() * sizeof(uint8_t);
+    return image.pixels.size() * sizeof(uint8_t) +
+           image.recovered_mask.size() * sizeof(uint8_t);
   };
 
   std::lock_guard<std::mutex> lock(prepared.data->mutex);
@@ -786,6 +803,10 @@ bool RenderConvertedCrop(PreparedSource* prepared,
                          ProgressCallback progress,
                          CancelCheck cancel,
                          std::string* error_message) {
+  std::string fallback_error;
+  if (error_message == nullptr) {
+    error_message = &fallback_error;
+  }
   const hiraco::ScopedTimingLog crop_timer("crop", "Render converted crop");
   if (prepared == nullptr || !preview) {
     if (error_message != nullptr) {
@@ -897,6 +918,10 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
                                 ProgressCallback progress,
                                 CancelCheck cancel,
                                 std::string* error_message) {
+  std::string fallback_error;
+  if (error_message == nullptr) {
+    error_message = &fallback_error;
+  }
   const hiraco::ScopedTimingLog preview_timer("preview", "Render converted full preview");
   if (prepared == nullptr || !preview) {
     if (error_message != nullptr) {
@@ -1158,18 +1183,10 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
   }
 
   std::shared_ptr<const PreviewImage> preview_override;
-  double preview_gain = 1.0;
   if (prepared.data) {
     std::lock_guard<std::mutex> lock(prepared.data->mutex);
     if (prepared.data->has_original_preview && prepared.data->original_preview) {
       preview_override = prepared.data->original_preview;
-    }
-    if (prepared.data->has_processing_cache && prepared.data->processing_cache) {
-      preview_gain = prepared.data->processing_cache->preview_auto_bright_gain;
-    } else if (prepared.data->has_preview_auto_bright_gain &&
-               LibRawOverridesEqual(prepared.data->preview_auto_bright_libraw_overrides,
-                                    libraw_overrides)) {
-      preview_gain = prepared.data->preview_auto_bright_gain;
     }
   }
 
@@ -1182,7 +1199,6 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
                                stage_overrides,
                                libraw_overrides,
                                preview_override,
-                               preview_gain,
                                progress,
                                cancel);
 }
@@ -1222,6 +1238,32 @@ std::filesystem::path ResolveOutputPath(const std::string& source_path,
                                         const std::filesystem::path& base_output_dir,
                                         const std::filesystem::path& relative_subdir) {
   return base_output_dir / relative_subdir / (std::filesystem::path(source_path).stem().string() + ".dng");
+}
+
+bool PathsReferToSameFile(const std::filesystem::path& left,
+                          const std::filesystem::path& right) {
+  if (left.empty() || right.empty()) {
+    return false;
+  }
+
+  std::error_code error;
+  // This resolves symlinks and hard links, and compares the actual files when
+  // both already exist.  It fails when either side is missing, so fall back to
+  // a lexical comparison of the canonical paths below.
+  if (std::filesystem::equivalent(left, right, error)) {
+    return true;
+  }
+  error.clear();
+
+  const std::filesystem::path canonical_left = std::filesystem::weakly_canonical(left, error);
+  if (error) {
+    return left.lexically_normal() == right.lexically_normal();
+  }
+  const std::filesystem::path canonical_right = std::filesystem::weakly_canonical(right, error);
+  if (error) {
+    return left.lexically_normal() == right.lexically_normal();
+  }
+  return canonical_left == canonical_right;
 }
 
 OverwriteDecision ResolveOverwriteDecision(OverwritePolicy current_policy,
