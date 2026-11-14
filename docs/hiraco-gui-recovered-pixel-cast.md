@@ -2,6 +2,15 @@
 
 Status: implemented (2026-10-15). See §5 for measurements.
 
+> **2026-11 update.** The preview pipeline now applies detail enhancement and
+> ORI recovery to the full-resolution raster once, caches the result, and
+> derives fit/50% by area-average resizing.  The mask is reduced with the same
+> resize (a display pixel is marked when its source block contains a recovered
+> pixel).  The 512 px measurements below were taken when recovery ran directly
+> on the display raster; they are kept as the historical baseline, while the
+> current tests assert the full-resolution changed count and the scaled-mask
+> bounds instead of exact display popcount equality.
+
 ## 1. What the user asked for
 
 > I would like to see pixels recovered with ORI in the preview as pink or green

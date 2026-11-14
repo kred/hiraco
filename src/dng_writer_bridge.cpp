@@ -4159,6 +4159,88 @@ void AppendImagePreview(dng_host& host,
 
 }  // namespace
 
+PreviewImage ScalePreviewImageForDisplay(const PreviewImage& source,
+                                         uint32_t max_dimension) {
+  PreviewImage scaled;
+  scaled.colors = source.colors;
+  scaled.bits = source.bits;
+  if (source.width == 0 || source.height == 0 || source.colors == 0) {
+    return scaled;
+  }
+
+  const uint32_t longest_edge = std::max(source.width, source.height);
+  if (max_dimension == 0 || longest_edge <= max_dimension) {
+    return source;
+  }
+  if (source.width >= source.height) {
+    scaled.width = max_dimension;
+    scaled.height = std::max<uint32_t>(
+        1, static_cast<uint32_t>((static_cast<uint64_t>(source.height) * max_dimension) /
+                                 source.width));
+  } else {
+    scaled.height = max_dimension;
+    scaled.width = std::max<uint32_t>(
+        1, static_cast<uint32_t>((static_cast<uint64_t>(source.width) * max_dimension) /
+                                 source.height));
+  }
+
+  const size_t dest_pixels = static_cast<size_t>(scaled.width) * scaled.height;
+  scaled.pixels.resize(dest_pixels * scaled.colors);
+  const bool has_mask = source.recovered_mask.size() ==
+      static_cast<size_t>(source.width) * source.height;
+  if (has_mask) {
+    scaled.recovered_mask.resize(dest_pixels, 0);
+  }
+
+  // Area-average downscale.  A nearest-neighbour resize would drop sparse
+  // recovered highlight pixels; averaging keeps their contribution visible.
+  #pragma omp parallel for schedule(static) if(scaled.height > 100)
+  for (uint32_t row = 0; row < scaled.height; ++row) {
+    const uint32_t source_y0 = static_cast<uint32_t>(
+        (static_cast<uint64_t>(row) * source.height) / scaled.height);
+    const uint32_t source_y1 = std::min<uint32_t>(
+        source.height,
+        std::max<uint32_t>(source_y0 + 1,
+                           static_cast<uint32_t>((static_cast<uint64_t>(row + 1) *
+                                                  source.height) / scaled.height)));
+    for (uint32_t col = 0; col < scaled.width; ++col) {
+      const uint32_t source_x0 = static_cast<uint32_t>(
+          (static_cast<uint64_t>(col) * source.width) / scaled.width);
+      const uint32_t source_x1 = std::min<uint32_t>(
+          source.width,
+          std::max<uint32_t>(source_x0 + 1,
+                             static_cast<uint32_t>((static_cast<uint64_t>(col + 1) *
+                                                    source.width) / scaled.width)));
+      uint64_t sums[4] = {0, 0, 0, 0};
+      bool any_recovered = false;
+      for (uint32_t source_y = source_y0; source_y < source_y1; ++source_y) {
+        const size_t source_row = static_cast<size_t>(source_y) * source.width;
+        for (uint32_t source_x = source_x0; source_x < source_x1; ++source_x) {
+          const size_t source_index = (source_row + source_x) * source.colors;
+          for (uint32_t channel = 0; channel < scaled.colors && channel < 4; ++channel) {
+            sums[channel] += source.pixels[source_index + channel];
+          }
+          if (has_mask && source.recovered_mask[source_row + source_x] != 0) {
+            any_recovered = true;
+          }
+        }
+      }
+      const size_t dest_index = (static_cast<size_t>(row) * scaled.width + col) * scaled.colors;
+      const uint32_t samples = (source_y1 - source_y0) * (source_x1 - source_x0);
+      for (uint32_t channel = 0; channel < scaled.colors && channel < 4; ++channel) {
+        scaled.pixels[dest_index + channel] =
+            static_cast<uint8_t>((sums[channel] + samples / 2) / samples);
+      }
+      if (has_mask) {
+        scaled.recovered_mask[static_cast<size_t>(row) * scaled.width + col] =
+            any_recovered ? 1 : 0;
+      }
+    }
+  }
+
+  return scaled;
+}
+
 HighlightRecoveryStats GetLastHighlightRecoveryStats() {
   std::lock_guard<std::mutex> lock(g_highlight_recovery_stats_mutex);
   return g_highlight_recovery_stats;
@@ -4515,50 +4597,6 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
   }
 
   ReportProgress(progress, "cache", 1.0, "Converted preview data ready");
-  return true;
-}
-
-bool BuildDisplayProcessingCache(const ProcessingCache& source,
-                                 uint32_t max_dimension,
-                                 ProcessingCache* display_cache,
-                                 std::string* error_message) {
-  if (display_cache == nullptr) {
-    if (error_message != nullptr) {
-      *error_message = "missing display processing cache";
-    }
-    return false;
-  }
-  if (source.raw_image.width == 0 || source.raw_image.height == 0 ||
-      source.raw_image.colors == 0 || max_dimension == 0) {
-    if (error_message != nullptr) {
-      *error_message = "source processing cache is empty";
-    }
-    return false;
-  }
-
-  display_cache->raw_image = BuildScaledRasterImage(source.raw_image, max_dimension);
-  if (display_cache->raw_image.width == 0 || display_cache->raw_image.height == 0) {
-    if (error_message != nullptr) {
-      *error_message = "could not scale processing cache for display";
-    }
-    return false;
-  }
-  if (source.cfa_guide_image.width == source.raw_image.width &&
-      source.cfa_guide_image.height == source.raw_image.height &&
-      source.cfa_guide_image.colors == 4) {
-    display_cache->cfa_guide_image = BuildScaledRasterImage(source.cfa_guide_image, max_dimension);
-  } else {
-    display_cache->cfa_guide_image = RasterImage();
-  }
-  display_cache->raw_image_is_camera_space = source.raw_image_is_camera_space;
-  display_cache->highlight_recovery_enabled = source.highlight_recovery_enabled;
-  display_cache->preview_auto_bright_gain = source.preview_auto_bright_gain;
-  display_cache->source_width = display_cache->raw_image.width;
-  display_cache->source_height = display_cache->raw_image.height;
-  display_cache->region_origin_x = 0;
-  display_cache->region_origin_y = 0;
-  display_cache->has_cached_crop = false;
-  display_cache->cached_crop_rect = CropRect();
   return true;
 }
 

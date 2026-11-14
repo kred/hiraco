@@ -496,19 +496,17 @@ struct PreparedSourceData {
   bool has_original_preview = false;
   std::shared_ptr<const PreviewImage> original_preview;
   LibRawOverrideSet original_preview_libraw_overrides;
-  bool has_converted_full_preview = false;
-  PreviewImage converted_full_preview;
-  StageOverrideSet converted_full_preview_stage_overrides;
-  LibRawOverrideSet converted_full_preview_libraw_overrides;
-  uint32_t converted_full_preview_max_dimension = 0;
-  bool converted_full_preview_highlight_recovery = false;
+  bool has_processed_full_preview = false;
+  // Full-resolution, fully processed (detail enhancement, transform, recovery)
+  // preview.  Fit and 50% are derived from this by resizing, so the expensive
+  // stages always run once against real pixels, never against a proxy.
+  PreviewImage processed_full_preview;
+  StageOverrideSet processed_full_preview_stage_overrides;
+  LibRawOverrideSet processed_full_preview_libraw_overrides;
+  bool processed_full_preview_highlight_recovery = false;
   bool has_processing_cache = false;
   std::shared_ptr<const ProcessingCache> processing_cache;
   LibRawOverrideSet cached_libraw_overrides;
-  bool has_display_processing_cache = false;
-  std::shared_ptr<const ProcessingCache> display_processing_cache;
-  uint32_t display_processing_cache_max_dimension = 0;
-  LibRawOverrideSet display_processing_cache_libraw_overrides;
   bool has_preview_auto_bright_gain = false;
   double preview_auto_bright_gain = 1.0;
   LibRawOverrideSet preview_auto_bright_libraw_overrides;
@@ -757,12 +755,10 @@ void ReleasePreviewProcessingCache(PreparedSource* prepared) {
   }
 
   std::lock_guard<std::mutex> lock(prepared->data->mutex);
-  prepared->data->has_converted_full_preview = false;
-  prepared->data->converted_full_preview = PreviewImage();
+  prepared->data->has_processed_full_preview = false;
+  prepared->data->processed_full_preview = PreviewImage();
   prepared->data->has_processing_cache = false;
   prepared->data->processing_cache.reset();
-  prepared->data->has_display_processing_cache = false;
-  prepared->data->display_processing_cache.reset();
 }
 
 size_t GetPreviewCacheBytes(const PreparedSource& prepared) {
@@ -783,14 +779,10 @@ size_t GetPreviewCacheBytes(const PreparedSource& prepared) {
   if (prepared.data->original_preview) {
     total += preview_bytes(*prepared.data->original_preview);
   }
-  total += preview_bytes(prepared.data->converted_full_preview);
+  total += preview_bytes(prepared.data->processed_full_preview);
   if (prepared.data->processing_cache) {
     total += raster_bytes(prepared.data->processing_cache->raw_image);
     total += raster_bytes(prepared.data->processing_cache->cfa_guide_image);
-  }
-  if (prepared.data->display_processing_cache) {
-    total += raster_bytes(prepared.data->display_processing_cache->raw_image);
-    total += raster_bytes(prepared.data->display_processing_cache->cfa_guide_image);
   }
   return total;
 }
@@ -834,9 +826,8 @@ bool RenderConvertedCrop(PreparedSource* prepared,
   // Explicit recovery coordinates for the crop path.  Crop previews render from
   // full-frame resolution processing caches (their source_width stays the full
   // frame), so the represented region is the requested crop in full-frame
-  // coordinates.  Passing it explicitly keeps the mapping correct even if a
-  // future caller reuses a display-resolution cache, whose source_width
-  // BuildDisplayProcessingCache overwrites with the display size.
+  // coordinates.  Passing it explicitly keeps the mapping independent of how
+  // the cache was cropped.
   RecoveryImageCoordinates recovery_coordinates;
   recovery_coordinates.full_width = prepared->image_width;
   recovery_coordinates.full_height = prepared->image_height;
@@ -892,8 +883,6 @@ bool RenderConvertedCrop(PreparedSource* prepared,
     prepared->data->has_processing_cache = true;
     prepared->data->cached_libraw_overrides = libraw_overrides;
     prepared->data->processing_cache = cache;
-    prepared->data->has_display_processing_cache = false;
-    prepared->data->display_processing_cache.reset();
   }
 
   return RenderConvertedCropPreview(*enhancement_metadata,
@@ -940,13 +929,16 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
   const bool highlight_recovery_enabled = prepared->ShouldUseHighlightRecovery();
   {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
-    if (prepared->data->has_converted_full_preview &&
-        prepared->data->converted_full_preview_max_dimension == max_dimension &&
-        prepared->data->converted_full_preview_highlight_recovery == highlight_recovery_enabled &&
-        StageOverridesEqual(prepared->data->converted_full_preview_stage_overrides, stage_overrides) &&
-        LibRawOverridesEqual(prepared->data->converted_full_preview_libraw_overrides,
+    if (prepared->data->has_processed_full_preview &&
+        prepared->data->processed_full_preview_highlight_recovery == highlight_recovery_enabled &&
+        StageOverridesEqual(prepared->data->processed_full_preview_stage_overrides, stage_overrides) &&
+        LibRawOverridesEqual(prepared->data->processed_full_preview_libraw_overrides,
                              libraw_overrides)) {
-      *preview = prepared->data->converted_full_preview;
+      // The cache holds the processed full-resolution result.  Display sizes
+      // are pure resizes, so a zoom change never re-runs the enhancement.
+      *preview = max_dimension == 0
+          ? prepared->data->processed_full_preview
+          : ScalePreviewImageForDisplay(prepared->data->processed_full_preview, max_dimension);
       return true;
     }
   }
@@ -978,12 +970,11 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
 
   auto store_rendered_preview = [&]() {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
-    prepared->data->has_converted_full_preview = true;
-    prepared->data->converted_full_preview = *preview;
-    prepared->data->converted_full_preview_stage_overrides = stage_overrides;
-    prepared->data->converted_full_preview_libraw_overrides = libraw_overrides;
-    prepared->data->converted_full_preview_max_dimension = max_dimension;
-    prepared->data->converted_full_preview_highlight_recovery = highlight_recovery_enabled;
+    prepared->data->has_processed_full_preview = true;
+    prepared->data->processed_full_preview = *preview;
+    prepared->data->processed_full_preview_stage_overrides = stage_overrides;
+    prepared->data->processed_full_preview_libraw_overrides = libraw_overrides;
+    prepared->data->processed_full_preview_highlight_recovery = highlight_recovery_enabled;
   };
 
   std::shared_ptr<const ProcessingCache> source_cache;
@@ -1023,46 +1014,14 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
       prepared->data->has_processing_cache = true;
       prepared->data->cached_libraw_overrides = libraw_overrides;
       prepared->data->processing_cache = built_cache;
-      prepared->data->has_display_processing_cache = false;
-      prepared->data->display_processing_cache.reset();
     }
     source_cache = std::move(built_cache);
   }
 
-  std::shared_ptr<const ProcessingCache> display_cache;
-  if (max_dimension == 0) {
-    // No downscale: render directly from the full-resolution source cache.
-    display_cache = source_cache;
-  } else {
-    {
-      std::lock_guard<std::mutex> lock(prepared->data->mutex);
-      if (prepared->data->has_display_processing_cache &&
-          prepared->data->display_processing_cache &&
-          prepared->data->display_processing_cache_max_dimension == max_dimension &&
-          LibRawOverridesEqual(prepared->data->display_processing_cache_libraw_overrides,
-                               libraw_overrides)) {
-        display_cache = prepared->data->display_processing_cache;
-      }
-    }
-
-    if (!display_cache) {
-      auto built_display_cache = std::make_shared<ProcessingCache>();
-      if (!BuildDisplayProcessingCache(*source_cache,
-                                       max_dimension,
-                                       built_display_cache.get(),
-                                       error_message)) {
-        return false;
-      }
-      {
-        std::lock_guard<std::mutex> lock(prepared->data->mutex);
-        prepared->data->has_display_processing_cache = true;
-        prepared->data->display_processing_cache = built_display_cache;
-        prepared->data->display_processing_cache_max_dimension = max_dimension;
-        prepared->data->display_processing_cache_libraw_overrides = libraw_overrides;
-      }
-      display_cache = std::move(built_display_cache);
-    }
-  }
+  // Always process the full-resolution cache.  Fit and 50% are produced by
+  // resizing the finished preview below, so the enhancement/recovery stages
+  // never see a downscaled proxy.
+  const std::shared_ptr<const ProcessingCache>& display_cache = source_cache;
 
   const CropRect source_cache_region = source_cache->has_cached_crop
       ? CropRect{source_cache->region_origin_x,
@@ -1166,6 +1125,12 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
     return false;
   }
   store_rendered_preview();
+  if (max_dimension != 0 &&
+      std::max(preview->width, preview->height) > max_dimension) {
+    // The cache keeps the full-resolution result; the display copy is only a
+    // nearest-neighbour resize.
+    *preview = ScalePreviewImageForDisplay(*preview, max_dimension);
+  }
   return true;
 }
 

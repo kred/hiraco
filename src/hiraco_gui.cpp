@@ -1237,12 +1237,11 @@ class CompareCanvas final : public wxScrolledWindow {
   wxPoint last_pan_point_;
 };
 
-// The maximum dimension the comparison previews carry for a zoom mode.  100%
-// removes the cap (0 = no limit), so the preview keeps the source resolution
-// and the zoom factor refers to real image pixels.  50% displays the image at
-// half size, so it needs half of the source resolution to stay sharp; the
-// capped proxy would be upscaled on large captures.  Fit always downscales, so
-// the cheap cap is enough there.
+// The output dimension for a zoom mode.  The core always processes the
+// full-resolution image once and caches it; this value only sizes the display
+// copy, which is produced by resizing that cached result.  100% is uncapped
+// (0), 50% asks for half of the source resolution so the resize is 1:1, and fit
+// uses the cheap 2560 cap because it downscales anyway.
 uint32_t ZoomMaxDimensionFor(CompareCanvas::ZoomMode mode, uint32_t oriented_long_edge) {
   if (mode == CompareCanvas::ZoomMode::k100) {
     return 0u;
@@ -3131,7 +3130,9 @@ class HiracoMainFrame final : public wxFrame {
     prepared.enable_highlight_recovery = item.enable_highlight_recovery;
     const StageOverrideSet stage_overrides = ResolveEffectiveStageOverrides(item.stage_overrides);
     // The preview serves the zoom active when the request is queued; a later
-    // zoom change bumps the request id and re-queues at the new size.
+    // zoom change bumps the request id and re-queues at the new output size.
+    // The core keeps the processed full-resolution result cached, so those
+    // later requests only resize it.
     const uint32_t oriented_width = OrientedImageWidth(
         prepared.image_width, prepared.image_height, prepared.metadata.libraw_flip);
     const uint32_t oriented_height = OrientedImageHeight(
