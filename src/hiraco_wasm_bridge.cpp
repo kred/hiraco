@@ -267,7 +267,7 @@ std::string JsonString(const std::string& text) {
 }
 
 std::string JsonNumber(double value) {
-  if (!std::isfinite(value)) {
+  if (!IsFiniteNumber(value)) {
     return "null";
   }
   char buffer[64];

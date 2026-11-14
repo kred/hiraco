@@ -10,7 +10,7 @@ constexpr float kStage2GainMax = 4.0f;
 constexpr float kStage2FineFromSmallScale = 1.6f;
 
 inline float ClampStage2Gain(float gain) {
-  if (!std::isfinite(gain)) {
+  if (!IsFiniteNumber(gain)) {
     return 1.0f;
   }
   return std::clamp(gain, kStage2GainMin, kStage2GainMax);
@@ -155,7 +155,7 @@ void FinalizeStage2Settings(ResolvedStageSettings* settings) {
 }
 
 float SanitizeStageValue(float value, float fallback, float minimum, float maximum) {
-  if (!std::isfinite(value)) {
+  if (!IsFiniteNumber(value)) {
     return fallback;
   }
   return std::clamp(value, minimum, maximum);
@@ -3178,7 +3178,7 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
     if (var_guide > 1e-6) {
       gain = cov_guide_green / var_guide;
     }
-    if (!std::isfinite(gain) || gain <= 0.0) {
+    if (!IsFiniteNumber(gain) || gain <= 0.0) {
       gain = 1.0;
     }
     gain = std::clamp(gain, 0.05, 64.0);
