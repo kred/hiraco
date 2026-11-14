@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -118,6 +119,21 @@ struct IfdEntry {
   bool value_valid = true;
 };
 
+// Computes the byte size of an entry without letting a hostile count wrap
+// size_t (relevant on 32-bit builds, where count * 8 can overflow).
+bool EntryValueSize(const IfdEntry& entry, size_t* size) {
+  if (size == nullptr) {
+    return false;
+  }
+  const size_t element_size = std::max<size_t>(TypeSize(entry.type), 1);
+  if (entry.count != 0 &&
+      element_size > std::numeric_limits<size_t>::max() / entry.count) {
+    return false;
+  }
+  *size = element_size * static_cast<size_t>(entry.count);
+  return true;
+}
+
 // Parse a single IFD at the given offset within the TIFF data.
 // base_offset is added to all offsets read from the IFD entries (used
 // for MakerNote sub-IFDs where offsets are relative to the MakerNote start).
@@ -143,7 +159,12 @@ bool ParseIfd(const TiffReader& reader,
     e.type = reader.ReadU16(pos + 2);
     e.count = reader.ReadU32(pos + 4);
 
-    const size_t value_size = TypeSize(e.type) * e.count;
+    size_t value_size = 0;
+    if (!EntryValueSize(e, &value_size)) {
+      e.value_offset = 0;
+      e.value_valid = false;
+      continue;
+    }
     if (value_size <= 4) {
       // Value stored inline in the 4-byte value/offset field.
       e.value_offset = static_cast<uint32_t>(pos + 8);
@@ -194,8 +215,8 @@ uint32_t EntryU32(const TiffReader& reader, const IfdEntry& entry) {
 
 std::vector<uint8_t> EntryBinaryPayload(const TiffReader& reader, const IfdEntry& entry) {
   if (!entry.value_valid) return {};
-  const size_t total = TypeSize(entry.type) * entry.count;
-  if (!reader.Valid(entry.value_offset, total)) return {};
+  size_t total = 0;
+  if (!EntryValueSize(entry, &total) || !reader.Valid(entry.value_offset, total)) return {};
   return std::vector<uint8_t>(
       reader.Data() + entry.value_offset,
       reader.Data() + entry.value_offset + total);
@@ -204,8 +225,8 @@ std::vector<uint8_t> EntryBinaryPayload(const TiffReader& reader, const IfdEntry
 // Read an ASCII string from an IFD entry.
 std::string EntryString(const TiffReader& reader, const IfdEntry& entry) {
   if (!entry.value_valid) return {};
-  const size_t total = TypeSize(entry.type) * entry.count;
-  if (!reader.Valid(entry.value_offset, total)) return {};
+  size_t total = 0;
+  if (!EntryValueSize(entry, &total) || !reader.Valid(entry.value_offset, total)) return {};
   std::string s(reinterpret_cast<const char*>(reader.Data() + entry.value_offset), total);
   // Trim trailing NUL bytes and spaces.
   while (!s.empty() && (s.back() == '\0' || s.back() == ' ')) {
