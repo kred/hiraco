@@ -73,7 +73,8 @@ bool RenderOriginalPreview(PreparedSource* prepared,
                            const LibRawOverrideSet& libraw_overrides,
                            ProgressCallback progress = {},
                            CancelCheck cancel = {},
-                           std::string* error_message = nullptr);
+                           std::string* error_message = nullptr,
+                           bool full_resolution = true);
 
 bool TryGetCachedOriginalPreview(const PreparedSource& prepared,
                                  const LibRawOverrideSet& libraw_overrides,
@@ -108,7 +109,22 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
                                 const LibRawOverrideSet& libraw_overrides,
                                 ProgressCallback progress = {},
                                 CancelCheck cancel = {},
-                                std::string* error_message = nullptr);
+                                std::string* error_message = nullptr,
+                                bool scale_cache_for_preview = false);
+
+// Renders the interactive preview from a display-sized proxy.  Unlike the
+// full-resolution preview this is deliberately approximate: the enhancement
+// stages run on at most `max_dimension` pixels, so the browser does not pay for
+// a 50-80 MP pipeline on every fit/50% request.  The DNG conversion and the
+// 100% preview never use this path.
+bool RenderConvertedProxyPreview(PreparedSource* prepared,
+                                 const StageOverrideSet& stage_overrides,
+                                 uint32_t max_dimension,
+                                 std::shared_ptr<PreviewImage> preview,
+                                 const LibRawOverrideSet& libraw_overrides,
+                                 ProgressCallback progress = {},
+                                 CancelCheck cancel = {},
+                                 std::string* error_message = nullptr);
 
 DngWriteResult ConvertToDng(const PreparedSource& prepared,
                             const std::filesystem::path& output_path,

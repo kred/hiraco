@@ -535,6 +535,7 @@ export function PreviewPanel() {
             ref={canvasRef}
             className="preview-canvas"
             data-testid="preview-canvas"
+            data-preview-kind={state.compareMode}
             style={{
               cursor: 'grab',
               touchAction: 'none',

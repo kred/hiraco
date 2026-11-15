@@ -221,6 +221,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const cancelRequested = useRef(false);
 
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The comparison mode and zoom whose previews are already requested, so the
+  // on-demand effect does not re-request them for unrelated state updates.
+  const previewViewRef = useRef('');
   const previewRunning = useRef(false);
   const previewPending = useRef(false);
   const originalRunning = useRef(false);
@@ -463,8 +466,31 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
           preset,
         },
       });
-      await renderOriginalPreview();
-      await renderConvertedPreview();
+      // Render only what the current comparison mode displays.  The original
+      // preview is a second full decode of the RAW and is the most expensive
+      // step of opening a file; the default Converted view must not pay for it.
+      // A cached fit preview already on screen is reused when the row is
+      // selected again, so switching back does not decode it a second time.
+      const compareMode = stateRef.current.compareMode;
+      const cachedPreviewUsable = stateRef.current.zoomMode === 'fit';
+      const cachedOriginal = cachedPreviewUsable
+        ? queueItem?.cachedOriginalPreview ?? null
+        : null;
+      const cachedConverted = cachedPreviewUsable
+        ? queueItem?.cachedConvertedPreview ?? null
+        : null;
+      if (compareMode === 'original') {
+        if (cachedOriginal === null) {
+          await renderOriginalPreview();
+        }
+      } else {
+        if (cachedConverted === null) {
+          await renderConvertedPreview();
+        }
+        if (compareMode === 'side-by-side' && cachedOriginal === null) {
+          await renderOriginalPreview();
+        }
+      }
       if (generation !== selectionGeneration.current) {
         return;
       }
@@ -517,7 +543,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   }, [client, renderConvertedPreview, renderOriginalPreview]);
 
   const schedulePreview = useCallback(() => {
-    if (convertingRef.current) {
+    if (convertingRef.current || stateRef.current.compareMode === 'original') {
       return;
     }
     if (previewTimer.current !== null) {
@@ -525,7 +551,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }
     previewTimer.current = setTimeout(() => {
       previewTimer.current = null;
-      if (convertingRef.current) {
+      if (convertingRef.current || stateRef.current.compareMode === 'original') {
         return;
       }
       if (!sessionRef.current) {
@@ -578,25 +604,50 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     };
   }, [client]);
 
-  // When the zoom mode changes, re-fetch both previews at the appropriate
-  // resolution: full resolution at 100%, capped at PREVIEW_MAX_DIMENSION otherwise.
+  // Render the previews a comparison mode needs when the mode or zoom changes.
+  // The opening path renders only the visible mode, so switching to Original
+  // or Side by side pulls in the missing preview at the current zoom.  The C++
+  // side caches the full-resolution preview, so a repeated request is a scale
+  // and copy rather than another RAW decode.
+  const previewViewKey = `${state.compareMode}:${state.zoomMode}`;
   useEffect(() => {
-    if (!sessionRef.current) {
+    if (previewViewRef.current === previewViewKey) {
       return;
     }
-    // openSession awaits this call and handles a cancellation itself; when the
-    // zoom change triggers it, the rejection is caught here instead.  The
-    // CancelledError carries no user-facing error message.
-    void renderOriginalPreview().catch((error: unknown) => {
-      if (error instanceof ModuleCrashedError) {
-        sessionRef.current = false;
+    previewViewRef.current = previewViewKey;
+    if (!sessionRef.current) {
+      // The comparison mode or zoom changed after a conversion closed the
+      // worker session (or after a cancel).  Reopen so the new view can load;
+      // the per-row cache still supplies an immediate fit preview.
+      if (!sessionLoading.current && !convertingRef.current &&
+          state.selectedItemId !== null) {
+        void openSession();
       }
-      if (!(error instanceof CancelledError)) {
-        dispatch({ type: 'error', message: messageOf(error) });
-      }
-    });
-    void renderConvertedPreview();
-  }, [state.zoomMode, renderOriginalPreview, renderConvertedPreview]);
+      return;
+    }
+    if (state.compareMode !== 'converted') {
+      void renderOriginalPreview().catch((error: unknown) => {
+        if (error instanceof ModuleCrashedError) {
+          sessionRef.current = false;
+        }
+        if (!(error instanceof CancelledError)) {
+          dispatch({ type: 'error', message: messageOf(error) });
+        }
+      });
+    }
+    if (state.compareMode !== 'original') {
+      void renderConvertedPreview();
+    }
+  }, [
+    previewViewKey,
+    state.compareMode,
+    state.originalPreview,
+    state.convertedPreview,
+    openSession,
+    renderOriginalPreview,
+    renderConvertedPreview,
+    dispatch,
+  ]);
 
   useEffect(
     () => () => {
@@ -731,6 +782,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
               settings: null,
               overrides: {},
               preset: null,
+              cachedOriginalPreview: null,
+              cachedConvertedPreview: null,
             });
           }
 

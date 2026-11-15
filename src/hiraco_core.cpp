@@ -1,6 +1,7 @@
 #include "hiraco_core.h"
 
 #include "dng_writer_bridge.h"
+#include "hiraco_threads.h"
 #include "hiraco_timing.h"
 #include "stack_guidance.h"
 #include "vendor_makernote.h"
@@ -494,6 +495,7 @@ bool StageOverridesEqual(const StageOverrideSet& lhs, const StageOverrideSet& rh
 struct PreparedSourceData {
   std::mutex mutex;
   bool has_original_preview = false;
+  bool original_preview_full_resolution = false;
   std::shared_ptr<const PreviewImage> original_preview;
   LibRawOverrideSet original_preview_libraw_overrides;
   bool has_processed_full_preview = false;
@@ -627,6 +629,7 @@ bool PrepareSource(const std::string& source_path,
                    std::string* error_message,
                    ProgressCallback progress,
                    CancelCheck cancel) {
+  hiraco::InitializeComputeThreads();
   const hiraco::ScopedTimingLog prepare_timer("prepare", "Prepare source");
   if (prepared == nullptr || error_message == nullptr) {
     return false;
@@ -683,7 +686,8 @@ bool RenderOriginalPreview(PreparedSource* prepared,
                            const LibRawOverrideSet& libraw_overrides,
                            ProgressCallback progress,
                            CancelCheck cancel,
-                           std::string* error_message) {
+                           std::string* error_message,
+                           bool full_resolution) {
   std::string fallback_error;
   if (error_message == nullptr) {
     error_message = &fallback_error;
@@ -707,7 +711,9 @@ bool RenderOriginalPreview(PreparedSource* prepared,
     if (prepared->data->has_original_preview &&
         prepared->data->original_preview &&
         LibRawOverridesEqual(prepared->data->original_preview_libraw_overrides,
-                             libraw_overrides)) {
+                             libraw_overrides) &&
+        // A cached half-size decode cannot serve a 100% request.
+        (prepared->data->original_preview_full_resolution || !full_resolution)) {
       *preview = *prepared->data->original_preview;
       return true;
     }
@@ -719,12 +725,14 @@ bool RenderOriginalPreview(PreparedSource* prepared,
                                    preview,
                                    progress,
                                    cancel,
-                                   error_message)) {
+                                   error_message,
+                                   full_resolution)) {
     return false;
   }
 
   std::lock_guard<std::mutex> lock(prepared->data->mutex);
   prepared->data->has_original_preview = true;
+  prepared->data->original_preview_full_resolution = full_resolution;
   prepared->data->original_preview_libraw_overrides = libraw_overrides;
   prepared->data->original_preview = preview;
   return true;
@@ -740,6 +748,7 @@ bool TryGetCachedOriginalPreview(const PreparedSource& prepared,
   std::lock_guard<std::mutex> lock(prepared.data->mutex);
   if (!prepared.data->has_original_preview ||
       !prepared.data->original_preview ||
+      !prepared.data->original_preview_full_resolution ||
       !LibRawOverridesEqual(prepared.data->original_preview_libraw_overrides,
                             libraw_overrides)) {
     return false;
@@ -906,7 +915,8 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
                                 const LibRawOverrideSet& libraw_overrides,
                                 ProgressCallback progress,
                                 CancelCheck cancel,
-                                std::string* error_message) {
+                                std::string* error_message,
+                                bool scale_cache_for_preview) {
   std::string fallback_error;
   if (error_message == nullptr) {
     error_message = &fallback_error;
@@ -927,7 +937,7 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
   }
 
   const bool highlight_recovery_enabled = prepared->ShouldUseHighlightRecovery();
-  {
+  if (!scale_cache_for_preview) {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
     if (prepared->data->has_processed_full_preview &&
         prepared->data->processed_full_preview_highlight_recovery == highlight_recovery_enabled &&
@@ -1018,10 +1028,28 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
     source_cache = std::move(built_cache);
   }
 
-  // Always process the full-resolution cache.  Fit and 50% are produced by
-  // resizing the finished preview below, so the enhancement/recovery stages
-  // never see a downscaled proxy.
-  const std::shared_ptr<const ProcessingCache>& display_cache = source_cache;
+  // The 100% path and the native GUI process the full-resolution cache.  The
+  // browser preview path (scale_cache_for_preview) builds a display-sized
+  // proxy first so the enhancement stages do not run over 50-80 MP for a
+  // 2560 px preview.
+  std::shared_ptr<const ProcessingCache> display_cache = source_cache;
+  if (scale_cache_for_preview && max_dimension != 0 &&
+      std::max(source_cache->raw_image.width, source_cache->raw_image.height) >
+          max_dimension) {
+    auto proxy = std::make_shared<ProcessingCache>();
+    proxy->raw_image = ScaleRasterImageForDisplay(source_cache->raw_image, max_dimension);
+    if (source_cache->cfa_guide_image.width == source_cache->raw_image.width &&
+        source_cache->cfa_guide_image.height == source_cache->raw_image.height) {
+      proxy->cfa_guide_image =
+          ScaleRasterImageForDisplay(source_cache->cfa_guide_image, max_dimension);
+    }
+    proxy->raw_image_is_camera_space = source_cache->raw_image_is_camera_space;
+    proxy->highlight_recovery_enabled = source_cache->highlight_recovery_enabled;
+    proxy->preview_auto_bright_gain = source_cache->preview_auto_bright_gain;
+    proxy->source_width = proxy->raw_image.width;
+    proxy->source_height = proxy->raw_image.height;
+    display_cache = proxy;
+  }
 
   const CropRect source_cache_region = source_cache->has_cached_crop
       ? CropRect{source_cache->region_origin_x,
@@ -1124,7 +1152,9 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
                                   highlight_recovery_enabled ? &recovery_coordinates : nullptr)) {
     return false;
   }
-  store_rendered_preview();
+  if (!scale_cache_for_preview) {
+    store_rendered_preview();
+  }
   if (max_dimension != 0 &&
       std::max(preview->width, preview->height) > max_dimension) {
     // The cache keeps the full-resolution result; the display copy is only a
@@ -1132,6 +1162,25 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
     *preview = ScalePreviewImageForDisplay(*preview, max_dimension);
   }
   return true;
+}
+
+bool RenderConvertedProxyPreview(PreparedSource* prepared,
+                                 const StageOverrideSet& stage_overrides,
+                                 uint32_t max_dimension,
+                                 std::shared_ptr<PreviewImage> preview,
+                                 const LibRawOverrideSet& libraw_overrides,
+                                 ProgressCallback progress,
+                                 CancelCheck cancel,
+                                 std::string* error_message) {
+  return RenderConvertedFullPreview(prepared,
+                                    stage_overrides,
+                                    max_dimension,
+                                    std::move(preview),
+                                    libraw_overrides,
+                                    std::move(progress),
+                                    std::move(cancel),
+                                    error_message,
+                                    /*scale_cache_for_preview=*/true);
 }
 
 DngWriteResult ConvertToDng(const PreparedSource& prepared,

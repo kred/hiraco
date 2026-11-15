@@ -88,7 +88,8 @@ bool BuildOriginalPreviewFromRaw(const std::string& source_path,
                                  std::shared_ptr<PreviewImage> preview,
                                  ProgressCallback progress = {},
                                  CancelCheck cancel = {},
-                                 std::string* error_message = nullptr);
+                                 std::string* error_message = nullptr,
+                                 bool full_resolution = true);
 
 bool EstimatePreviewAutoBrightGainFromRaw(const std::string& source_path,
                                           const SourceLinearDngMetadata& metadata,
@@ -111,6 +112,8 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
 // full-resolution preview cached; this only produces the fit/50% copy.
 PreviewImage ScalePreviewImageForDisplay(const PreviewImage& source,
                                          uint32_t max_dimension);
+
+RasterImage ScaleRasterImageForDisplay(const RasterImage& source, uint32_t max_dimension);
 
 bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                 const ProcessingCache& cache,

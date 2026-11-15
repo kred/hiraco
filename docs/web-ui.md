@@ -1,6 +1,8 @@
 # The hiraco web UI
 
-A live build is published at https://kred.github.io/hiraco/.
+A live build is published at https://kred.github.io/hiraco/.  See
+[web-performance.md](web-performance.md) for the preview/decode performance
+work and the benchmark harness.
 
 `web/` holds a Vite + React + TypeScript application that runs the full
 hiraco conversion in the browser.  The browser loads the `hiraco-wasm`

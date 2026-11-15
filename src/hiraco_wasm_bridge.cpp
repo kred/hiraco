@@ -642,7 +642,8 @@ int hiraco_wasm_get_original_preview(uint32_t session_id, uint32_t max_dimension
                                LibRawOverrideSet(),
                                ReportProgress,
                                [session]() { return session->cancel_requested->load(); },
-                               &error_message)) {
+                               &error_message,
+                               /*full_resolution=*/max_dimension == 0)) {
       LastError() = error_message.empty() ? "the original preview could not be rendered" : error_message;
       return 1;
     }
@@ -712,14 +713,25 @@ int hiraco_wasm_get_converted_preview(uint32_t session_id, uint32_t max_dimensio
   session->cancel_requested->store(false);
   std::shared_ptr<PreviewImage> preview = std::make_shared<PreviewImage>();
   std::string error_message;
-  if (!RenderConvertedFullPreview(&session->prepared,
-                                  overrides,
-                                  max_dimension,
-                                  preview,
-                                  LibRawOverrideSet(),
-                                  ReportProgress,
-                                  [session]() { return session->cancel_requested->load(); },
-                                  &error_message)) {
+  const bool proxy_preview = max_dimension != 0;
+  const bool preview_ok = proxy_preview
+      ? RenderConvertedProxyPreview(&session->prepared,
+                                    overrides,
+                                    max_dimension,
+                                    preview,
+                                    LibRawOverrideSet(),
+                                    ReportProgress,
+                                    [session]() { return session->cancel_requested->load(); },
+                                    &error_message)
+      : RenderConvertedFullPreview(&session->prepared,
+                                   overrides,
+                                   max_dimension,
+                                   preview,
+                                   LibRawOverrideSet(),
+                                   ReportProgress,
+                                   [session]() { return session->cancel_requested->load(); },
+                                   &error_message);
+  if (!preview_ok) {
     LastError() = error_message.empty() ? "the converted preview could not be rendered" : error_message;
     return 1;
   }
