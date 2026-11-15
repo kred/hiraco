@@ -12,15 +12,22 @@ sliders and writes the Linear DNG, all without uploading the file anywhere.
 Several RAW files can be queued at once.  ORI files added in the same batch are
 paired automatically with the RAW file of the same name (an ORI added on its
 own is treated as a source).  The selected queue entry is the one shown in the
-preview, but presets and sliders are global: changing them applies to every
-queued file, matching the native queue's "paste settings to all images"
-workflow.  `Convert` writes one DNG for every queued file, sequentially.
+preview and edited by the presets and sliders, like the native queue.  The
+presets and sliders are disabled until a file is selected; the Processing panel
+names the file they edit.  Use the copy, paste and layers icons in the queue
+footer to move a settings set between entries (`layers` pastes to every queued
+file); `Convert` writes one DNG for every queued file using each entry's
+settings.  Every icon has a tooltip and an accessible label.
 
-The preset row has the native Small, Medium and Strong settings, a Custom
-button, and a saved-preset manager.  Enter a name and `Save preset` to store the
-current absolute slider values in `localStorage`; select a saved name and use
-`Load` (or the Custom preset button) to apply it.  Saved presets survive a page
-reload and are validated/clamped when read back.
+The preset row has the native Small, Medium and Strong settings and one Custom
+button.  Use the bookmark icon in the queue footer to store the selected file's
+current absolute slider values as the single custom preset; the Custom button
+applies it to the selected file.  Setting it again overwrites the previous
+custom preset.  It is stored in `localStorage` and validated/clamped when read
+back, so it normally survives a page reload.  A browser that blocks storage
+(private mode, a full quota) keeps the preset for the session but cannot
+persist it, and the old named-preset list `hiraco.custom-presets.v1` is
+migrated to the new single slot.
 
 
 ## Requirements
@@ -70,15 +77,26 @@ python3 -m http.server 8000
 ```bash
 cd web
 npm run test      # vitest unit tests
-npm run e2e       # Playwright end to end test
+npm run e2e       # builds dist/ and runs the Playwright tests
 ```
 
-The end-to-end tests use `sample/_8142490.ORI` and
-`build/reference/_8142490-deflate.dng`.  Both are generated files, not
-committed; regenerate the reference with `scripts/make_reference_dngs.sh`
-after changing the writer, otherwise the pixel comparison is against a stale
-baseline.  `HIRACO_E2E_RAW` and `HIRACO_E2E_REFERENCE` override the two paths,
-and `HIRACO_PYTHON` selects the interpreter used for the DNG comparison.
+The end-to-end server serves `dist/`; `npm run e2e` runs the build first so the
+tests never exercise a stale bundle.  The fixture-free shell tests always run;
+the conversion, queue and ORI tests use these generated or sample files:
+
+- `sample/_8142490.ORI` and `build/reference/_8142490-deflate.dng` for the
+  pixel comparison
+- `sample/_8142489_.ORF`, `reference/_3060001.ORF` for the queue and copy/paste
+  tests
+- `sample/_8142492.ORF` and `sample/_8142492.ORI` for ORI pairing
+
+They are not committed.  Regenerate the reference with
+`scripts/make_reference_dngs.sh` after changing the writer, otherwise the pixel
+comparison is against a stale baseline.  `HIRACO_E2E_RAW`,
+`HIRACO_E2E_REFERENCE`, `HIRACO_E2E_SMALL_RAW`, `HIRACO_E2E_RAW_A`,
+`HIRACO_E2E_RAW_B`, `HIRACO_E2E_PAIR_RAW` and `HIRACO_E2E_PAIR_ORI` override
+the fixture paths, and `HIRACO_PYTHON` selects the interpreter used for the DNG
+comparison (it must have NumPy).
 
 ## Supported browsers
 
