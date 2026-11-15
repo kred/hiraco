@@ -13,7 +13,13 @@ async function openApp(page: import('@playwright/test').Page): Promise<void> {
   });
 }
 
-test('saves, loads and persists a named custom preset', async ({ page }) => {
+test('stores one custom preset from the selected file and reuses it', async ({
+  page,
+}) => {
+  const raw =
+    process.env.HIRACO_E2E_SMALL_RAW ?? path.join(repoRoot, 'reference', '_3060001.ORF');
+  test.skip(!existsSync(raw), 'the small RAW fixture is not part of the repository');
+
   await page.addInitScript(() => {
     if (sessionStorage.getItem('hiraco-preset-test-cleared') === null) {
       localStorage.clear();
@@ -21,6 +27,11 @@ test('saves, loads and persists a named custom preset', async ({ page }) => {
     }
   });
   await openApp(page);
+  await page.getByLabel('RAW file').setInputFiles(raw);
+  await expect(page.getByTestId('preview-canvas')).toBeVisible({ timeout: 300_000 });
+  await expect(page.getByRole('button', { name: 'Clear all' })).toBeEnabled({
+    timeout: 300_000,
+  });
 
   const blur = page.getByLabel('Blur Radius');
   const setBlur = (value: string) =>
@@ -37,25 +48,21 @@ test('saves, loads and persists a named custom preset', async ({ page }) => {
 
   await setBlur('2.5');
   await expect(blur).toHaveValue('2.5');
-
-  await page.getByLabel('Custom preset name').fill('Portrait');
-  await page.getByRole('button', { name: 'Save preset', exact: true }).click();
-  await expect(page.getByLabel('Saved custom preset')).toHaveValue('Portrait');
-
-  // Change the slider away from the saved values, then load the preset.
-  await setBlur('1');
-  await expect(blur).toHaveValue('1');
-  await page.getByRole('button', { name: 'Load', exact: true }).click();
-  await expect(blur).toHaveValue('2.5');
+  await page.getByRole('button', { name: 'Set as custom preset', exact: true }).click();
   await expect(
     page.getByRole('button', { name: 'Custom', exact: true }),
   ).toHaveAttribute('aria-pressed', 'true');
 
-  // Saving must survive a reload and remain loadable.
+  // Change the slider away from the saved values, then apply Custom.
+  await setBlur('1');
+  await expect(blur).toHaveValue('1');
+  await page.getByRole('button', { name: 'Custom', exact: true }).click();
+  await expect(blur).toHaveValue('2.5');
+
+  // One preset slot survives a reload even though the queue does not.
   await page.reload();
   await openApp(page);
-  await page.getByLabel('Saved custom preset').selectOption('Portrait');
-  await page.getByRole('button', { name: 'Load', exact: true }).click();
+  await page.getByRole('button', { name: 'Custom', exact: true }).click();
   await expect(page.getByLabel('Blur Radius')).toHaveValue('2.5');
 });
 

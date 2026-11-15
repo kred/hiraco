@@ -602,20 +602,6 @@
   color: var(--danger);
 }
 
-.custom-preset-row {
-  display: flex;
-  align-items: stretch;
-  gap: var(--space-2);
-  margin-top: var(--space-2);
-}
-
-.custom-preset-row .select,
-.custom-preset-row .text-input {
-  flex: 1;
-  width: auto;
-  min-width: 0;
-}
-
 .convert-hint {
   margin: var(--space-2) 0 0;
 }

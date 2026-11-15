@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import { useAppState } from '../state/AppStateProvider';
 import {
   COMPRESSION_MODES,
@@ -10,16 +9,11 @@ import {
   STAGE_SECTIONS,
   formatStageValue,
 } from '../lib/stageSettings';
-import { IconButton } from './IconButton';
-import { FolderOpenIcon, SaveIcon, TrashIcon } from './icons';
 
 export function ControlsPanel() {
   const { state, dispatch, actions } = useAppState();
   const busy = state.activity.state === 'working';
-  const activeCustomPreset =
-    state.customPresets.find((preset) => preset.name === state.activeCustomPreset) ??
-    null;
-  const [presetName, setPresetName] = useState('');
+  const hasCustomPreset = state.customPreset !== null;
 
   return (
     <section className="panel" aria-label="Processing">
@@ -38,10 +32,10 @@ export function ControlsPanel() {
                 type="button"
                 className="preset-button"
                 aria-pressed={state.preset === preset}
-                disabled={busy || (preset === 'custom' && activeCustomPreset === null)}
+                disabled={busy || (preset === 'custom' && !hasCustomPreset)}
                 title={
-                  preset === 'custom' && activeCustomPreset === null
-                    ? 'Save or select a custom preset first.'
+                  preset === 'custom' && !hasCustomPreset
+                    ? 'Set a custom preset from the queue first.'
                     : undefined
                 }
                 onClick={() => actions.applyPreset(preset)}
@@ -49,70 +43,6 @@ export function ControlsPanel() {
                 {PRESET_LABELS[preset]}
               </button>
             ))}
-          </div>
-
-          <div className="custom-preset-row">
-            <select
-              id="saved-custom-preset"
-              className="select"
-              aria-label="Saved custom preset"
-              title="Saved custom preset"
-              value={state.activeCustomPreset ?? ''}
-              disabled={busy}
-              onChange={(event) =>
-                actions.selectCustomPreset(event.target.value === '' ? null : event.target.value)
-              }
-            >
-              <option value="">No saved preset</option>
-              {state.customPresets.map((preset) => (
-                <option key={preset.name} value={preset.name}>
-                  {preset.name}
-                </option>
-              ))}
-            </select>
-            <IconButton
-              label="Load"
-              icon={<FolderOpenIcon />}
-              disabled={busy || activeCustomPreset === null}
-              onClick={() => {
-                if (activeCustomPreset !== null) {
-                  actions.loadCustomPreset(activeCustomPreset.name);
-                }
-              }}
-            />
-            <IconButton
-              label="Delete"
-              icon={<TrashIcon />}
-              variant="danger"
-              disabled={busy || activeCustomPreset === null}
-              onClick={() => {
-                if (activeCustomPreset !== null) {
-                  actions.deleteCustomPreset(activeCustomPreset.name);
-                }
-              }}
-            />
-          </div>
-
-          <div className="custom-preset-row">
-            <input
-              id="custom-preset-name"
-              className="text-input"
-              type="text"
-              aria-label="Custom preset name"
-              placeholder="Preset name"
-              maxLength={64}
-              value={presetName}
-              disabled={busy}
-              onChange={(event) => setPresetName(event.target.value)}
-            />
-            <IconButton
-              label="Save preset"
-              icon={<SaveIcon />}
-              disabled={busy || presetName.trim() === ''}
-              onClick={() => {
-                actions.saveCustomPreset(presetName);
-              }}
-            />
           </div>
         </div>
 

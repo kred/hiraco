@@ -5,7 +5,6 @@ import {
   type StageOverrides,
   type StageSettings,
 } from '../lib/stageSettings';
-import type { CustomPreset } from '../lib/customPresets';
 
 export type CompressionMode = 'uncompressed' | 'deflate' | 'jpeg-xl';
 
@@ -103,10 +102,8 @@ export interface AppState {
   settings: StageSettings;
   overrides: StageOverrides;
   preset: PresetId | null;
-  /** User-named absolute settings, persisted in localStorage. */
-  customPresets: CustomPreset[];
-  /** The saved preset selected in the custom-preset picker. */
-  activeCustomPreset: string | null;
+  /** The single custom preset, persisted in localStorage. */
+  customPreset: StageSettings | null;
   /** Settings copied from the selected queue entry, or null. */
   copiedSettings: CopiedSettings | null;
   compression: CompressionMode;
@@ -135,8 +132,7 @@ export const initialAppState: AppState = {
   settings: DEFAULT_STAGE_SETTINGS,
   overrides: {},
   preset: null,
-  customPresets: [],
-  activeCustomPreset: null,
+  customPreset: null,
   copiedSettings: null,
   compression: 'deflate',
   compareMode: 'converted',
@@ -154,7 +150,7 @@ export type AppAction =
   | { type: 'queue-removed'; id: number }
   | { type: 'queue-cleared' }
   | { type: 'selection-changed'; id: number | null }
-  | { type: 'custom-presets-changed'; presets: CustomPreset[]; active: string | null }
+  | { type: 'custom-preset-changed'; settings: StageSettings | null }
   | { type: 'settings-copied'; value: CopiedSettings | null }
   | { type: 'settings-pasted'; ids: number[]; value: CopiedSettings }
   | { type: 'source-prepared'; width: number; height: number; metadata: SourceMetadata; baseSettings: StageSettings; settings: StageSettings; overrides: StageOverrides; preset: PresetId | null }

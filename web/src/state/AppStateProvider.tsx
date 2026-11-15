@@ -19,12 +19,10 @@ import {
 } from './appState';
 import { previewMaxDimension } from '../lib/compare';
 import {
-  loadCustomPresets,
-  persistCustomPresets,
-  removeCustomPreset as removeSavedPreset,
+  loadCustomPreset,
+  persistCustomPreset,
   sanitizeCustomPreset,
-  upsertCustomPreset,
-} from '../lib/customPresets';
+} from '../lib/customPreset';
 import {
   CancelledError,
   HiracoWasmClient,
@@ -150,12 +148,8 @@ function reducer(state: AppState, action: AppAction): AppState {
         preset: action.value.preset,
       };
     }
-    case 'custom-presets-changed':
-      return {
-        ...state,
-        customPresets: action.presets,
-        activeCustomPreset: action.active,
-      };
+    case 'custom-preset-changed':
+      return { ...state, customPreset: action.settings };
     case 'source-prepared': {
       return {
         ...state,
@@ -358,14 +352,8 @@ interface AppActions {
   applyPreset(preset: PresetId): void;
   /** Drops the overrides of one section. */
   resetSection(keys: StageKey[]): void;
-  /** Selects a saved custom preset without applying it yet. */
-  selectCustomPreset(name: string | null): void;
-  /** Saves the current absolute settings under a name. */
-  saveCustomPreset(name: string): void;
-  /** Applies the named saved preset. */
-  loadCustomPreset(name: string): void;
-  /** Deletes the named saved preset. */
-  deleteCustomPreset(name: string): void;
+  /** Saves the selected file's current settings as the one custom preset. */
+  setCustomPreset(): void;
   /** Copies the selected item's settings for a later paste. */
   copySettings(): void;
   /** Applies the copied settings to the selected queue entry. */
@@ -390,7 +378,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(
     reducer,
     initialAppState,
-    (initial) => ({ ...initial, customPresets: loadCustomPresets() }),
+    (initial) => ({ ...initial, customPreset: loadCustomPreset() }),
   );
   const clientRef = useRef<HiracoWasmClient | null>(null);
   const sourceRef = useRef<SourceFile | null>(null);
@@ -998,17 +986,15 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     (preset: PresetId) => {
       const current = stateRef.current;
       if (preset === 'custom') {
-        const saved = current.customPresets.find(
-          (entry) => entry.name === current.activeCustomPreset,
-        );
-        if (saved === undefined) {
+        const saved = current.customPreset;
+        if (saved === null) {
           return;
         }
-        const overrides = makeExplicitOverrides(saved.settings);
+        const overrides = makeExplicitOverrides(saved);
         dispatch({
           type: 'preset-applied',
           preset: 'custom',
-          settings: saved.settings,
+          settings: saved,
           overrides,
         });
         schedulePreview();
@@ -1029,82 +1015,27 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     [schedulePreview],
   );
 
-  const selectCustomPreset = useCallback(
-    (name: string | null) => {
-      dispatch({
-        type: 'custom-presets-changed',
-        presets: stateRef.current.customPresets,
-        active: name,
-      });
-    },
-    [dispatch],
-  );
-
-  const saveCustomPreset = useCallback(
-    (name: string) => {
-      const current = stateRef.current;
-      const preset = sanitizeCustomPreset({ name, settings: current.settings });
-      if (preset === null) {
-        dispatch({ type: 'error', message: 'Enter a preset name of 64 characters or fewer.' });
-        return;
-      }
-      const presets = upsertCustomPreset(current.customPresets, preset);
-      persistCustomPresets(presets);
-      const overrides = makeExplicitOverrides(preset.settings);
-      dispatch({ type: 'custom-presets-changed', presets, active: preset.name });
-      dispatch({
-        type: 'preset-applied',
-        preset: 'custom',
-        settings: preset.settings,
-        overrides,
-      });
-      schedulePreview();
-    },
-    [dispatch, schedulePreview],
-  );
-
-  const loadCustomPreset = useCallback(
-    (name: string) => {
-      const current = stateRef.current;
-      const preset = current.customPresets.find((entry) => entry.name === name);
-      if (preset === undefined) {
-        return;
-      }
-      const overrides = makeExplicitOverrides(preset.settings);
-      dispatch({
-        type: 'custom-presets-changed',
-        presets: current.customPresets,
-        active: preset.name,
-      });
-      dispatch({
-        type: 'preset-applied',
-        preset: 'custom',
-        settings: preset.settings,
-        overrides,
-      });
-      schedulePreview();
-    },
-    [dispatch, schedulePreview],
-  );
-
-  const deleteCustomPreset = useCallback(
-    (name: string) => {
-      const current = stateRef.current;
-      const presets = removeSavedPreset(current.customPresets, name);
-      const active =
-        current.activeCustomPreset === name ? null : current.activeCustomPreset;
-      persistCustomPresets(presets);
-      dispatch({ type: 'custom-presets-changed', presets, active });
-      if (current.activeCustomPreset === name && current.preset === 'custom') {
-        dispatch({
-          type: 'settings-changed',
-          settings: current.settings,
-          overrides: current.overrides,
-        });
-      }
-    },
-    [dispatch],
-  );
+  const setCustomPreset = useCallback(() => {
+    const current = stateRef.current;
+    if (current.selectedItemId === null) {
+      return;
+    }
+    const settings = sanitizeCustomPreset(current.settings);
+    if (settings === null) {
+      dispatch({ type: 'error', message: 'The current settings cannot be saved as a custom preset.' });
+      return;
+    }
+    persistCustomPreset(settings);
+    dispatch({ type: 'custom-preset-changed', settings });
+    // Keep the values and mark the selected row as using the custom preset,
+    // exactly like the native "Set as Custom preset" action.
+    dispatch({
+      type: 'preset-applied',
+      preset: 'custom',
+      settings: current.settings,
+      overrides: current.overrides,
+    });
+  }, [dispatch]);
 
   const copySettings = useCallback(() => {
     const current = stateRef.current;
@@ -1337,10 +1268,7 @@ const actions = useMemo<AppActions>(
       setStageValue,
       applyPreset,
       resetSection,
-      selectCustomPreset,
-      saveCustomPreset,
-      loadCustomPreset,
-      deleteCustomPreset,
+      setCustomPreset,
       copySettings,
       pasteSettings,
       pasteSettingsToAll,
@@ -1354,15 +1282,12 @@ const actions = useMemo<AppActions>(
       clearQueue,
       convert,
       copySettings,
-      deleteCustomPreset,
-      loadCustomPreset,
       pasteSettings,
       pasteSettingsToAll,
       removeQueueItem,
       resetSection,
-      saveCustomPreset,
+      setCustomPreset,
       selectCompanion,
-      selectCustomPreset,
       selectQueueItem,
       setStageValue,
     ],

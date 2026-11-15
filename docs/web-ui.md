@@ -12,16 +12,17 @@ sliders and writes the Linear DNG, all without uploading the file anywhere.
 Several RAW files can be queued at once.  ORI files added in the same batch are
 paired automatically with the RAW file of the same name (an ORI added on its
 own is treated as a source).  The selected queue entry is the one shown in the
-preview and edited by the presets and sliders, like the native queue.  Use
-`Copy settings`, `Paste settings`, or `Paste to all files` to move a settings
-set between entries; `Convert` writes one DNG for every queued file using each
-entry's settings.
+preview and edited by the presets and sliders, like the native queue.  Use the
+copy, paste and layers icons under the queue to move a settings set between
+entries; `Convert` writes one DNG for every queued file using each entry's
+settings.  Every icon has a tooltip and an accessible label.
 
-The preset row has the native Small, Medium and Strong settings, a Custom
-button, and a saved-preset manager.  Enter a name and `Save preset` to store the
-current absolute slider values in `localStorage`; select a saved name and use
-`Load` (or the Custom preset button) to apply it.  Saved presets survive a page
-reload and are validated/clamped when read back.
+The preset row has the native Small, Medium and Strong settings and one Custom
+button.  Use the save icon under the queue to store the selected file's current
+absolute slider values as the single custom preset; the Custom button applies
+it to the selected file.  Setting it again overwrites the previous custom
+preset.  It is stored in `localStorage`, survives a page reload, and is
+validated/clamped when read back.
 
 
 ## Requirements

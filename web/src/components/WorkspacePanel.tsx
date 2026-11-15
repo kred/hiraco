@@ -4,6 +4,7 @@ import type { QueueItem, QueueStatus } from '../state/appState';
 import { PRESET_LABELS } from '../lib/stageSettings';
 import { IconButton } from './IconButton';
 import {
+  BookmarkIcon,
   CopyIcon,
   LayersIcon,
   LinkIcon,
@@ -181,6 +182,13 @@ export function WorkspacePanel() {
                 icon={<LayersIcon />}
                 disabled={busy || !canPaste}
                 onClick={() => actions.pasteSettingsToAll()}
+              />
+              <span className="toolbar-separator" aria-hidden="true" />
+              <IconButton
+                label="Set as custom preset"
+                icon={<BookmarkIcon />}
+                disabled={busy}
+                onClick={() => actions.setCustomPreset()}
               />
             </div>
           )}

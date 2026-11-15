@@ -22,7 +22,7 @@ describe('the application shell', () => {
     expect(screen.getByLabelText('Edge Gain')).toBeInTheDocument();
   });
 
-  it('offers a multi-file queue and saved custom presets', () => {
+  it('offers a multi-file queue and a single custom preset', () => {
     render(<App />);
     expect(screen.getByLabelText('RAW file')).toHaveAttribute('multiple');
     expect(screen.getByRole('button', { name: 'Add ORF' })).toBeInTheDocument();
@@ -30,11 +30,7 @@ describe('the application shell', () => {
       screen.getByRole('button', { name: 'Add companion ORI' }),
     ).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Queue' })).toBeInTheDocument();
-    expect(screen.getByLabelText('Saved custom preset')).toBeInTheDocument();
-    expect(screen.getByLabelText('Custom preset name')).toBeInTheDocument();
-    expect(
-      screen.getByRole('button', { name: 'Save preset' }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Custom' })).toBeDisabled();
   });
 
   it('switches the theme and remembers it', () => {

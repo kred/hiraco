@@ -76,20 +76,10 @@ export function LayersIcon() {
   );
 }
 
-export function SaveIcon() {
+export function BookmarkIcon() {
   return (
     <IconBase>
-      <path d="M3.5 2.5h7L13 5v8.5H3.5z" />
-      <path d="M5.5 2.5v4h5v-4M5.5 13.5v-4h5v4" />
-    </IconBase>
-  );
-}
-
-export function FolderOpenIcon() {
-  return (
-    <IconBase>
-      <path d="M2 4.5h4l1.2 1.5H14l-1.8 7H3.8z" />
-      <path d="M2 4.5v8h1.8" />
+      <path d="M4 2.5h8v11L8 10.5 4 13.5z" />
     </IconBase>
   );
 }
