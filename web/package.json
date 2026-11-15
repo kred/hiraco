@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coi": "playwright test --config playwright.coi.config.ts",
+    "pree2e": "npm run build",
     "e2e": "playwright test"
   },
   "dependencies": {

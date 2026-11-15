@@ -45,7 +45,7 @@ export function WorkspacePanel() {
   const { state, actions } = useAppState();
   const sourceInput = useRef<HTMLInputElement>(null);
   const companionInput = useRef<HTMLInputElement>(null);
-  const busy = state.activity.state === 'working';
+  const converting = state.converting;
   const selectedItem = state.queue.find((item) => item.id === state.selectedItemId);
   const canPaste = state.copiedSettings !== null;
 
@@ -62,8 +62,9 @@ export function WorkspacePanel() {
           multiple
           accept=".ORF,.ORI,.dng,.DNG,image/*"
           aria-label="RAW file"
+          aria-hidden="true"
           tabIndex={-1}
-          disabled={busy}
+          disabled={converting}
           onChange={(event) => {
             const files = Array.from(event.target.files ?? []);
             // Allow adding the same file again after removing it.
@@ -77,8 +78,9 @@ export function WorkspacePanel() {
           type="file"
           accept=".ORI,.ori"
           aria-label="ORI companion"
+          aria-hidden="true"
           tabIndex={-1}
-          disabled={busy}
+          disabled={converting}
           onChange={(event) => {
             const file = event.target.files?.[0] ?? null;
             event.target.value = '';
@@ -88,39 +90,49 @@ export function WorkspacePanel() {
 
         <div className="section queue-section">
           <div className="section-header queue-header">
-            <h3 className="section-title">
+            <h3 className="section-title" aria-label="Queue">
               Queue
               {state.queue.length > 0 && (
-                <span className="queue-count">{state.queue.length}</span>
+                <span className="queue-count" aria-hidden="true">
+                  {state.queue.length}
+                </span>
               )}
             </h3>
             <div className="queue-toolbar" role="group" aria-label="Queue actions">
               <IconButton
-                label="Add ORF"
+                label="Add files"
+                description="Add one or more RAW or DNG files. ORI files pair automatically by file name."
                 icon={<PlusIcon />}
                 variant="primary"
-                disabled={busy}
+                disabled={converting}
                 onClick={() => sourceInput.current?.click()}
               />
               <IconButton
                 label="Add companion ORI"
+                description="Attach the ORI highlight-recovery companion of the selected file."
                 icon={<LinkIcon />}
-                disabled={busy || selectedItem === undefined}
+                disabled={converting || selectedItem === undefined}
                 onClick={() => companionInput.current?.click()}
               />
               <span className="toolbar-separator" aria-hidden="true" />
               <IconButton
                 label="Clear all"
+                description="Remove every queued file and its settings."
                 icon={<TrashIcon />}
                 variant="danger"
-                disabled={busy || state.queue.length === 0}
+                disabled={converting || state.queue.length === 0}
                 onClick={() => actions.clearQueue()}
               />
             </div>
           </div>
 
           {state.queue.length === 0 ? (
-            <p className="empty-state">No files queued yet.</p>
+            <p className="empty-state">
+              No files queued yet.
+              <span className="empty-hint">
+                Add one or more RAW/DNG files; ORI companions pair by name.
+              </span>
+            </p>
           ) : (
             <ul className="queue-list" aria-label="Conversion queue">
               {state.queue.map((item) => {
@@ -136,12 +148,20 @@ export function WorkspacePanel() {
                     <button
                       type="button"
                       className="queue-select"
-                      aria-pressed={selected}
+                      data-testid="queue-select"
+                      aria-current={selected ? 'true' : undefined}
                       title={queueDetails(item)}
-                      disabled={busy}
+                      disabled={converting}
                       onClick={() => actions.selectQueueItem(item.id)}
                     >
-                      <span className="queue-name">{item.sourceName}</span>
+                      <span className="queue-name">
+                        {selected && (
+                          <span className="queue-selected-mark" aria-hidden="true">
+                            ✓
+                          </span>
+                        )}
+                        <span className="queue-name-text">{item.sourceName}</span>
+                      </span>
                       <span className="queue-meta">
                         <span className="queue-dot" aria-hidden="true" />
                         {STATUS_LABELS[item.status]}
@@ -156,7 +176,7 @@ export function WorkspacePanel() {
                       label={`Remove ${item.sourceName}`}
                       icon={<XIcon />}
                       className="queue-remove"
-                      disabled={busy}
+                      disabled={converting}
                       onClick={() => actions.removeQueueItem(item.id)}
                     />
                   </li>
@@ -164,38 +184,57 @@ export function WorkspacePanel() {
               })}
             </ul>
           )}
-
-          {selectedItem !== undefined && (
-            <div className="queue-settings" role="group" aria-label="Selected file settings">
-              <IconButton
-                label="Copy settings"
-                icon={<CopyIcon />}
-                disabled={busy}
-                onClick={() => actions.copySettings()}
-              />
-              <IconButton
-                label="Paste settings"
-                icon={<PasteIcon />}
-                disabled={busy || !canPaste}
-                onClick={() => actions.pasteSettings()}
-              />
-              <IconButton
-                label="Paste to all files"
-                icon={<LayersIcon />}
-                disabled={busy || !canPaste}
-                onClick={() => actions.pasteSettingsToAll()}
-              />
-              <span className="toolbar-separator" aria-hidden="true" />
-              <IconButton
-                label="Set as custom preset"
-                icon={<BookmarkIcon />}
-                disabled={busy}
-                onClick={() => actions.setCustomPreset()}
-              />
-            </div>
-          )}
         </div>
       </div>
+
+      {selectedItem !== undefined && (
+        <footer className="panel-footer queue-settings-footer">
+          <div className="queue-settings" role="group" aria-label="Selected file settings">
+            <IconButton
+              label="Copy settings"
+              description="Copy the resolved settings of the selected file."
+              icon={<CopyIcon />}
+              disabled={converting}
+              onClick={() => actions.copySettings()}
+            />
+            <IconButton
+              label="Paste settings"
+              description="Paste the copied settings into the selected file."
+              icon={<PasteIcon />}
+              disabled={converting || !canPaste}
+              onClick={() => actions.pasteSettings()}
+            />
+            <IconButton
+              label="Paste to all files"
+              description={`Paste the copied settings into all ${state.queue.length} queued files.`}
+              icon={<LayersIcon />}
+              disabled={converting || !canPaste}
+              onClick={() => actions.pasteSettingsToAll()}
+            />
+            {selectedItem.companionName !== null && (
+              <IconButton
+                label={`Remove companion ${selectedItem.companionName}`}
+                icon={<XIcon />}
+                disabled={converting}
+                onClick={() => actions.selectCompanion(null)}
+              />
+            )}
+            <span className="toolbar-separator" aria-hidden="true" />
+            <IconButton
+              label="Set as custom preset"
+              description="Save the selected file's resolved settings as the single Custom preset."
+              icon={<BookmarkIcon />}
+              disabled={converting}
+              onClick={() => actions.setCustomPreset()}
+            />
+          </div>
+          {state.customPreset === null && (
+            <p className="hint">
+              The bookmark saves this file's settings as the single Custom preset.
+            </p>
+          )}
+        </footer>
+      )}
     </section>
   );
 }

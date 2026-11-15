@@ -13,6 +13,16 @@ import {
 export function ControlsPanel() {
   const { state, dispatch, actions } = useAppState();
   const busy = state.activity.state === 'working';
+  const converting = state.converting;
+  const selectedItem = state.queue.find((item) => item.id === state.selectedItemId);
+  // A queue entry is editable once its row exists.  While the module is
+  // preparing it, the base values are still unknown, so the controls wait.
+  // Preview rendering and an already converted row do not lock them.
+  const settingsDisabled =
+    converting ||
+    selectedItem === undefined ||
+    selectedItem.status === 'working' ||
+    selectedItem.status === 'pending';
   const hasCustomPreset = state.customPreset !== null;
 
   return (
@@ -25,6 +35,17 @@ export function ControlsPanel() {
           <div className="section-header">
             <h3 className="section-title">Presets</h3>
           </div>
+          <p className="hint editing-hint">
+            {selectedItem === undefined
+              ? 'Select a queued file to edit its settings.'
+              : (
+                  <>
+                    Editing <strong>{selectedItem.sourceName}</strong>. Presets and
+                    sliders only affect the selected file; use the queue footer to
+                    copy or paste settings.
+                  </>
+                )}
+          </p>
           <div className="preset-grid">
             {PRESET_IDS.map((preset) => (
               <button
@@ -32,7 +53,9 @@ export function ControlsPanel() {
                 type="button"
                 className="preset-button"
                 aria-pressed={state.preset === preset}
-                disabled={busy || (preset === 'custom' && !hasCustomPreset)}
+                disabled={
+                  settingsDisabled || (preset === 'custom' && !hasCustomPreset)
+                }
                 title={
                   preset === 'custom' && !hasCustomPreset
                     ? 'Set a custom preset from the queue first.'
@@ -44,6 +67,12 @@ export function ControlsPanel() {
               </button>
             ))}
           </div>
+          {!hasCustomPreset && (
+            <p className="hint">
+              The Custom slot is empty. Save the selected file's settings with the
+              bookmark button in the queue footer.
+            </p>
+          )}
         </div>
 
         {STAGE_SECTIONS.map((section) => (
@@ -53,6 +82,7 @@ export function ControlsPanel() {
               <button
                 type="button"
                 className="button ghost"
+                disabled={settingsDisabled}
                 onClick={() => actions.resetSection(section.sliders.map((slider) => slider.key))}
               >
                 Reset
@@ -75,7 +105,7 @@ export function ControlsPanel() {
                   max={slider.max}
                   step={slider.step}
                   value={state.settings[slider.key]}
-                  disabled={busy}
+                  disabled={settingsDisabled}
                   onChange={(event) => {
                     const raw = Number(event.target.value);
                     actions.setStageValue(
@@ -98,7 +128,7 @@ export function ControlsPanel() {
             <select
               className="select"
               value={state.compression}
-              disabled={busy}
+              disabled={converting}
               aria-label="Compression"
               onChange={(event) =>
                 dispatch({
@@ -123,7 +153,10 @@ export function ControlsPanel() {
             type="button"
             className="button primary"
             disabled={
-              busy || state.queue.length === 0 || state.moduleStatus !== 'ready'
+              busy ||
+              converting ||
+              state.queue.length === 0 ||
+              state.moduleStatus !== 'ready'
             }
             title={
               state.queue.length > 1
@@ -137,7 +170,7 @@ export function ControlsPanel() {
           <button
             type="button"
             className="button danger"
-            disabled={!busy}
+            disabled={!converting}
             title="Stop the running conversion. The worker restarts, so the next conversion prepares the image again."
             onClick={() => actions.cancel()}
           >

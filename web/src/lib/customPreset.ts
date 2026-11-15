@@ -6,7 +6,7 @@ import {
 } from './stageSettings';
 
 export const CUSTOM_PRESET_STORAGE_KEY = 'hiraco.custom-preset.v1';
-/** Old web releases kept a named list; migrate its last entry. */
+/** Old web releases kept a named list; migrate its last valid entry. */
 export const LEGACY_CUSTOM_PRESETS_STORAGE_KEY = 'hiraco.custom-presets.v1';
 
 const SLIDER_BY_KEY = new Map(
@@ -54,46 +54,79 @@ export function loadCustomPreset(
   if (storage === null) {
     return null;
   }
+
   try {
     const text = storage.getItem(CUSTOM_PRESET_STORAGE_KEY);
     if (text !== null) {
-      return sanitizeCustomPreset(JSON.parse(text));
+      const current = sanitizeCustomPreset(JSON.parse(text));
+      if (current !== null) {
+        try {
+          // The old named list is no longer used.
+          storage.removeItem(LEGACY_CUSTOM_PRESETS_STORAGE_KEY);
+        } catch {
+          // Read-only storage still has a valid preset to return.
+        }
+        return current;
+      }
+      // A corrupt new slot must not hide a valid old list.
+      try {
+        storage.removeItem(CUSTOM_PRESET_STORAGE_KEY);
+      } catch {
+        // Read-only storage; the value is ignored either way.
+      }
     }
+  } catch {
+    try {
+      storage.removeItem(CUSTOM_PRESET_STORAGE_KEY);
+    } catch {
+      // The storage may be read-only; fall through to the legacy migration.
+    }
+  }
+
+  try {
     const legacy = storage.getItem(LEGACY_CUSTOM_PRESETS_STORAGE_KEY);
     if (legacy === null) {
       return null;
     }
     const parsed: unknown = JSON.parse(legacy);
-    if (!Array.isArray(parsed) || parsed.length === 0) {
+    if (!Array.isArray(parsed)) {
+      storage.removeItem(LEGACY_CUSTOM_PRESETS_STORAGE_KEY);
       return null;
     }
-    const last = parsed[parsed.length - 1] as Record<string, unknown> | null;
-    const migrated = last !== null && typeof last === 'object'
-        ? sanitizeCustomPreset(last.settings)
-        : null;
-    if (migrated !== null) {
-      persistCustomPreset(migrated, storage);
-    } else {
-      storage.removeItem(LEGACY_CUSTOM_PRESETS_STORAGE_KEY);
+    // Take the last valid entry; a malformed tail must not throw away earlier
+    // presets.  The old UI appended new names and updated existing ones in
+    // place, so the last valid element is the best available migration.
+    for (let index = parsed.length - 1; index >= 0; index -= 1) {
+      const entry = parsed[index] as Record<string, unknown> | null;
+      const migrated = entry !== null && typeof entry === 'object'
+          ? sanitizeCustomPreset(entry.settings)
+          : null;
+      if (migrated !== null) {
+        persistCustomPreset(migrated, storage);
+        return migrated;
+      }
     }
-    return migrated;
+    storage.removeItem(LEGACY_CUSTOM_PRESETS_STORAGE_KEY);
+    return null;
   } catch {
     return null;
   }
 }
 
-/** Persists the one custom preset; storage failures are ignored. */
+/** Persists the one custom preset; returns false when storage is blocked. */
 export function persistCustomPreset(
   settings: StageSettings,
   storage: Storage | null = storageOrNull(),
-): void {
+): boolean {
   if (storage === null) {
-    return;
+    return false;
   }
   try {
     storage.setItem(CUSTOM_PRESET_STORAGE_KEY, JSON.stringify(settings));
     storage.removeItem(LEGACY_CUSTOM_PRESETS_STORAGE_KEY);
+    return true;
   } catch {
     // The UI keeps the preset for the session even when persistence is blocked.
+    return false;
   }
 }

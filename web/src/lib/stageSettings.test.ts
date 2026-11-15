@@ -59,6 +59,21 @@ function expectClose(actual: StageSettings, expected: StageSettings) {
   }
 }
 
+describe('the bridge ABI', () => {
+  it('keeps the stage key order the WebAssembly side expects', () => {
+    expect(STAGE_KEYS).toEqual([
+      'stage1_psf_sigma',
+      'stage1_nsr',
+      'stage2_denoise',
+      'stage2_gain1',
+      'stage2_gain2',
+      'stage2_gain3',
+      'stage3_radius',
+      'stage3_gain',
+    ]);
+  });
+});
+
 describe('builtInPresetSettings', () => {
   it('matches the native small preset', () => {
     expectClose(

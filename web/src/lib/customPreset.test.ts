@@ -31,9 +31,14 @@ function makeStorage(initial: Record<string, string> = {}): Storage {
 const PRESET = { ...DEFAULT_STAGE_SETTINGS, stage1_psf_sigma: 2.5 };
 
 describe('custom preset', () => {
+  it('uses stable storage keys', () => {
+    expect(CUSTOM_PRESET_STORAGE_KEY).toBe('hiraco.custom-preset.v1');
+    expect(LEGACY_CUSTOM_PRESETS_STORAGE_KEY).toBe('hiraco.custom-presets.v1');
+  });
+
   it('round-trips the single preset through storage', () => {
     const storage = makeStorage();
-    persistCustomPreset(PRESET, storage);
+    expect(persistCustomPreset(PRESET, storage)).toBe(true);
     expect(loadCustomPreset(storage)).toEqual(PRESET);
   });
 
@@ -58,16 +63,27 @@ describe('custom preset', () => {
     expect(preset?.stage3_radius).toBe(5);
   });
 
-  it('migrates the last entry of the old named-preset list', () => {
+  it('migrates the last valid entry of the old named-preset list', () => {
     const storage = makeStorage({
-      [LEGACY_CUSTOM_PRESETS_STORAGE_KEY]: JSON.stringify([
+      'hiraco.custom-presets.v1': JSON.stringify([
         { name: 'Old', settings: { ...PRESET, stage1_psf_sigma: 1.2 } },
         { name: 'Latest', settings: PRESET },
+        { name: 'Broken', settings: { stage1_psf_sigma: 'bad' } },
       ]),
     });
     expect(loadCustomPreset(storage)).toEqual(PRESET);
-    expect(storage.getItem(CUSTOM_PRESET_STORAGE_KEY)).toBe(JSON.stringify(PRESET));
-    expect(storage.getItem(LEGACY_CUSTOM_PRESETS_STORAGE_KEY)).toBeNull();
+    expect(storage.getItem('hiraco.custom-preset.v1')).toBe(JSON.stringify(PRESET));
+    expect(storage.getItem('hiraco.custom-presets.v1')).toBeNull();
+  });
+
+  it('falls back to a valid legacy list when the new slot is corrupt', () => {
+    const storage = makeStorage({
+      'hiraco.custom-preset.v1': '{not json',
+      'hiraco.custom-presets.v1': JSON.stringify([
+        { name: 'Old', settings: PRESET },
+      ]),
+    });
+    expect(loadCustomPreset(storage)).toEqual(PRESET);
   });
 
   it('does not throw when storage is blocked', () => {
@@ -83,6 +99,6 @@ describe('custom preset', () => {
       },
     } as unknown as Storage;
     expect(loadCustomPreset(storage)).toBeNull();
-    expect(() => persistCustomPreset(PRESET, storage)).not.toThrow();
+    expect(persistCustomPreset(PRESET, storage)).toBe(false);
   });
 });

@@ -318,7 +318,7 @@ A live build is published at https://kred.github.io/hiraco/.
 
 The repository ships a browser UI in `web/` that runs the full conversion in
 the browser.  It supports a multi-file queue, ORI companion pairing, per-file
-settings with copy/paste/apply-to-all, and a single reusable custom preset saved
+settings with copy/paste/paste-to-all, and a single reusable custom preset saved
 in the browser.  Build and run it with:
 
 ```bash

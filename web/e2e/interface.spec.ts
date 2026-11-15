@@ -6,6 +6,17 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
 
+const pageErrors: string[] = [];
+
+test.beforeEach(({ page }) => {
+  pageErrors.length = 0;
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+});
+
+test.afterEach(() => {
+  expect(pageErrors).toEqual([]);
+});
+
 /** The RAW file the test converts. */
 const fixture = process.env.HIRACO_E2E_RAW ?? path.join(repoRoot, 'sample', '_8142490.ORI');
 
@@ -101,11 +112,13 @@ test.describe('the preview and the controls', () => {
       'true',
     );
 
-    // The reset button of the section exists.
-    await expect(page.getByRole('button', { name: 'Reset' }).first()).toBeVisible();
+    // Resetting the Multi-scale Detail section returns its sliders to the base.
+    const detail = page.locator('.section', { hasText: 'Multi-scale Detail' });
+    await detail.getByRole('button', { name: 'Reset' }).click();
+    await expect(denoise).toHaveValue('0.33');
     await expect(
       page.getByRole('button', { name: 'Strong', exact: true }),
-    ).toHaveAttribute('aria-pressed', 'true');
+    ).toHaveAttribute('aria-pressed', 'false');
   });
 
   test('writes the file the native application writes', async ({ page }) => {

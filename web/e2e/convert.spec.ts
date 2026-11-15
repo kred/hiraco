@@ -78,6 +78,10 @@ test('converts a RAW file in the browser and matches the native output', async (
   await download.saveAs(output);
   expect(statSync(output).size).toBeGreaterThan(1_000_000);
 
+  // Page errors are asserted before the reference skip: a run that cannot
+  // compare pixels must still prove the conversion produced no runtime error.
+  expect(failures.join('\n')).toBe('');
+
   // The browser has to write the same pixels as the native build.
   test.skip(
     !existsSync(reference),
@@ -95,5 +99,4 @@ test('converts a RAW file in the browser and matches the native output', async (
     { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
   );
   expect(report).toContain('RESULT: PASS');
-  expect(failures.join('\n')).toBe('');
 });

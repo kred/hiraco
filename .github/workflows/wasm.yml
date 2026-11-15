@@ -237,6 +237,23 @@ jobs:
           unzip -q /tmp/dng-sdk.zip -d .
           test -f dng_sdk_1_7_1/dng_sdk/source/dng_host.h
 
+      - name: Fetch the RAW fixtures
+        env:
+          # The browser queue, copy/paste and conversion tests use the same
+          # sample/ and reference/ fixtures as the native and wasm jobs.  When
+          # the archive is not configured, those tests skip individually and
+          # the unit suite still covers the queue reducer.
+          HIRACO_FIXTURE_URL: ${{ vars.HIRACO_FIXTURE_URL }}
+        run: |
+          if [ -z "${HIRACO_FIXTURE_URL}" ]; then
+            echo "::notice::HIRACO_FIXTURE_URL is not set; the fixture-dependent" \
+                 "browser tests will be skipped."
+            exit 0
+          fi
+          curl -sSL --retry 3 --fail -o /tmp/fixtures.tar.gz "${HIRACO_FIXTURE_URL}"
+          tar xzf /tmp/fixtures.tar.gz -C .
+          test -f reference/_3210504.ORF
+
       - name: Build the WebAssembly module
         run: ./scripts/build_wasm.sh hiraco-web-assets
 
@@ -261,10 +278,15 @@ jobs:
         working-directory: web
         run: npx playwright install --with-deps chromium
 
+      - name: Install the DNG comparison dependencies
+        run: |
+          python3 -m venv .venv-ci
+          .venv-ci/bin/pip install --quiet numpy
+
       - name: Run the end to end test
         working-directory: web
         env:
-          HIRACO_PYTHON: python3
+          HIRACO_PYTHON: ../.venv-ci/bin/python
         run: npx playwright test
 
       - name: Run the static host isolation test
