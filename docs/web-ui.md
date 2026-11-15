@@ -81,8 +81,8 @@ npm run e2e       # builds dist/ and runs the Playwright tests
 ```
 
 The end-to-end server serves `dist/`; `npm run e2e` runs the build first so the
-tests never exercise a stale bundle.  The end-to-end tests use these generated
-or sample files:
+tests never exercise a stale bundle.  The fixture-free shell tests always run;
+the conversion, queue and ORI tests use these generated or sample files:
 
 - `sample/_8142490.ORI` and `build/reference/_8142490-deflate.dng` for the
   pixel comparison
