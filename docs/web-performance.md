@@ -114,7 +114,7 @@ queue copy/paste test from about 24.4 s to 20.2 s, on the same machine.
 ```bash
 cd web
 npm run typecheck
-npm run test            # 44 unit tests
+npm run test            # 45 unit tests
 npm run e2e             # 12 Playwright tests when the fixtures are present
 npm run test:coi
 
