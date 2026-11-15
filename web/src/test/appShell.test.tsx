@@ -5,6 +5,7 @@ import { App } from '../App';
 describe('the application shell', () => {
   it('renders the three panes of the native layout', () => {
     render(<App />);
+    expect(screen.getByText('highres raw converter')).toBeInTheDocument();
     expect(screen.getByLabelText('Workspace')).toBeInTheDocument();
     expect(screen.getByLabelText('Preview')).toBeInTheDocument();
     expect(screen.getByLabelText('Processing')).toBeInTheDocument();

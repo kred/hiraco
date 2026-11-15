@@ -1,4 +1,4 @@
-# hiraco
+# hiraco highres raw converter
 
 `hiraco` is a native C++ toolchain for converting selected Olympus / OM SYSTEM RAW files, with a custom emphasis on high-resolution sensor-shift captures, into rendered Linear DNG files.
 

@@ -14,7 +14,7 @@ function AppShell() {
     <div className="app" data-module-status={state.moduleStatus}>
       <header className="app-header">
         <div className="app-brand">
-          hiraco <small>Linear DNG converter</small>
+          hiraco <small>highres raw converter</small>
         </div>
         <div className="app-header-spacer" />
         <ThemeToggle />
