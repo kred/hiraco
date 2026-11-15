@@ -138,7 +138,8 @@ in the preparation, cache, enhancement or display phases is visible without
   renders.  Their detail-enhancement stages run at the display size, so
   highlight recovery masks and fine-scale sharpening can differ slightly from
   the 100% view.  The DNG output and the 100% preview keep the original exact
-  pipeline.
+  pipeline.  If the 100% preview has already been rendered, switching down to
+  fit/50% reuses that processed full preview and only resizes it.
 - The queue preview cache keeps fit previews per row (about 20 MB for a
   2560×1920 RGBA preview, plus up to ~5 MB for the recovered-pixel mask).
   Pixels and mask together must stay under the 32 MB per-entry limit;

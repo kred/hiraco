@@ -808,6 +808,34 @@ void TestDisplayPreviewIsResizedProcessedFull() {
   }
 }
 
+void TestProxyPreviewReusesCachedFullPreview() {
+  // Switching 100% -> 50%/fit must resize the already processed full preview,
+  // not run the proxy enhancement again.  A separately enhanced proxy would
+  // not match the exact resize.
+  const std::filesystem::path source_path = RealOrfFixturePath("sample/_8142491.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
+
+  PreparedSource prepared;
+  std::string error_message;
+  Expect(PrepareSource(source_path.string(), &prepared, &error_message),
+         "proxy cache test should prepare source: " + error_message);
+
+  auto full = std::make_shared<PreviewImage>();
+  Expect(RenderConvertedFullPreview(&prepared, {}, 0, full, {}, {}, {}, &error_message),
+         "full-resolution preview should succeed: " + error_message);
+
+  auto proxy = std::make_shared<PreviewImage>();
+  Expect(RenderConvertedProxyPreview(&prepared, {}, 512, proxy, {}, {}, {}, &error_message),
+         "proxy preview should succeed: " + error_message);
+
+  const PreviewImage expected = ScalePreviewImageForDisplay(*full, 512);
+  Expect(proxy->width == expected.width && proxy->height == expected.height,
+         "a cached full preview should be resized for a proxy request");
+  Expect(proxy->colors == expected.colors && proxy->pixels == expected.pixels,
+         "a cached full preview must not be re-enhanced for a 50%/fit request");
+}
+
 void TestFullPreviewObeysDisplayDimension() {
   const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
   // The .ORF fixtures are gitignored, so an absent fixture means a broken
@@ -1496,6 +1524,7 @@ int main() {
     TestLocalOm3RecoveryFullPreviewSmoke();
     TestLocalOm3RecoveryCropPreviewMapping();
     TestFullPreviewObeysDisplayDimension();
+    TestProxyPreviewReusesCachedFullPreview();
     TestDisplayPreviewIsResizedProcessedFull();
     TestStandard20MpPreviewColourIsStableAcrossZoom();
     TestFullPreviewOrientationMatchesLibRawFlip();
