@@ -1115,7 +1115,10 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       type: 'settings-copied',
       value: {
         settings: current.settings,
-        overrides: current.overrides,
+        // Copy every value explicitly, like the native "Copy settings": a
+        // paste must not fall back to different per-image base values for
+        // keys the source happened to leave at its base.
+        overrides: makeExplicitOverrides(current.settings),
         preset: current.preset,
       },
     });
