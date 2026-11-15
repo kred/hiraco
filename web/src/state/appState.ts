@@ -177,10 +177,13 @@ export type AppAction =
   | { type: 'module-status'; status: ModuleStatus; message: string | null };
 
 /** Large full-resolution previews are not retained per queue row. */
-const PREVIEW_CACHE_LIMIT_BYTES = 32 * 1024 * 1024;
+export const PREVIEW_CACHE_LIMIT_BYTES = 32 * 1024 * 1024;
 
 function cacheablePreview(preview: PreviewBuffer): PreviewBuffer | null {
-  return preview.pixels.byteLength <= PREVIEW_CACHE_LIMIT_BYTES ? preview : null;
+  // The returned preview keeps both arrays alive; count the recovered-pixel
+  // mask as well as the RGBA pixels against the per-row cache limit.
+  const bytes = preview.pixels.byteLength + preview.recoveredMask.byteLength;
+  return bytes <= PREVIEW_CACHE_LIMIT_BYTES ? preview : null;
 }
 
 /** The preset a value set matches: built-in first, then the custom slot. */

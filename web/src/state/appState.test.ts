@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  PREVIEW_CACHE_LIMIT_BYTES,
   appReducer,
   initialAppState,
   matchedPreset,
@@ -159,6 +160,19 @@ describe('the application reducer', () => {
     });
     expect(companionChanged.queue[0].cachedConvertedPreview).toBeNull();
     expect(companionChanged.queue[0].cachedOriginalPreview).toBeNull();
+  });
+
+  it('counts the recovered mask against the preview cache limit', () => {
+    const preview = {
+      width: 2,
+      height: 1,
+      pixels: new Uint8ClampedArray(8),
+      recoveredMask: new Uint8Array(PREVIEW_CACHE_LIMIT_BYTES + 1),
+    };
+    const state = makeState({ queue: [makeItem(1)], selectedItemId: 1 });
+    const rendered = appReducer(state, { type: 'converted-preview', preview });
+    expect(rendered.convertedPreview).toBe(preview);
+    expect(rendered.queue[0].cachedConvertedPreview).toBeNull();
   });
 
   it('drops a cached converted preview when the values change', () => {

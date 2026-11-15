@@ -140,7 +140,9 @@ in the preparation, cache, enhancement or display phases is visible without
   the 100% view.  The DNG output and the 100% preview keep the original exact
   pipeline.
 - The queue preview cache keeps fit previews per row (about 20 MB for a
-  2560×1920 RGBA preview).  Full-resolution previews are not cached per row.
+  2560×1920 RGBA preview, plus up to ~5 MB for the recovered-pixel mask).
+  Pixels and mask together must stay under the 32 MB per-entry limit;
+  full-resolution previews are not cached per row.
 - Conversion still uses the full-resolution pipeline.  On this machine the
   80 MP Deflate conversion takes about 25 s after the preview; the work above
   removes a thread-pool deadlock, but does not make conversion itself cheaper.
