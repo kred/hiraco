@@ -271,7 +271,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       return;
     }
     previewJobs.current = Math.max(0, previewJobs.current - 1);
-    if (previewJobs.current === 0) {
+    if (
+      previewJobs.current === 0 &&
+      !sessionLoading.current &&
+      !convertingRef.current
+    ) {
       dispatch({
         type: 'activity',
         activity: { state: 'idle', message: 'Ready', fraction: null },
@@ -315,7 +319,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       if (error instanceof ModuleCrashedError) {
         sessionRef.current = false;
       }
-      if (!(error instanceof CancelledError)) {
+      // A conversion owns the worker now; a stale preview error must not
+      // replace its progress message.
+      if (!(error instanceof CancelledError) && !convertingRef.current) {
         dispatch({ type: 'error', message: messageOf(error) });
       }
     } finally {
@@ -357,7 +363,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       if (error instanceof ModuleCrashedError) {
         sessionRef.current = false;
       }
-      if (!(error instanceof CancelledError)) {
+      if (!(error instanceof CancelledError) && !convertingRef.current) {
         dispatch({ type: 'error', message: messageOf(error) });
       }
     } finally {
@@ -1001,7 +1007,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const convert = useCallback(async () => {
     const snapshot = stateRef.current;
     const items = [...snapshot.queue];
-    if (items.length === 0 || convertingRef.current) {
+    if (items.length === 0 || convertingRef.current || sessionLoading.current) {
       return;
     }
     convertingRef.current = true;
