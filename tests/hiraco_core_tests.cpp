@@ -812,7 +812,7 @@ void TestProxyPreviewReusesCachedFullPreview() {
   // Switching 100% -> 50%/fit must resize the already processed full preview,
   // not run the proxy enhancement again.  A separately enhanced proxy would
   // not match the exact resize.
-  const std::filesystem::path source_path = RealOrfFixturePath("sample/_8142491.ORF");
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
   Expect(std::filesystem::exists(source_path),
          "missing test fixture (gitignored *.ORF): " + source_path.string());
 
@@ -825,9 +825,13 @@ void TestProxyPreviewReusesCachedFullPreview() {
   Expect(RenderConvertedFullPreview(&prepared, {}, 0, full, {}, {}, {}, &error_message),
          "full-resolution preview should succeed: " + error_message);
 
+  // A rebuild would be cancelled immediately; success proves the cached full
+  // preview was resized instead.
+  const CancelCheck cancel = []() { return true; };
   auto proxy = std::make_shared<PreviewImage>();
-  Expect(RenderConvertedProxyPreview(&prepared, {}, 512, proxy, {}, {}, {}, &error_message),
-         "proxy preview should succeed: " + error_message);
+  Expect(RenderConvertedProxyPreview(&prepared, {}, 512, proxy, {}, {}, cancel, &error_message),
+         "a cached full preview should satisfy a proxy request without rebuilding: " +
+             error_message);
 
   const PreviewImage expected = ScalePreviewImageForDisplay(*full, 512);
   Expect(proxy->width == expected.width && proxy->height == expected.height,
