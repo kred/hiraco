@@ -937,15 +937,17 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
   }
 
   const bool highlight_recovery_enabled = prepared->ShouldUseHighlightRecovery();
-  if (!scale_cache_for_preview) {
+  {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
     if (prepared->data->has_processed_full_preview &&
         prepared->data->processed_full_preview_highlight_recovery == highlight_recovery_enabled &&
         StageOverridesEqual(prepared->data->processed_full_preview_stage_overrides, stage_overrides) &&
         LibRawOverridesEqual(prepared->data->processed_full_preview_libraw_overrides,
                              libraw_overrides)) {
-      // The cache holds the processed full-resolution result.  Display sizes
-      // are pure resizes, so a zoom change never re-runs the enhancement.
+      // The cache holds the processed full-resolution result.  A display-sized
+      // request is a pure resize, so switching 100% -> 50%/fit must reuse it
+      // instead of running the proxy enhancement again.  Proxy results are
+      // never stored here, so every cache entry is full resolution.
       *preview = max_dimension == 0
           ? prepared->data->processed_full_preview
           : ScalePreviewImageForDisplay(prepared->data->processed_full_preview, max_dimension);
