@@ -151,6 +151,14 @@ describe('the application reducer', () => {
       { type: 'selection-changed', id: 1 },
     );
     expect(zoomed.convertedPreview).toBeNull();
+
+    const companionChanged = appReducer(rendered, {
+      type: 'queue-updated',
+      id: 1,
+      patch: { companionName: 'image-1.ORI' },
+    });
+    expect(companionChanged.queue[0].cachedConvertedPreview).toBeNull();
+    expect(companionChanged.queue[0].cachedOriginalPreview).toBeNull();
   });
 
   it('drops a cached converted preview when the values change', () => {

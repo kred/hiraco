@@ -202,13 +202,28 @@ export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case 'queue-added':
       return { ...state, queue: [...state.queue, ...action.items] };
-    case 'queue-updated':
+    case 'queue-updated': {
+      // A different companion changes the decoded pixels, so both cached
+      // previews of that row are stale.
+      const companionChanged = action.patch.companionName !== undefined;
       return {
         ...state,
         queue: state.queue.map((item) =>
-          item.id === action.id ? { ...item, ...action.patch } : item,
+          item.id === action.id
+            ? {
+                ...item,
+                ...action.patch,
+                ...(companionChanged
+                  ? {
+                      cachedOriginalPreview: null,
+                      cachedConvertedPreview: null,
+                    }
+                  : {}),
+              }
+            : item,
         ),
       };
+    }
     case 'queue-removed':
       return {
         ...state,
