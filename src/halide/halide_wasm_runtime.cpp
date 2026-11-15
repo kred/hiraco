@@ -33,6 +33,8 @@
 #include <thread>
 #include <vector>
 
+#include "../hiraco_threads.h"
+
 namespace {
 
 // The alignment the official runtime uses on 64-bit x86, kept here because
@@ -44,11 +46,7 @@ constexpr size_t kHalideAlignment = 64;
 constexpr size_t kHalidePrefix = 16;
 
 int HalideWorkerCount() {
-  const unsigned hardware = std::thread::hardware_concurrency();
-  if (hardware <= 1) {
-    return 1;
-  }
-  return static_cast<int>(std::min<unsigned>(hardware, 32u));
+  return hiraco::ComputeThreadCount();
 }
 
 [[noreturn]] void HalideAbort(const char *message) {

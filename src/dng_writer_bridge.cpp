@@ -3,6 +3,7 @@
 
 #include "hiraco_core.h"
 #include "dng_writer_bridge.h"
+#include "hiraco_threads.h"
 #include "hiraco_timing.h"
 
 constexpr float kStage2GainMin = 0.25f;
@@ -255,9 +256,9 @@ uint64_t g_highlight_recovery_run_sequence = 0;
 void InitFftwThreads() {
   std::call_once(g_fftw_init_flag, [] {
     if (fftw_init_threads()) {
-      const int num_threads = static_cast<int>(std::thread::hardware_concurrency());
-      fftw_plan_with_nthreads(std::max(num_threads, 1));
-      std::cerr << "[hiraco] FFTW using " << std::max(num_threads, 1) << " threads\n";
+      const int num_threads = hiraco::ComputeThreadCount();
+      fftw_plan_with_nthreads(num_threads);
+      std::cerr << "[hiraco] FFTW using " << num_threads << " threads\n";
     }
   });
 }
@@ -4159,6 +4160,10 @@ void AppendImagePreview(dng_host& host,
 
 }  // namespace
 
+RasterImage ScaleRasterImageForDisplay(const RasterImage& source, uint32_t max_dimension) {
+  return BuildScaledRasterImage(source, max_dimension);
+}
+
 PreviewImage ScalePreviewImageForDisplay(const PreviewImage& source,
                                          uint32_t max_dimension) {
   PreviewImage scaled;
@@ -4394,7 +4399,8 @@ bool BuildOriginalPreviewFromRaw(const std::string& source_path,
                                  std::shared_ptr<PreviewImage> preview,
                                  ProgressCallback progress,
                                  CancelCheck cancel,
-                                 std::string* error_message) {
+                                 std::string* error_message,
+                                 bool full_resolution) {
   const hiraco::ScopedTimingLog preview_timer("preview", "Build original preview");
   if (!preview) {
     if (error_message != nullptr) {
@@ -4409,13 +4415,14 @@ bool BuildOriginalPreviewFromRaw(const std::string& source_path,
   }
 
   RasterImage rendered;
-  // The original preview must show the full raw resolution, not a half-size
-  // embedded-style decode.  Full sensor width/height is decoded here and then
-  // downsampled by BuildPreviewImage / ScalePreview to the requested display
-  // dimension.  half_size is forced to 0 so both native and WASM use the full
-  // 50 MP / 80 MP raw data instead of an embedded ORF thumbnail.
+  // The GUI keeps a full-resolution original for 100% inspection.  The browser
+  // asks for a display-capped preview and can decode at half size: LibRaw
+  // merges each 2x2 Bayer quad over the full sensor data and skips the
+  // demosaic, so this is not an embedded ORF thumbnail.  Below 100% the result
+  // still supplies more pixels than the requested preview.  The embedded DNG
+  // thumbnail (1024 px) uses the half-size path too.
   RenderSettings preview_settings = BuildPreviewRenderSettings(metadata, libraw_overrides);
-  preview_settings.half_size = 0;
+  preview_settings.half_size = full_resolution ? 0 : 1;
   {
     const hiraco::ScopedTimingLog timer("preview", "Render LibRaw preview");
     if (!RenderLibRawImage(source_path, metadata, preview_settings, &rendered, error_message)) {
@@ -4926,7 +4933,8 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                          embedded_preview,
                                          preview_progress,
                                          cancel,
-                                         &result.message)) {
+                                         &result.message,
+                                         /*full_resolution=*/false)) {
           return result;
         }
       }

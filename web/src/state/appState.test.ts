@@ -33,6 +33,8 @@ function makeItem(
     settings: applyOverrides(base, overrides),
     overrides,
     preset: null,
+    cachedOriginalPreview: null,
+    cachedConvertedPreview: null,
   };
 }
 
@@ -116,6 +118,66 @@ describe('the application reducer', () => {
     expect(next.queue[1].preset).toBeNull();
     expect(next.preset).toBe('custom');
     expect(next.customPreset).toEqual(custom);
+  });
+
+  it('caches fit previews per queue row and restores them on reselection', () => {
+    const preview = {
+      width: 2,
+      height: 1,
+      pixels: new Uint8ClampedArray(8),
+      recoveredMask: new Uint8Array(2),
+    };
+    const first = makeItem(1);
+    const second = makeItem(2);
+    const state = makeState({
+      queue: [first, second],
+      selectedItemId: 1,
+      convertedPreview: null,
+      originalPreview: null,
+    });
+
+    const rendered = appReducer(state, { type: 'converted-preview', preview });
+    expect(rendered.queue[0].cachedConvertedPreview).toBe(preview);
+    expect(rendered.queue[1].cachedConvertedPreview).toBeNull();
+
+    const switched = appReducer(
+      { ...rendered, selectedItemId: 2, convertedPreview: null },
+      { type: 'selection-changed', id: 1 },
+    );
+    expect(switched.convertedPreview).toBe(preview);
+
+    const zoomed = appReducer(
+      { ...rendered, selectedItemId: 2, zoomMode: '50', convertedPreview: null },
+      { type: 'selection-changed', id: 1 },
+    );
+    expect(zoomed.convertedPreview).toBeNull();
+  });
+
+  it('drops a cached converted preview when the values change', () => {
+    const preview = {
+      width: 2,
+      height: 1,
+      pixels: new Uint8ClampedArray(8),
+      recoveredMask: new Uint8Array(2),
+    };
+    const state = makeState({
+      queue: [makeItem(1), makeItem(2)],
+      selectedItemId: 1,
+    });
+    const rendered = appReducer(state, { type: 'converted-preview', preview });
+    const edited = appReducer(rendered, {
+      type: 'settings-changed',
+      settings: rendered.settings,
+      overrides: {},
+    });
+    expect(edited.queue[0].cachedConvertedPreview).toBeNull();
+
+    const pasted = appReducer(rendered, {
+      type: 'settings-pasted',
+      ids: [1, 2],
+      value: { settings: rendered.settings, overrides: {} },
+    });
+    expect(pasted.queue.every((item) => item.cachedConvertedPreview === null)).toBe(true);
   });
 
   it('resets the processing panel when the queue is cleared', () => {

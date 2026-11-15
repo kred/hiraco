@@ -151,6 +151,9 @@ test('copies settings between queued files and converts them all', async ({
   await page.getByRole('button', { name: 'Copy settings', exact: true }).click();
 
   await page.getByTestId('queue-item').nth(0).getByTestId('queue-select').click();
+  // The first row was already opened, so its fit preview comes back from the
+  // per-row cache while the worker reopens the session.
+  await expect(page.getByTestId('preview-canvas')).toBeVisible({ timeout: 1500 });
   await expect(page.getByLabel('Denoise')).not.toHaveValue(strongDenoise);
   await page.getByRole('button', { name: 'Paste settings', exact: true }).click();
   await expect(page.getByLabel('Denoise')).toHaveValue(strongDenoise);

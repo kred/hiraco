@@ -58,6 +58,12 @@ test.describe('the preview and the controls', () => {
     expect(converted.width).toBeGreaterThan(0);
 
     await page.getByRole('button', { name: 'Original', exact: true }).click();
+    // The original preview is loaded lazily when the mode first needs it.
+    await expect(page.getByTestId('preview-canvas')).toHaveAttribute(
+      'data-preview-kind',
+      'original',
+      { timeout: 300_000 },
+    );
     const original = await canvasSize(page);
     expect(original.width).toBeGreaterThan(0);
 

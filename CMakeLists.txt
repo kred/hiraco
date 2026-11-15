@@ -87,14 +87,14 @@ if(HIRACO_BUILD_WASM)
   # RuntimeError as a dead module and replaces it.  Do not add -fexceptions
   # here without re-testing a malformed RAW end to end.
   # The pool has to match the machine that runs the module, not the machine
-  # that built it: a CI runner with two cores would otherwise pre-warm two
-  # workers, and every user with more cores would then need on-demand thread
-  # creation.  That path deadlocks here, because a thread created from inside
-  # a pthread is proxied synchronously to the module's main thread, which is
-  # blocked inside the wasm call.  Emscripten emits this expression into the
-  # generated JS, so the pool is warmed to the browser's own core count (with
-  # one spare worker for the asynchronous helper threads).
-  set(HIRACO_WASM_PTHREAD_POOL_SIZE "(navigator.hardwareConcurrency||4)+1" CACHE STRING
+  # that built it.  FFTW and Halide can each own up to twelve threads, OpenMP
+  # up to six per team (the CFA-guide extraction runs on a std::async thread,
+  # so two teams can overlap), and all of them come from this one pool.  A pool
+  # smaller than their sum stalls inside the wasm call, because Emscripten
+  # proxies new thread creation to the blocked module main thread.  The pool
+  # covers 12 + 12 + 6 + 6 plus spare workers for the preview and conversion
+  # phases.  Emscripten emits this expression into the generated JS.
+  set(HIRACO_WASM_PTHREAD_POOL_SIZE "Math.min((navigator.hardwareConcurrency||4)*3+4,40)" CACHE STRING
     "Number of worker threads in the WebAssembly thread pool")
   add_link_options(-sPTHREAD_POOL_SIZE=${HIRACO_WASM_PTHREAD_POOL_SIZE})
   # The conversion keeps several double precision buffers of the size of the
@@ -345,8 +345,8 @@ if(HIRACO_USE_BUNDLED_LIBRAW)
     # Emscripten equivalents are used instead.
     set(HIRACO_LIBRAW_AR emar)
     set(HIRACO_LIBRAW_RANLIB emranlib)
-    set(HIRACO_LIBRAW_CFLAGS "--target=${HIRACO_WASM_TARGET_TRIPLE} -O2 -ffp-contract=off -pthread -msimd128")
-    set(HIRACO_LIBRAW_CXXFLAGS "--target=${HIRACO_WASM_TARGET_TRIPLE} -O2 -ffp-contract=off -pthread -msimd128")
+    set(HIRACO_LIBRAW_CFLAGS "--target=${HIRACO_WASM_TARGET_TRIPLE} -O3 -ffp-contract=off -pthread -msimd128")
+    set(HIRACO_LIBRAW_CXXFLAGS "--target=${HIRACO_WASM_TARGET_TRIPLE} -O3 -ffp-contract=off -pthread -msimd128")
     set(HIRACO_LIBRAW_CPPFLAGS "-DUSE_ZLIB -DUSE_JPEG")
     set(HIRACO_LIBRAW_LDFLAGS "--target=${HIRACO_WASM_TARGET_TRIPLE} -pthread")
     set(HIRACO_LIBRAW_HOST "${HIRACO_WASM_TARGET_TRIPLE}")

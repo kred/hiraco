@@ -79,6 +79,9 @@ export interface QueueItem {
   settings: StageSettings | null;
   overrides: StageOverrides;
   preset: PresetId | null;
+  /** Cached fit-mode previews, so reselecting a row does not decode again. */
+  cachedOriginalPreview: PreviewBuffer | null;
+  cachedConvertedPreview: PreviewBuffer | null;
 }
 
 /** Settings copied from one queue entry for pasting into another. */
@@ -173,6 +176,13 @@ export type AppAction =
   | { type: 'error'; message: string | null }
   | { type: 'module-status'; status: ModuleStatus; message: string | null };
 
+/** Large full-resolution previews are not retained per queue row. */
+const PREVIEW_CACHE_LIMIT_BYTES = 32 * 1024 * 1024;
+
+function cacheablePreview(preview: PreviewBuffer): PreviewBuffer | null {
+  return preview.pixels.byteLength <= PREVIEW_CACHE_LIMIT_BYTES ? preview : null;
+}
+
 /** The preset a value set matches: built-in first, then the custom slot. */
 export function matchedPreset(
   base: StageSettings,
@@ -261,8 +271,12 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         settings,
         overrides: item.overrides,
         preset: matchedPreset(baseSettings, settings, state.customPreset),
-        originalPreview: null,
-        convertedPreview: null,
+        // A cached preview is only valid for the fit resolution it was
+        // rendered at; zoom changes request a fresh one.
+        originalPreview:
+          state.zoomMode === 'fit' ? item.cachedOriginalPreview : null,
+        convertedPreview:
+          state.zoomMode === 'fit' ? item.cachedConvertedPreview : null,
         error: null,
         activity: { state: 'idle', message: `Loading ${item.sourceName}`, fraction: null },
       };
@@ -280,6 +294,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
               preset: item.baseSettings === null
                   ? null
                   : matchedPreset(item.baseSettings, action.value.settings, state.customPreset),
+              cachedConvertedPreview: null,
             }
           : item,
       );
@@ -329,9 +344,25 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
     case 'original-preview':
-      return { ...state, originalPreview: action.preview };
+      return {
+        ...state,
+        originalPreview: action.preview,
+        queue: state.queue.map((item) =>
+          item.id === state.selectedItemId
+            ? { ...item, cachedOriginalPreview: cacheablePreview(action.preview) }
+            : item,
+        ),
+      };
     case 'converted-preview':
-      return { ...state, convertedPreview: action.preview };
+      return {
+        ...state,
+        convertedPreview: action.preview,
+        queue: state.queue.map((item) =>
+          item.id === state.selectedItemId
+            ? { ...item, cachedConvertedPreview: cacheablePreview(action.preview) }
+            : item,
+        ),
+      };
     case 'settings-changed': {
       // Moving a slider back onto a preset value highlights it again, like the
       // native SettingsMatchPreset.
@@ -349,6 +380,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
                 settings: action.settings,
                 overrides: action.overrides,
                 preset,
+                cachedConvertedPreview: null,
               }
             : item,
         ),
@@ -367,6 +399,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
                 settings: action.settings,
                 overrides: action.overrides,
                 preset: action.preset,
+                cachedConvertedPreview: null,
               }
             : item,
         ),
