@@ -1,6 +1,7 @@
 import { useRef } from 'react';
 import { useAppState } from '../state/AppStateProvider';
 import type { QueueItem, QueueStatus } from '../state/appState';
+import { PRESET_LABELS } from '../lib/stageSettings';
 
 const STATUS_LABELS: Record<QueueStatus, string> = {
   pending: 'Queued',
@@ -11,18 +12,23 @@ const STATUS_LABELS: Record<QueueStatus, string> = {
   cancelled: 'Cancelled',
 };
 
-function queueDetail(item: QueueItem): string {
-  const parts = [STATUS_LABELS[item.status]];
-  if (item.width > 0 && item.height > 0) {
-    parts.push(`${item.width}×${item.height}`);
-  }
-  if (item.companionName !== null) {
-    parts.push('ORI');
-  }
-  if (item.message !== null && item.status !== 'ready') {
-    parts.push(item.message);
-  }
-  return parts.join(' · ');
+function QueueBadges({ item }: { item: QueueItem }) {
+  return (
+    <span className="queue-badges">
+      <span className="queue-status" data-status={item.status}>
+        {STATUS_LABELS[item.status]}
+      </span>
+      {item.width > 0 && item.height > 0 && (
+        <span>
+          {item.width}×{item.height}
+        </span>
+      )}
+      {item.companionName !== null && <span className="queue-badge">ORI</span>}
+      {item.preset !== null && (
+        <span className="queue-badge">{PRESET_LABELS[item.preset]}</span>
+      )}
+    </span>
+  );
 }
 
 export function WorkspacePanel() {
@@ -31,6 +37,7 @@ export function WorkspacePanel() {
   const companionInput = useRef<HTMLInputElement>(null);
   const busy = state.activity.state === 'working';
   const selectedItem = state.queue.find((item) => item.id === state.selectedItemId);
+  const canPaste = state.copiedSettings !== null;
 
   return (
     <section className="panel" aria-label="Workspace">
@@ -38,53 +45,43 @@ export function WorkspacePanel() {
         <h2 className="panel-title">Workspace</h2>
       </header>
       <div className="panel-body">
-        <div className="field">
-          <span className="field-label">RAW files</span>
-          <input
-            ref={sourceInput}
-            className="text-input"
-            type="file"
-            multiple
-            accept=".ORF,.ORI,.dng,.DNG,image/*"
-            aria-label="RAW file"
-            disabled={busy}
-            onChange={(event) => {
-              const files = Array.from(event.target.files ?? []);
-              // Allow adding the same file again after removing it.
-              event.target.value = '';
-              actions.addFiles(files);
-            }}
-          />
-          <p className="hint">
-            Add several files at once. ORI files with the same name are paired as the
-            companion of their RAW automatically.
-          </p>
-        </div>
-
-        <div className="field">
-          <span className="field-label">ORI companion (selected file)</span>
-          <input
-            ref={companionInput}
-            className="text-input"
-            type="file"
-            accept=".ORI,.ori"
-            aria-label="ORI companion"
-            disabled={busy || selectedItem === undefined}
-            onChange={(event) => {
-              const file = event.target.files?.[0] ?? null;
-              event.target.value = '';
-              actions.selectCompanion(file);
-            }}
-          />
-          <p className="hint">
-            Attaching the ORI companion turns on highlight recovery, exactly like the
-            native application does when it finds the file next to the RAW file.
-          </p>
-        </div>
+        <input
+          ref={sourceInput}
+          className="visually-hidden"
+          type="file"
+          multiple
+          accept=".ORF,.ORI,.dng,.DNG,image/*"
+          aria-label="RAW file"
+          tabIndex={-1}
+          onChange={(event) => {
+            const files = Array.from(event.target.files ?? []);
+            // Allow adding the same file again after removing it.
+            event.target.value = '';
+            actions.addFiles(files);
+          }}
+        />
+        <input
+          ref={companionInput}
+          className="visually-hidden"
+          type="file"
+          accept=".ORI,.ori"
+          aria-label="ORI companion"
+          tabIndex={-1}
+          onChange={(event) => {
+            const file = event.target.files?.[0] ?? null;
+            event.target.value = '';
+            actions.selectCompanion(file);
+          }}
+        />
 
         <div className="section queue-section">
           <div className="section-header">
-            <h3 className="section-title">Queue</h3>
+            <h3 className="section-title">
+              Queue
+              {state.queue.length > 0 && (
+                <span className="queue-count">{state.queue.length}</span>
+              )}
+            </h3>
             <button
               type="button"
               className="button ghost"
@@ -92,6 +89,26 @@ export function WorkspacePanel() {
               onClick={() => actions.clearQueue()}
             >
               Clear all
+            </button>
+          </div>
+
+          <div className="queue-toolbar">
+            <button
+              type="button"
+              className="button primary"
+              disabled={busy}
+              onClick={() => sourceInput.current?.click()}
+            >
+              Add ORF
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={busy || selectedItem === undefined}
+              title="Attach an ORI companion to the selected RAW file"
+              onClick={() => companionInput.current?.click()}
+            >
+              Add companion ORI
             </button>
           </div>
 
@@ -117,7 +134,10 @@ export function WorkspacePanel() {
                       onClick={() => actions.selectQueueItem(item.id)}
                     >
                       <span className="queue-name">{item.sourceName}</span>
-                      <span className="queue-meta">{queueDetail(item)}</span>
+                      <QueueBadges item={item} />
+                      {item.message !== null && item.status !== 'ready' && (
+                        <span className="queue-message">{item.message}</span>
+                      )}
                     </button>
                     <button
                       type="button"
@@ -135,9 +155,41 @@ export function WorkspacePanel() {
             </ul>
           )}
 
+          {selectedItem !== undefined && (
+            <div className="queue-settings" aria-label="Queue settings">
+              <span className="field-label">Selected file settings</span>
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="button"
+                  disabled={busy}
+                  onClick={() => actions.copySettings()}
+                >
+                  Copy settings
+                </button>
+                <button
+                  type="button"
+                  className="button"
+                  disabled={busy || !canPaste}
+                  onClick={() => actions.pasteSettings()}
+                >
+                  Paste settings
+                </button>
+                <button
+                  type="button"
+                  className="button"
+                  disabled={busy || !canPaste}
+                  onClick={() => actions.pasteSettingsToAll()}
+                >
+                  Paste to all files
+                </button>
+              </div>
+            </div>
+          )}
+
           <p className="hint queue-hint">
-            Presets and sliders apply to every queued file. Convert writes one DNG per
-            file.
+            Presets and sliders edit the selected file. Copy settings, then paste
+            them to another file or to all files in the queue.
           </p>
         </div>
       </div>

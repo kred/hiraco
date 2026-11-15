@@ -12,9 +12,10 @@ sliders and writes the Linear DNG, all without uploading the file anywhere.
 Several RAW files can be queued at once.  ORI files added in the same batch are
 paired automatically with the RAW file of the same name (an ORI added on its
 own is treated as a source).  The selected queue entry is the one shown in the
-preview, but presets and sliders are global: changing them applies to every
-queued file, matching the native queue's "paste settings to all images"
-workflow.  `Convert` writes one DNG for every queued file, sequentially.
+preview and edited by the presets and sliders, like the native queue.  Use
+`Copy settings`, `Paste settings`, or `Paste to all files` to move a settings
+set between entries; `Convert` writes one DNG for every queued file using each
+entry's settings.
 
 The preset row has the native Small, Medium and Strong settings, a Custom
 button, and a saved-preset manager.  Enter a name and `Save preset` to store the

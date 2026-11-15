@@ -48,6 +48,12 @@ export function ControlsPanel() {
               </button>
             ))}
           </div>
+          {state.selectedItemId !== null && (
+            <p className="hint preset-hint">
+              Applies to the selected file. Use Paste to all files in the queue to
+              sync it.
+            </p>
+          )}
 
           <div className="field custom-preset-field">
             <label className="field-label" htmlFor="saved-custom-preset">
@@ -209,8 +215,8 @@ export function ControlsPanel() {
             }
             title={
               state.queue.length > 1
-                ? `Convert all ${state.queue.length} queued files with the current settings`
-                : 'Convert the queued file with the current settings'
+                ? `Convert all ${state.queue.length} queued files using their own settings`
+                : 'Convert the queued file using its own settings'
             }
             onClick={() => actions.convert()}
           >
@@ -228,7 +234,7 @@ export function ControlsPanel() {
         </div>
         {state.queue.length > 1 && (
           <p className="hint convert-hint">
-            Converts all {state.queue.length} queued files with the current settings.
+            Converts all {state.queue.length} queued files, each with its own settings.
           </p>
         )}
       </footer>

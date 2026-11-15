@@ -403,7 +403,41 @@
 /* Queue ----------------------------------------------------------------- */
 
 .queue-section {
-  margin-top: var(--space-2);
+  margin-top: 0;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.queue-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.queue-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--bg-inset);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .queue-list {
@@ -435,8 +469,8 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 6px 8px;
+  gap: 3px;
+  padding: 7px 8px;
   border: 0;
   background: transparent;
   color: var(--text);
@@ -453,18 +487,63 @@
   overflow-wrap: anywhere;
 }
 
-.queue-meta {
+.queue-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
   font-size: 11px;
   color: var(--text-muted);
-  overflow-wrap: anywhere;
 }
 
-.queue-item[data-status='error'] .queue-meta {
+.queue-status {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--bg-inset);
+  color: var(--text-muted);
+}
+
+.queue-status[data-status='ready'],
+.queue-status[data-status='done'] {
+  color: var(--ok);
+}
+
+.queue-status[data-status='working'] {
+  color: var(--accent);
+}
+
+.queue-status[data-status='error'],
+.queue-status[data-status='cancelled'] {
   color: var(--danger);
 }
 
-.queue-item[data-status='done'] .queue-meta {
-  color: var(--ok);
+.queue-badge {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.queue-message {
+  font-size: 11px;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.queue-item[data-status='done'] .queue-message {
+  color: var(--text-muted);
+}
+
+.queue-settings {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.queue-settings .field-label {
+  display: block;
+  margin-bottom: var(--space-2);
 }
 
 .queue-remove {

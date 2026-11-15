@@ -73,6 +73,17 @@ export interface QueueItem {
   height: number;
   metadata: SourceMetadata | null;
   baseSettings: StageSettings | null;
+  /** Resolved sliders for this item after it has been prepared. */
+  settings: StageSettings | null;
+  overrides: StageOverrides;
+  preset: PresetId | null;
+}
+
+/** Settings copied from one queue entry for pasting into another. */
+export interface CopiedSettings {
+  settings: StageSettings;
+  overrides: StageOverrides;
+  preset: PresetId | null;
 }
 
 export interface AppState {
@@ -96,6 +107,8 @@ export interface AppState {
   customPresets: CustomPreset[];
   /** The saved preset selected in the custom-preset picker. */
   activeCustomPreset: string | null;
+  /** Settings copied from the selected queue entry, or null. */
+  copiedSettings: CopiedSettings | null;
   compression: CompressionMode;
   compareMode: CompareMode;
   zoomMode: ZoomMode;
@@ -124,6 +137,7 @@ export const initialAppState: AppState = {
   preset: null,
   customPresets: [],
   activeCustomPreset: null,
+  copiedSettings: null,
   compression: 'deflate',
   compareMode: 'converted',
   zoomMode: 'fit',
@@ -141,7 +155,9 @@ export type AppAction =
   | { type: 'queue-cleared' }
   | { type: 'selection-changed'; id: number | null }
   | { type: 'custom-presets-changed'; presets: CustomPreset[]; active: string | null }
-  | { type: 'source-prepared'; width: number; height: number; metadata: SourceMetadata; baseSettings: StageSettings }
+  | { type: 'settings-copied'; value: CopiedSettings | null }
+  | { type: 'settings-pasted'; ids: number[]; value: CopiedSettings }
+  | { type: 'source-prepared'; width: number; height: number; metadata: SourceMetadata; baseSettings: StageSettings; settings: StageSettings; overrides: StageOverrides; preset: PresetId | null }
   | { type: 'original-preview'; preview: PreviewBuffer }
   | { type: 'converted-preview'; preview: PreviewBuffer }
   | { type: 'settings-changed'; settings: StageSettings; overrides: StageOverrides }

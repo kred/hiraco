@@ -59,7 +59,7 @@ test('saves, loads and persists a named custom preset', async ({ page }) => {
   await expect(page.getByLabel('Blur Radius')).toHaveValue('2.5');
 });
 
-test('applies one setting set to every queued file and converts them all', async ({
+test('copies settings between queued files and converts them all', async ({
   page,
 }) => {
   const first =
@@ -84,14 +84,27 @@ test('applies one setting set to every queued file and converts them all', async
     }),
   ).toBeVisible();
 
-  // Settings are global across the queue: changing them on the second file is
-  // visible when switching back to the first.
+  // Each queue entry has its own settings, like the native queue.  Copy the
+  // Strong preset from the second file and paste it into the first.
   await page.getByTestId('queue-item').nth(1).getByRole('button').first().click();
   await expect(page.getByTestId('preview-canvas')).toBeVisible({ timeout: 300_000 });
   await page.getByRole('button', { name: 'Strong', exact: true }).click();
   await expect(page.getByLabel('Denoise')).toHaveValue('0.24');
+  await page.getByRole('button', { name: 'Copy settings', exact: true }).click();
+
   await page.getByTestId('queue-item').nth(0).getByRole('button').first().click();
+  await expect(page.getByLabel('Denoise')).toHaveValue('0.33');
+  await page.getByRole('button', { name: 'Paste settings', exact: true }).click();
   await expect(page.getByLabel('Denoise')).toHaveValue('0.24');
+
+  // Copy a different preset from the selected file and push it to the whole
+  // queue with the native-style "paste to all" action.
+  await page.getByRole('button', { name: 'Small', exact: true }).click();
+  await expect(page.getByLabel('Denoise')).toHaveValue('0.41');
+  await page.getByRole('button', { name: 'Copy settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Paste to all files', exact: true }).click();
+  await page.getByTestId('queue-item').nth(1).getByRole('button').first().click();
+  await expect(page.getByLabel('Denoise')).toHaveValue('0.41');
 
   const downloads: string[] = [];
   page.on('download', (download) => downloads.push(download.suggestedFilename()));

@@ -25,6 +25,10 @@ describe('the application shell', () => {
   it('offers a multi-file queue and saved custom presets', () => {
     render(<App />);
     expect(screen.getByLabelText('RAW file')).toHaveAttribute('multiple');
+    expect(screen.getByRole('button', { name: 'Add ORF' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'Add companion ORI' }),
+    ).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Queue' })).toBeInTheDocument();
     expect(screen.getByLabelText('Saved custom preset')).toBeInTheDocument();
     expect(screen.getByLabelText('Custom preset name')).toBeInTheDocument();

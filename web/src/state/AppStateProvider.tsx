@@ -106,8 +106,7 @@ function reducer(state: AppState, action: AppAction): AppState {
         return state;
       }
       const baseSettings = item.baseSettings ?? state.baseSettings;
-      const settings = applyOverrides(baseSettings, state.overrides);
-      const builtInPreset = presetForSettings(baseSettings, settings);
+      const settings = item.settings ?? applyOverrides(baseSettings, item.overrides);
       return {
         ...state,
         selectedItemId: item.id,
@@ -118,15 +117,37 @@ function reducer(state: AppState, action: AppAction): AppState {
         metadata: item.metadata,
         baseSettings,
         settings,
-        preset:
-          builtInPreset ??
-          (state.preset === 'custom' && state.activeCustomPreset !== null
-            ? 'custom'
-            : null),
+        overrides: item.overrides,
+        preset: item.preset ?? presetForSettings(baseSettings, settings),
         originalPreview: null,
         convertedPreview: null,
         error: null,
         activity: { state: 'idle', message: `Loading ${item.sourceName}`, fraction: null },
+      };
+    }
+    case 'settings-copied':
+      return { ...state, copiedSettings: action.value };
+    case 'settings-pasted': {
+      const ids = new Set(action.ids);
+      const queue = state.queue.map((item) =>
+        ids.has(item.id)
+          ? {
+              ...item,
+              settings: action.value.settings,
+              overrides: action.value.overrides,
+              preset: action.value.preset,
+            }
+          : item,
+      );
+      if (state.selectedItemId === null || !ids.has(state.selectedItemId)) {
+        return { ...state, queue };
+      }
+      return {
+        ...state,
+        queue,
+        settings: action.value.settings,
+        overrides: action.value.overrides,
+        preset: action.value.preset,
       };
     }
     case 'custom-presets-changed':
@@ -136,20 +157,15 @@ function reducer(state: AppState, action: AppAction): AppState {
         activeCustomPreset: action.active,
       };
     case 'source-prepared': {
-      const settings = applyOverrides(action.baseSettings, state.overrides);
-      const builtInPreset = presetForSettings(action.baseSettings, settings);
       return {
         ...state,
         imageWidth: action.width,
         imageHeight: action.height,
         metadata: action.metadata,
         baseSettings: action.baseSettings,
-        settings,
-        preset:
-          builtInPreset ??
-          (state.preset === 'custom' && state.activeCustomPreset !== null
-            ? 'custom'
-            : null),
+        settings: action.settings,
+        overrides: action.overrides,
+        preset: action.preset,
       };
     }
     case 'original-preview':
@@ -159,6 +175,16 @@ function reducer(state: AppState, action: AppAction): AppState {
     case 'settings-changed':
       return {
         ...state,
+        queue: state.queue.map((item) =>
+          item.id === state.selectedItemId
+            ? {
+                ...item,
+                settings: action.settings,
+                overrides: action.overrides,
+                preset: null,
+              }
+            : item,
+        ),
         settings: action.settings,
         overrides: action.overrides,
         preset: null,
@@ -166,6 +192,16 @@ function reducer(state: AppState, action: AppAction): AppState {
     case 'preset-applied':
       return {
         ...state,
+        queue: state.queue.map((item) =>
+          item.id === state.selectedItemId
+            ? {
+                ...item,
+                settings: action.settings,
+                overrides: action.overrides,
+                preset: action.preset,
+              }
+            : item,
+        ),
         settings: action.settings,
         overrides: action.overrides,
         preset: action.preset,
@@ -330,6 +366,12 @@ interface AppActions {
   loadCustomPreset(name: string): void;
   /** Deletes the named saved preset. */
   deleteCustomPreset(name: string): void;
+  /** Copies the selected item's settings for a later paste. */
+  copySettings(): void;
+  /** Applies the copied settings to the selected queue entry. */
+  pasteSettings(): void;
+  /** Applies the copied settings to every queue entry. */
+  pasteSettingsToAll(): void;
   /** Writes a Linear DNG for every queued file. */
   convert(): void;
   /** Stops the running conversion. */
@@ -361,6 +403,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const queueFiles = useRef<Map<number, QueueFiles>>(new Map());
   const nextItemId = useRef(1);
   const activeItemId = useRef<number | null>(null);
+  // Dimensions of the active item, including the freshly opened size before
+  // the source-prepared reducer has rendered.
+  const activeSize = useRef({ width: 0, height: 0 });
   // Incremented by Clear all so an in-flight add cannot repopulate the queue.
   const queueEpoch = useRef(0);
   // Incremented whenever the selected queue entry changes; late preview/open
@@ -439,10 +484,13 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     const generation = selectionGeneration.current;
     const started = beginPreviewJob();
     try {
-      const overrides = stateRef.current.overrides;
+      const activeItem = stateRef.current.queue.find(
+        (item) => item.id === activeItemId.current,
+      );
+      const overrides = activeItem?.overrides ?? stateRef.current.overrides;
       const maxDimension = previewMaxDimension(
         stateRef.current.zoomMode,
-        stateRef.current.imageWidth,
+        activeSize.current.width,
         PREVIEW_MAX_DIMENSION,
       );
       const preview = await client().convertedPreview(
@@ -487,7 +535,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     try {
       const maxDimension = previewMaxDimension(
         stateRef.current.zoomMode,
-        stateRef.current.imageWidth,
+        activeSize.current.width,
         PREVIEW_MAX_DIMENSION,
       );
       const preview = await client().originalPreview(maxDimension);
@@ -554,6 +602,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         return;
       }
       sessionRef.current = true;
+      activeSize.current = { width: opened.width, height: opened.height };
       const baseValues = await client().resolvedSettings(
         overridesToArray({}),
       );
@@ -562,12 +611,20 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       }
       const baseSettings = settingsFromValues(baseValues);
       const metadata = metadataFromBridge(opened.metadata);
+      const queueItem = stateRef.current.queue.find((item) => item.id === itemId);
+      const overrides = queueItem?.overrides ?? {};
+      const settings = applyOverrides(baseSettings, overrides);
+      const preset =
+        queueItem?.preset ?? presetForSettings(baseSettings, settings);
       dispatch({
         type: 'source-prepared',
         width: opened.width,
         height: opened.height,
         metadata,
         baseSettings,
+        settings,
+        overrides,
+        preset,
       });
       dispatch({
         type: 'queue-updated',
@@ -579,6 +636,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
           height: opened.height,
           metadata,
           baseSettings,
+          settings,
+          overrides,
+          preset,
         },
       });
       await renderOriginalPreview();
@@ -710,6 +770,10 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       const files = id === null ? undefined : queueFiles.current.get(id);
       sourceRef.current = files?.source ?? null;
       companionRef.current = files?.companion ?? null;
+      const item = id === null
+          ? undefined
+          : stateRef.current.queue.find((entry) => entry.id === id);
+      activeSize.current = { width: item?.width ?? 0, height: item?.height ?? 0 };
       sessionRef.current = false;
       if (previewTimer.current !== null) {
         clearTimeout(previewTimer.current);
@@ -803,6 +867,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
               height: 0,
               metadata: null,
               baseSettings: null,
+              settings: null,
+              overrides: {},
+              preset: null,
             });
           }
 
@@ -1039,6 +1106,45 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     [dispatch],
   );
 
+  const copySettings = useCallback(() => {
+    const current = stateRef.current;
+    if (current.selectedItemId === null) {
+      return;
+    }
+    dispatch({
+      type: 'settings-copied',
+      value: {
+        settings: current.settings,
+        overrides: current.overrides,
+        preset: current.preset,
+      },
+    });
+  }, [dispatch]);
+
+  const pasteSettingsTo = useCallback(
+    (all: boolean) => {
+      const current = stateRef.current;
+      const value = current.copiedSettings;
+      if (value === null) {
+        return;
+      }
+      const ids = all
+        ? current.queue.map((item) => item.id)
+        : current.selectedItemId === null
+          ? []
+          : [current.selectedItemId];
+      if (ids.length === 0) {
+        return;
+      }
+      dispatch({ type: 'settings-pasted', ids, value });
+      schedulePreview();
+    },
+    [dispatch, schedulePreview],
+  );
+
+  const pasteSettings = useCallback(() => pasteSettingsTo(false), [pasteSettingsTo]);
+  const pasteSettingsToAll = useCallback(() => pasteSettingsTo(true), [pasteSettingsTo]);
+
   const resetSection = useCallback(
     (keys: StageKey[]) => {
       const current = stateRef.current;
@@ -1074,7 +1180,6 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       previewTimer.current = null;
     }
     previewPending.current = false;
-    const overrides = overridesToArray(snapshot.overrides);
     const compression = snapshot.compression;
     let converted = 0;
     let failed = 0;
@@ -1115,6 +1220,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
           const baseValues = await client().resolvedSettings(overridesToArray({}));
           const baseSettings = settingsFromValues(baseValues);
           const metadata = metadataFromBridge(opened.metadata);
+          const settings = applyOverrides(baseSettings, item.overrides);
+          const preset =
+            item.preset ?? presetForSettings(baseSettings, settings);
           dispatch({
             type: 'queue-updated',
             id: item.id,
@@ -1125,9 +1233,15 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
               height: opened.height,
               metadata,
               baseSettings,
+              settings,
+              overrides: item.overrides,
+              preset,
             },
           });
-          const dng = await client().convert(compression, overrides);
+          const dng = await client().convert(
+            compression,
+            overridesToArray(item.overrides),
+          );
           const name = resultNameFor(files.source.name);
           saveFile(new Blob([dng], { type: 'image/x-adobe-dng' }), name);
           converted += 1;
@@ -1224,6 +1338,9 @@ const actions = useMemo<AppActions>(
       saveCustomPreset,
       loadCustomPreset,
       deleteCustomPreset,
+      copySettings,
+      pasteSettings,
+      pasteSettingsToAll,
       convert: () => void convert(),
       cancel,
     }),
@@ -1233,8 +1350,11 @@ const actions = useMemo<AppActions>(
       cancel,
       clearQueue,
       convert,
+      copySettings,
       deleteCustomPreset,
       loadCustomPreset,
+      pasteSettings,
+      pasteSettingsToAll,
       removeQueueItem,
       resetSection,
       saveCustomPreset,
