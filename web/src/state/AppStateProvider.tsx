@@ -777,7 +777,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const addFiles = useCallback(
     (files: File[]) => {
-      if (files.length === 0) {
+      if (files.length === 0 ||
+          convertingRef.current ||
+          stateRef.current.activity.state === 'working') {
         return;
       }
       const epoch = queueEpoch.current;
@@ -934,6 +936,10 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const selectCompanion = useCallback(
     (file: File | null) => {
+      if (convertingRef.current ||
+          stateRef.current.activity.state === 'working') {
+        return;
+      }
       const id = activeItemId.current;
       const files = id === null ? undefined : queueFiles.current.get(id);
       if (id === null || files === undefined) {

@@ -63,6 +63,7 @@ export function WorkspacePanel() {
           accept=".ORF,.ORI,.dng,.DNG,image/*"
           aria-label="RAW file"
           tabIndex={-1}
+          disabled={busy}
           onChange={(event) => {
             const files = Array.from(event.target.files ?? []);
             // Allow adding the same file again after removing it.
@@ -77,6 +78,7 @@ export function WorkspacePanel() {
           accept=".ORI,.ori"
           aria-label="ORI companion"
           tabIndex={-1}
+          disabled={busy}
           onChange={(event) => {
             const file = event.target.files?.[0] ?? null;
             event.target.value = '';
