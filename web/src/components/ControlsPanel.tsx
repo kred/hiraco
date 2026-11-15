@@ -10,6 +10,8 @@ import {
   STAGE_SECTIONS,
   formatStageValue,
 } from '../lib/stageSettings';
+import { IconButton } from './IconButton';
+import { FolderOpenIcon, SaveIcon, TrashIcon } from './icons';
 
 export function ControlsPanel() {
   const { state, dispatch, actions } = useAppState();
@@ -48,89 +50,69 @@ export function ControlsPanel() {
               </button>
             ))}
           </div>
-          {state.selectedItemId !== null && (
-            <p className="hint preset-hint">
-              Applies to the selected file. Use Paste to all files in the queue to
-              sync it.
-            </p>
-          )}
 
-          <div className="field custom-preset-field">
-            <label className="field-label" htmlFor="saved-custom-preset">
-              Saved custom preset
-            </label>
+          <div className="custom-preset-row">
             <select
               id="saved-custom-preset"
               className="select"
               aria-label="Saved custom preset"
+              title="Saved custom preset"
               value={state.activeCustomPreset ?? ''}
               disabled={busy}
               onChange={(event) =>
                 actions.selectCustomPreset(event.target.value === '' ? null : event.target.value)
               }
             >
-              <option value="">None</option>
+              <option value="">No saved preset</option>
               {state.customPresets.map((preset) => (
                 <option key={preset.name} value={preset.name}>
                   {preset.name}
                 </option>
               ))}
             </select>
-          </div>
-          <div className="button-row custom-preset-actions">
-            <button
-              type="button"
-              className="button"
+            <IconButton
+              label="Load"
+              icon={<FolderOpenIcon />}
               disabled={busy || activeCustomPreset === null}
               onClick={() => {
                 if (activeCustomPreset !== null) {
                   actions.loadCustomPreset(activeCustomPreset.name);
                 }
               }}
-            >
-              Load
-            </button>
-            <button
-              type="button"
-              className="button danger"
+            />
+            <IconButton
+              label="Delete"
+              icon={<TrashIcon />}
+              variant="danger"
               disabled={busy || activeCustomPreset === null}
               onClick={() => {
                 if (activeCustomPreset !== null) {
                   actions.deleteCustomPreset(activeCustomPreset.name);
                 }
               }}
-            >
-              Delete
-            </button>
+            />
           </div>
 
-          <div className="field custom-preset-field">
-            <label className="field-label" htmlFor="custom-preset-name">
-              Save current settings as
-            </label>
-            <div className="inline-row">
-              <input
-                id="custom-preset-name"
-                className="text-input"
-                type="text"
-                aria-label="Custom preset name"
-                placeholder="Preset name"
-                maxLength={64}
-                value={presetName}
-                disabled={busy}
-                onChange={(event) => setPresetName(event.target.value)}
-              />
-              <button
-                type="button"
-                className="button"
-                disabled={busy || presetName.trim() === ''}
-                onClick={() => {
-                  actions.saveCustomPreset(presetName);
-                }}
-              >
-                Save preset
-              </button>
-            </div>
+          <div className="custom-preset-row">
+            <input
+              id="custom-preset-name"
+              className="text-input"
+              type="text"
+              aria-label="Custom preset name"
+              placeholder="Preset name"
+              maxLength={64}
+              value={presetName}
+              disabled={busy}
+              onChange={(event) => setPresetName(event.target.value)}
+            />
+            <IconButton
+              label="Save preset"
+              icon={<SaveIcon />}
+              disabled={busy || presetName.trim() === ''}
+              onClick={() => {
+                actions.saveCustomPreset(presetName);
+              }}
+            />
           </div>
         </div>
 

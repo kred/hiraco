@@ -2,6 +2,16 @@ import { useRef } from 'react';
 import { useAppState } from '../state/AppStateProvider';
 import type { QueueItem, QueueStatus } from '../state/appState';
 import { PRESET_LABELS } from '../lib/stageSettings';
+import { IconButton } from './IconButton';
+import {
+  CopyIcon,
+  LayersIcon,
+  LinkIcon,
+  PasteIcon,
+  PlusIcon,
+  TrashIcon,
+  XIcon,
+} from './icons';
 
 const STATUS_LABELS: Record<QueueStatus, string> = {
   pending: 'Queued',
@@ -12,23 +22,22 @@ const STATUS_LABELS: Record<QueueStatus, string> = {
   cancelled: 'Cancelled',
 };
 
-function QueueBadges({ item }: { item: QueueItem }) {
-  return (
-    <span className="queue-badges">
-      <span className="queue-status" data-status={item.status}>
-        {STATUS_LABELS[item.status]}
-      </span>
-      {item.width > 0 && item.height > 0 && (
-        <span>
-          {item.width}×{item.height}
-        </span>
-      )}
-      {item.companionName !== null && <span className="queue-badge">ORI</span>}
-      {item.preset !== null && (
-        <span className="queue-badge">{PRESET_LABELS[item.preset]}</span>
-      )}
-    </span>
-  );
+/** Tooltip text: the compact rows only show the name and status. */
+function queueDetails(item: QueueItem): string {
+  const parts = [item.sourceName, STATUS_LABELS[item.status]];
+  if (item.width > 0 && item.height > 0) {
+    parts.push(`${item.width}×${item.height}`);
+  }
+  if (item.preset !== null) {
+    parts.push(`${PRESET_LABELS[item.preset]} preset`);
+  }
+  if (item.companionName !== null) {
+    parts.push(`ORI companion: ${item.companionName}`);
+  }
+  if (item.message !== null && item.status !== 'ready') {
+    parts.push(item.message);
+  }
+  return parts.join(' · ');
 }
 
 export function WorkspacePanel() {
@@ -75,41 +84,36 @@ export function WorkspacePanel() {
         />
 
         <div className="section queue-section">
-          <div className="section-header">
+          <div className="section-header queue-header">
             <h3 className="section-title">
               Queue
               {state.queue.length > 0 && (
                 <span className="queue-count">{state.queue.length}</span>
               )}
             </h3>
-            <button
-              type="button"
-              className="button ghost"
-              disabled={busy || state.queue.length === 0}
-              onClick={() => actions.clearQueue()}
-            >
-              Clear all
-            </button>
-          </div>
-
-          <div className="queue-toolbar">
-            <button
-              type="button"
-              className="button primary"
-              disabled={busy}
-              onClick={() => sourceInput.current?.click()}
-            >
-              Add ORF
-            </button>
-            <button
-              type="button"
-              className="button"
-              disabled={busy || selectedItem === undefined}
-              title="Attach an ORI companion to the selected RAW file"
-              onClick={() => companionInput.current?.click()}
-            >
-              Add companion ORI
-            </button>
+            <div className="queue-toolbar" role="group" aria-label="Queue actions">
+              <IconButton
+                label="Add ORF"
+                icon={<PlusIcon />}
+                variant="primary"
+                disabled={busy}
+                onClick={() => sourceInput.current?.click()}
+              />
+              <IconButton
+                label="Add companion ORI"
+                icon={<LinkIcon />}
+                disabled={busy || selectedItem === undefined}
+                onClick={() => companionInput.current?.click()}
+              />
+              <span className="toolbar-separator" aria-hidden="true" />
+              <IconButton
+                label="Clear all"
+                icon={<TrashIcon />}
+                variant="danger"
+                disabled={busy || state.queue.length === 0}
+                onClick={() => actions.clearQueue()}
+              />
+            </div>
           </div>
 
           {state.queue.length === 0 ? (
@@ -130,25 +134,28 @@ export function WorkspacePanel() {
                       type="button"
                       className="queue-select"
                       aria-pressed={selected}
+                      title={queueDetails(item)}
                       disabled={busy}
                       onClick={() => actions.selectQueueItem(item.id)}
                     >
                       <span className="queue-name">{item.sourceName}</span>
-                      <QueueBadges item={item} />
+                      <span className="queue-meta">
+                        <span className="queue-dot" aria-hidden="true" />
+                        {STATUS_LABELS[item.status]}
+                        {item.companionName !== null && ' · ORI'}
+                        {item.preset !== null && ` · ${PRESET_LABELS[item.preset]}`}
+                      </span>
                       {item.message !== null && item.status !== 'ready' && (
                         <span className="queue-message">{item.message}</span>
                       )}
                     </button>
-                    <button
-                      type="button"
+                    <IconButton
+                      label={`Remove ${item.sourceName}`}
+                      icon={<XIcon />}
                       className="queue-remove"
-                      aria-label={`Remove ${item.sourceName}`}
-                      title="Remove from the queue"
                       disabled={busy}
                       onClick={() => actions.removeQueueItem(item.id)}
-                    >
-                      ×
-                    </button>
+                    />
                   </li>
                 );
               })}
@@ -156,41 +163,27 @@ export function WorkspacePanel() {
           )}
 
           {selectedItem !== undefined && (
-            <div className="queue-settings" aria-label="Queue settings">
-              <span className="field-label">Selected file settings</span>
-              <div className="button-row">
-                <button
-                  type="button"
-                  className="button"
-                  disabled={busy}
-                  onClick={() => actions.copySettings()}
-                >
-                  Copy settings
-                </button>
-                <button
-                  type="button"
-                  className="button"
-                  disabled={busy || !canPaste}
-                  onClick={() => actions.pasteSettings()}
-                >
-                  Paste settings
-                </button>
-                <button
-                  type="button"
-                  className="button"
-                  disabled={busy || !canPaste}
-                  onClick={() => actions.pasteSettingsToAll()}
-                >
-                  Paste to all files
-                </button>
-              </div>
+            <div className="queue-settings" role="group" aria-label="Selected file settings">
+              <IconButton
+                label="Copy settings"
+                icon={<CopyIcon />}
+                disabled={busy}
+                onClick={() => actions.copySettings()}
+              />
+              <IconButton
+                label="Paste settings"
+                icon={<PasteIcon />}
+                disabled={busy || !canPaste}
+                onClick={() => actions.pasteSettings()}
+              />
+              <IconButton
+                label="Paste to all files"
+                icon={<LayersIcon />}
+                disabled={busy || !canPaste}
+                onClick={() => actions.pasteSettingsToAll()}
+              />
             </div>
           )}
-
-          <p className="hint queue-hint">
-            Presets and sliders edit the selected file. Copy settings, then paste
-            them to another file or to all files in the queue.
-          </p>
         </div>
       </div>
     </section>
