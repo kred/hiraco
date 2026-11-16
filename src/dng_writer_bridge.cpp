@@ -3589,6 +3589,7 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
 bool BuildLinearDngPayload(const std::string& source_path,
                            const SourceLinearDngMetadata& metadata,
                            const LibRawOverrideSet& libraw_overrides,
+                           const ProcessingCache* predecoded_raw,
                            LinearDngPayload* payload,
                            std::string* error_message) {
   const hiraco::ScopedTimingLog payload_timer("convert", "Build linear DNG payload");
@@ -3611,7 +3612,19 @@ bool BuildLinearDngPayload(const std::string& source_path,
   }
 
   payload->raw_image_is_camera_space = false;
-  if (IsOm3HighResMetadata(metadata)) {
+  const bool om3_metadata = IsOm3HighResMetadata(metadata);
+  const bool can_reuse_raw =
+      predecoded_raw != nullptr &&
+      !predecoded_raw->has_cached_crop &&
+      predecoded_raw->raw_image.width > 0 &&
+      predecoded_raw->raw_image.height > 0 &&
+      predecoded_raw->raw_image_is_camera_space == om3_metadata &&
+      LibRawOverridesEqual(predecoded_raw->libraw_overrides, libraw_overrides);
+  if (can_reuse_raw) {
+    const hiraco::ScopedTimingLog timer("convert", "Reuse preview raw cache");
+    payload->raw_image = predecoded_raw->raw_image;
+    payload->raw_image_is_camera_space = predecoded_raw->raw_image_is_camera_space;
+  } else if (om3_metadata) {
     const hiraco::ScopedTimingLog timer("convert", "Render raw payload");
     if (!RenderOm3RawDomainImage(source_path, metadata, nullptr, &payload->raw_image, error_message)) {
       return false;
@@ -4565,6 +4578,7 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
 
   cache->raw_image = RasterImage();
   cache->cfa_guide_image = RasterImage();
+  cache->libraw_overrides = libraw_overrides;
   cache->raw_image_is_camera_space = false;
   cache->highlight_recovery_enabled = false;
   cache->preview_auto_bright_gain = 1.0;
@@ -4921,6 +4935,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const StageOverrideSet& stage_overrides,
                                      const LibRawOverrideSet& libraw_overrides,
                                      std::shared_ptr<const PreviewImage> preview_override,
+                                     std::shared_ptr<const ProcessingCache> predecoded_raw,
                                      ProgressCallback progress,
                                      CancelCheck cancel) {
   const hiraco::ScopedTimingLog convert_timer("convert", "Write linear DNG from raw");
@@ -5002,6 +5017,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       if (!BuildLinearDngPayload(source_path,
                                  metadata,
                                  libraw_overrides,
+                                 predecoded_raw.get(),
                                  &payload,
                                  &render_error)) {
         result.message = render_error;
@@ -5070,6 +5086,10 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       return result;
     }
     PopulateLinearRawNegative(host, source_path, payload.raw_image, metadata, *negative.Get());
+    // The negative owns its copy; the multi-hundred-MB source payloads are no
+    // longer needed while the compressor writes the file.
+    payload.raw_image = RasterImage();
+    payload.cfa_guide_image = RasterImage();
 
     dng_preview_list preview_list;
     AppendImagePreview(host, preview_image, &preview_list);

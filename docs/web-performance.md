@@ -36,19 +36,29 @@ minutes.
   render an invisible converted preview.
 - **Original preview reuses the decoded frame.**  Once the converted preview
   has built the processing cache, the Original pane is derived from that
-  unenhanced raster instead of running a second LibRaw decode.  LibRaw remains
-  the fallback when Original is requested before any converted preview, and
-  for the native GUI.
+  unenhanced raster instead of running a second LibRaw decode.  The derived
+  preview is cached per session and by display size; LibRaw remains the
+  fallback when Original is requested before any converted preview, and for
+  the native GUI.
 - **Half-size original fallback below 100%.**  When the fallback decode is
   needed, `RenderOriginalPreview` asks LibRaw for `half_size = 1` for
   display-capped requests, which is a 2×2 Bayer merge over the full sensor data
   (not an embedded thumbnail).  100% zoom still uses the full-resolution
   decode.
-- **Per-row preview cache.**  A completed fit preview is stored on its queue
-  item.  Selecting that row again paints the cached preview immediately and
-  reopens the session in the background; the expensive preview render is
-  skipped while the settings are unchanged.  Settings edits invalidate the
-  cached converted preview.
+- **Per-row preview cache.**  A completed preview is stored on its queue item
+  together with the display size it was rendered at.  Selecting that row again
+  paints the cached preview immediately and reopens the session in the
+  background; a larger cached buffer can serve a smaller zoom.  Settings edits
+  and companion changes invalidate the cached converted preview.  The queue
+  budget is 96 MB total, so a long queue cannot retain several GB of previews.
+- **No duplicate compare-mode renders.**  Preview requests record their item,
+  resolution, settings and selection generation.  Toggling Converted → Side by
+  side → Converted reuses the buffers already on screen instead of running the
+  same render again.
+- **Conversion reuses the preview frame.**  A full-frame processing cache is
+  copied into the DNG payload instead of decoding the RAW again.  The
+  cache-derived original also supplies the embedded 1024 px thumbnail, so a
+  conversion after preview does not pay for a second embedded-preview decode.
 - **Display-sized converted preview.**  Fit/50% requests use
   `RenderConvertedProxyPreview`: the linear full-resolution cache is built
   once, then a display-sized proxy is enhanced and tone-mapped.  100% and DNG
@@ -120,7 +130,7 @@ queue copy/paste test from about 24.4 s to 20.2 s, on the same machine.
 ```bash
 cd web
 npm run typecheck
-npm run test            # 45 unit tests
+npm run test            # 47 unit tests
 npm run e2e             # 12 Playwright tests when the fixtures are present
 npm run test:coi
 

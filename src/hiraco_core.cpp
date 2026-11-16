@@ -469,16 +469,6 @@ bool BuildEnhancementMetadata(const std::string& source_path,
   return true;
 }
 
-bool LibRawOverridesEqual(const LibRawOverrideSet& lhs, const LibRawOverrideSet& rhs) {
-  return lhs.user_qual == rhs.user_qual &&
-         lhs.four_color_rgb == rhs.four_color_rgb &&
-         lhs.green_matching == rhs.green_matching &&
-         lhs.med_passes == rhs.med_passes &&
-         lhs.no_auto_scale == rhs.no_auto_scale &&
-         lhs.no_auto_bright == rhs.no_auto_bright &&
-         lhs.adjust_maximum_thr == rhs.adjust_maximum_thr;
-}
-
 bool StageOverridesEqual(const StageOverrideSet& lhs, const StageOverrideSet& rhs) {
   return lhs.stage1_psf_sigma == rhs.stage1_psf_sigma &&
          lhs.stage1_nsr == rhs.stage1_nsr &&
@@ -498,6 +488,11 @@ struct PreparedSourceData {
   bool original_preview_full_resolution = false;
   std::shared_ptr<const PreviewImage> original_preview;
   LibRawOverrideSet original_preview_libraw_overrides;
+  // Preview derived from the processing cache, keyed by the source edge it
+  // was rendered at (0 = full resolution).
+  bool has_cached_original_from_processing = false;
+  uint32_t cached_original_from_processing_max_dimension = 0;
+  std::shared_ptr<const PreviewImage> cached_original_from_processing;
   bool has_processed_full_preview = false;
   // Full-resolution, fully processed (detail enhancement, transform, recovery)
   // preview.  Fit and 50% are derived from this by resizing, so the expensive
@@ -738,6 +733,17 @@ bool RenderOriginalPreview(PreparedSource* prepared,
   return true;
 }
 
+namespace {
+
+bool PreviewDimensionSatisfies(uint32_t rendered, uint32_t requested) {
+  if (rendered == requested || rendered == 0) {
+    return true;
+  }
+  return requested != 0 && rendered >= requested;
+}
+
+}  // namespace
+
 bool RenderOriginalPreviewFromProcessingCache(PreparedSource* prepared,
                                               uint32_t max_dimension,
                                               std::shared_ptr<PreviewImage> preview,
@@ -759,6 +765,14 @@ bool RenderOriginalPreviewFromProcessingCache(PreparedSource* prepared,
   std::shared_ptr<const ProcessingCache> cache;
   {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
+    if (prepared->data->has_cached_original_from_processing &&
+        prepared->data->cached_original_from_processing &&
+        PreviewDimensionSatisfies(
+            prepared->data->cached_original_from_processing_max_dimension,
+            max_dimension)) {
+      *preview = *prepared->data->cached_original_from_processing;
+      return true;
+    }
     if (!prepared->data->has_processing_cache || !prepared->data->processing_cache) {
       return false;
     }
@@ -791,6 +805,26 @@ bool RenderOriginalPreviewFromProcessingCache(PreparedSource* prepared,
   if (IsCancelled(cancel)) {
     *error_message = "operation canceled";
     return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(prepared->data->mutex);
+    const uint32_t rendered_dimension = max_dimension == 0
+        ? 0
+        : std::max(preview->width, preview->height);
+    if (!prepared->data->has_cached_original_from_processing ||
+        PreviewDimensionSatisfies(
+            rendered_dimension,
+            prepared->data->cached_original_from_processing_max_dimension)) {
+      prepared->data->has_cached_original_from_processing = true;
+      prepared->data->cached_original_from_processing_max_dimension = rendered_dimension;
+      prepared->data->cached_original_from_processing = preview;
+    }
+    if (!prepared->data->has_original_preview) {
+      prepared->data->has_original_preview = true;
+      prepared->data->original_preview_full_resolution = max_dimension == 0;
+      prepared->data->original_preview_libraw_overrides = LibRawOverrideSet();
+      prepared->data->original_preview = preview;
+    }
   }
   if (progress) {
     progress(ProcessingProgress{"preview", 1.0, "Original preview ready"});
@@ -828,6 +862,8 @@ void ReleasePreviewProcessingCache(PreparedSource* prepared) {
   prepared->data->processed_full_preview = PreviewImage();
   prepared->data->has_processing_cache = false;
   prepared->data->processing_cache.reset();
+  prepared->data->has_cached_original_from_processing = false;
+  prepared->data->cached_original_from_processing.reset();
 }
 
 size_t GetPreviewCacheBytes(const PreparedSource& prepared) {
@@ -1086,6 +1122,8 @@ bool RenderConvertedFullPreview(PreparedSource* prepared,
       prepared->data->has_processing_cache = true;
       prepared->data->cached_libraw_overrides = libraw_overrides;
       prepared->data->processing_cache = built_cache;
+      prepared->data->has_cached_original_from_processing = false;
+      prepared->data->cached_original_from_processing.reset();
     }
     source_cache = std::move(built_cache);
   }
@@ -1259,10 +1297,15 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
   }
 
   std::shared_ptr<const PreviewImage> preview_override;
+  std::shared_ptr<const ProcessingCache> predecoded_raw;
   if (prepared.data) {
     std::lock_guard<std::mutex> lock(prepared.data->mutex);
     if (prepared.data->has_original_preview && prepared.data->original_preview) {
       preview_override = prepared.data->original_preview;
+    }
+    if (prepared.data->has_processing_cache && prepared.data->processing_cache &&
+        !prepared.data->processing_cache->has_cached_crop) {
+      predecoded_raw = prepared.data->processing_cache;
     }
   }
 
@@ -1275,6 +1318,7 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
                                stage_overrides,
                                libraw_overrides,
                                preview_override,
+                               predecoded_raw,
                                progress,
                                cancel);
 }

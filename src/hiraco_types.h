@@ -130,6 +130,17 @@ struct LibRawOverrideSet {
   }
 };
 
+inline bool LibRawOverridesEqual(const LibRawOverrideSet& lhs,
+                                 const LibRawOverrideSet& rhs) {
+  return lhs.user_qual == rhs.user_qual &&
+         lhs.four_color_rgb == rhs.four_color_rgb &&
+         lhs.green_matching == rhs.green_matching &&
+         lhs.med_passes == rhs.med_passes &&
+         lhs.no_auto_scale == rhs.no_auto_scale &&
+         lhs.no_auto_bright == rhs.no_auto_bright &&
+         lhs.adjust_maximum_thr == rhs.adjust_maximum_thr;
+}
+
 struct ResolvedStageSettings {
   float stage1_psf_sigma = 1.0f;
   float stage1_nsr = 0.09f;
@@ -237,6 +248,7 @@ struct ProcessingCache {
   bool raw_image_is_camera_space = false;
   bool highlight_recovery_enabled = false;
   double preview_auto_bright_gain = 1.0;
+  LibRawOverrideSet libraw_overrides;
   uint32_t source_width = 0;
   uint32_t source_height = 0;
   uint32_t region_origin_x = 0;

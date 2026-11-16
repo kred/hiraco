@@ -875,6 +875,54 @@ void TestOriginalPreviewReusesProcessingCache() {
          "cache-backed original preview should obey the display-size limit");
 }
 
+void TestConversionReusesPreviewCachesAfterSourceRemoval() {
+  // A converted preview builds the full-frame processing cache and the
+  // unenhanced original preview.  Conversion should use both instead of
+  // decoding the source again.  Removing the source proves the caches are
+  // required for the conversion to succeed.
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
+
+  const std::filesystem::path temporary =
+      std::filesystem::temp_directory_path() / "hiraco_conversion_cache_test.ORF";
+  const std::filesystem::path output =
+      std::filesystem::temp_directory_path() / "hiraco_conversion_cache_test.dng";
+  std::error_code remove_error;
+  std::filesystem::remove(temporary, remove_error);
+  std::filesystem::remove(output, remove_error);
+  std::filesystem::copy_file(source_path, temporary);
+
+  PreparedSource prepared;
+  std::string error_message;
+  Expect(PrepareSource(temporary.string(), &prepared, &error_message),
+         "conversion cache test should prepare source: " + error_message);
+
+  auto converted = std::make_shared<PreviewImage>();
+  Expect(RenderConvertedFullPreview(&prepared, {}, 512, converted, {}, {}, {}, &error_message),
+         "converted preview should build the processing cache: " + error_message);
+  auto original = std::make_shared<PreviewImage>();
+  Expect(RenderOriginalPreviewFromProcessingCache(&prepared, 512, original, {}, {}, &error_message),
+         "original preview should populate the embedded-preview cache: " + error_message);
+
+  std::filesystem::remove(temporary);
+
+  const DngWriteResult result = ConvertToDng(prepared,
+                                             output,
+                                             HiracoCompression::kDeflate,
+                                             {},
+                                             {},
+                                             {},
+                                             {});
+  Expect(result.ok,
+         "conversion should succeed from the preview caches after the source is gone: " +
+             result.message);
+  Expect(std::filesystem::exists(output) && std::filesystem::file_size(output) > 1'000'000,
+         "cache-backed conversion should write a non-empty DNG");
+
+  std::filesystem::remove(output, remove_error);
+}
+
 void TestFullPreviewObeysDisplayDimension() {
   const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
   // The .ORF fixtures are gitignored, so an absent fixture means a broken
@@ -1565,6 +1613,7 @@ int main() {
     TestFullPreviewObeysDisplayDimension();
     TestProxyPreviewReusesCachedFullPreview();
     TestOriginalPreviewReusesProcessingCache();
+    TestConversionReusesPreviewCachesAfterSourceRemoval();
     TestDisplayPreviewIsResizedProcessedFull();
     TestStandard20MpPreviewColourIsStableAcrossZoom();
     TestFullPreviewOrientationMatchesLibRawFlip();

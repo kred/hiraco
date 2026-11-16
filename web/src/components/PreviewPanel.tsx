@@ -24,20 +24,18 @@ export function PreviewPanel() {
 
   const sideBySide = state.compareMode === 'side-by-side';
 
-  // The single-canvas modes (original and converted).
-  const single: PixelBuffer | null = useMemo(() => {
-    if (sideBySide) {
-      return null;
-    }
-    switch (state.compareMode) {
-      case 'original':
-        return original ? { ...original, data: original.pixels } : null;
-      case 'converted':
-        return converted ? { ...converted, data: converted.pixels } : null;
-      default:
-        return null;
-    }
-  }, [sideBySide, state.compareMode, original, converted]);
+  // The single-canvas modes (original and converted).  Memoize on the buffer
+  // that is actually displayed: an update to the other pane must not trigger
+  // a full-frame canvas upload.
+  const chosen = state.compareMode === 'original'
+      ? state.originalPreview
+      : state.compareMode === 'converted'
+        ? converted
+        : null;
+  const single: PixelBuffer | null = useMemo(
+    () => (chosen ? { ...chosen, data: chosen.pixels } : null),
+    [chosen],
+  );
 
   // Side by side: two fixed panes, each showing its own preview.  While one
   // preview is still missing both panes show the available one.

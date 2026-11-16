@@ -155,5 +155,6 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const StageOverrideSet& stage_overrides = {},
                                      const LibRawOverrideSet& libraw_overrides = {},
                                      std::shared_ptr<const PreviewImage> preview_override = {},
+                                     std::shared_ptr<const ProcessingCache> predecoded_raw = {},
                                      ProgressCallback progress = {},
                                      CancelCheck cancel = {});

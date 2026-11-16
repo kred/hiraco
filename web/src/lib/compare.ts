@@ -33,6 +33,9 @@ export const COMPARE_MODES: CompareModeSpec[] = [
 
 export type ZoomMode = 'fit' | '50' | '100';
 
+/** The longest edge of a preview rendered by the web application. */
+export const PREVIEW_MAX_DIMENSION = 2560;
+
 export interface ZoomModeSpec {
   id: ZoomMode;
   label: string;
