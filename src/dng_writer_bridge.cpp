@@ -3974,6 +3974,47 @@ RasterImage CropRasterImage(const RasterImage& source,
   return result;
 }
 
+bool BuildOriginalPreviewFromProcessingCacheImpl(const ProcessingCache& cache,
+                                             const SourceLinearDngMetadata& metadata,
+                                             const CropRect& crop_rect,
+                                             uint32_t max_dimension,
+                                             PreviewImage* preview) {
+  if (preview == nullptr || cache.raw_image.width == 0 || cache.raw_image.height == 0) {
+    return false;
+  }
+  if (cache.raw_image_is_camera_space &&
+      (!metadata.has_black_level || !metadata.has_as_shot_neutral)) {
+    return false;
+  }
+
+  CropRect cache_crop = crop_rect;
+  const uint32_t source_width = cache.source_width > 0 ? cache.source_width : cache.raw_image.width;
+  const uint32_t source_height = cache.source_height > 0 ? cache.source_height : cache.raw_image.height;
+  cache_crop = ClampCropRectToBounds(cache_crop, source_width, source_height);
+  if (cache.has_cached_crop) {
+    cache_crop.x = cache_crop.x > cache.region_origin_x
+        ? cache_crop.x - cache.region_origin_x
+        : 0;
+    cache_crop.y = cache_crop.y > cache.region_origin_y
+        ? cache_crop.y - cache.region_origin_y
+        : 0;
+  }
+  cache_crop = ClampCropRectToBounds(cache_crop,
+                                     cache.raw_image.width,
+                                     cache.raw_image.height);
+
+  RasterImage crop = CropRasterImage(cache.raw_image, cache_crop);
+  if (crop.width == 0 || crop.height == 0 || crop.colors < 3) {
+    return false;
+  }
+  *preview = BuildDisplayPreviewFromRaster(metadata,
+                                           std::move(crop),
+                                           cache.raw_image_is_camera_space,
+                                           max_dimension,
+                                           cache.preview_auto_bright_gain);
+  return preview->width > 0 && preview->height > 0;
+}
+
 AutoPtr<dng_image> MakeUint16Image(dng_host& host, const RasterImage& image) {
   dng_rect bounds(image.height, image.width);
   AutoPtr<dng_image> dng_image_ptr(host.Make_dng_image(bounds,
@@ -4162,6 +4203,18 @@ void AppendImagePreview(dng_host& host,
 
 RasterImage ScaleRasterImageForDisplay(const RasterImage& source, uint32_t max_dimension) {
   return BuildScaledRasterImage(source, max_dimension);
+}
+
+bool BuildOriginalPreviewFromProcessingCache(const ProcessingCache& cache,
+                                             const SourceLinearDngMetadata& metadata,
+                                             const CropRect& crop_rect,
+                                             uint32_t max_dimension,
+                                             PreviewImage* preview) {
+  return BuildOriginalPreviewFromProcessingCacheImpl(cache,
+                                                     metadata,
+                                                     crop_rect,
+                                                     max_dimension,
+                                                     preview);
 }
 
 PreviewImage ScalePreviewImageForDisplay(const PreviewImage& source,

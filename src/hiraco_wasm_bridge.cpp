@@ -637,11 +637,21 @@ int hiraco_wasm_get_original_preview(uint32_t session_id, uint32_t max_dimension
   std::shared_ptr<PreviewImage> preview = std::make_shared<PreviewImage>();
   std::string error_message;
   try {
-    if (!RenderOriginalPreview(&session->prepared,
+    const CancelCheck cancel =
+        [session]() { return session->cancel_requested->load(); };
+    // The converted preview has already decoded the full frame.  Reuse that
+    // cache for the unenhanced original instead of decoding the RAW again.
+    if (!RenderOriginalPreviewFromProcessingCache(&session->prepared,
+                                                  max_dimension,
+                                                  preview,
+                                                  ReportProgress,
+                                                  cancel,
+                                                  &error_message) &&
+        !RenderOriginalPreview(&session->prepared,
                                preview,
                                LibRawOverrideSet(),
                                ReportProgress,
-                               [session]() { return session->cancel_requested->load(); },
+                               cancel,
                                &error_message,
                                /*full_resolution=*/max_dimension == 0)) {
       LastError() = error_message.empty() ? "the original preview could not be rendered" : error_message;

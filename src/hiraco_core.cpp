@@ -738,6 +738,66 @@ bool RenderOriginalPreview(PreparedSource* prepared,
   return true;
 }
 
+bool RenderOriginalPreviewFromProcessingCache(PreparedSource* prepared,
+                                              uint32_t max_dimension,
+                                              std::shared_ptr<PreviewImage> preview,
+                                              ProgressCallback progress,
+                                              CancelCheck cancel,
+                                              std::string* error_message) {
+  std::string fallback_error;
+  if (error_message == nullptr) {
+    error_message = &fallback_error;
+  }
+  if (prepared == nullptr || !preview || !prepared->data) {
+    return false;
+  }
+  if (IsCancelled(cancel)) {
+    *error_message = "operation canceled";
+    return false;
+  }
+
+  std::shared_ptr<const ProcessingCache> cache;
+  {
+    std::lock_guard<std::mutex> lock(prepared->data->mutex);
+    if (!prepared->data->has_processing_cache || !prepared->data->processing_cache) {
+      return false;
+    }
+    cache = prepared->data->processing_cache;
+  }
+
+  CropRect crop;
+  crop.width = prepared->image_width;
+  crop.height = prepared->image_height;
+  if (prepared->metadata.has_default_crop &&
+      prepared->metadata.default_crop_width > 0 &&
+      prepared->metadata.default_crop_height > 0 &&
+      prepared->metadata.default_crop_origin_h < prepared->image_width &&
+      prepared->metadata.default_crop_origin_v < prepared->image_height) {
+    crop.x = prepared->metadata.default_crop_origin_h;
+    crop.y = prepared->metadata.default_crop_origin_v;
+    crop.width = std::min(prepared->metadata.default_crop_width,
+                          prepared->image_width - crop.x);
+    crop.height = std::min(prepared->metadata.default_crop_height,
+                           prepared->image_height - crop.y);
+  }
+
+  if (!BuildOriginalPreviewFromProcessingCache(*cache,
+                                               prepared->metadata,
+                                               crop,
+                                               max_dimension,
+                                               preview.get())) {
+    return false;
+  }
+  if (IsCancelled(cancel)) {
+    *error_message = "operation canceled";
+    return false;
+  }
+  if (progress) {
+    progress(ProcessingProgress{"preview", 1.0, "Original preview ready"});
+  }
+  return true;
+}
+
 bool TryGetCachedOriginalPreview(const PreparedSource& prepared,
                                  const LibRawOverrideSet& libraw_overrides,
                                  std::shared_ptr<const PreviewImage>* preview) {

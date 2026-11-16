@@ -34,10 +34,16 @@ minutes.
   the original decode; switching to `Original` or `Side by side` requests the
   missing preview then.  Slider changes while viewing `Original` no longer
   render an invisible converted preview.
-- **Half-size original previews below 100%.**  `RenderOriginalPreview` asks
-  LibRaw for `half_size = 1` for display-capped requests, which is a 2×2 Bayer
-  merge over the full sensor data (not an embedded thumbnail).  100% zoom and
-  the native GUI still use the full-resolution decode.
+- **Original preview reuses the decoded frame.**  Once the converted preview
+  has built the processing cache, the Original pane is derived from that
+  unenhanced raster instead of running a second LibRaw decode.  LibRaw remains
+  the fallback when Original is requested before any converted preview, and
+  for the native GUI.
+- **Half-size original fallback below 100%.**  When the fallback decode is
+  needed, `RenderOriginalPreview` asks LibRaw for `half_size = 1` for
+  display-capped requests, which is a 2×2 Bayer merge over the full sensor data
+  (not an embedded thumbnail).  100% zoom still uses the full-resolution
+  decode.
 - **Per-row preview cache.**  A completed fit preview is stored on its queue
   item.  Selecting that row again paints the cached preview immediately and
   reopens the session in the background; the expensive preview render is

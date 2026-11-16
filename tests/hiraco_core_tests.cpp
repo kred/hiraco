@@ -840,6 +840,41 @@ void TestProxyPreviewReusesCachedFullPreview() {
          "a cached full preview must not be re-enhanced for a 50%/fit request");
 }
 
+void TestOriginalPreviewReusesProcessingCache() {
+  // Once the converted preview has decoded the frame, the unsharpened original
+  // must come from that cache.  Removing the source before asking for the
+  // original proves there is no second LibRaw decode.
+  const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
+  Expect(std::filesystem::exists(source_path),
+         "missing test fixture (gitignored *.ORF): " + source_path.string());
+
+  const std::filesystem::path temporary =
+      std::filesystem::temp_directory_path() / "hiraco_original_cache_test.ORF";
+  std::error_code remove_error;
+  std::filesystem::remove(temporary, remove_error);
+  std::filesystem::copy_file(source_path, temporary);
+
+  PreparedSource prepared;
+  std::string error_message;
+  Expect(PrepareSource(temporary.string(), &prepared, &error_message),
+         "cache-backed original test should prepare source: " + error_message);
+
+  auto converted = std::make_shared<PreviewImage>();
+  Expect(RenderConvertedFullPreview(&prepared, {}, 512, converted, {}, {}, {}, &error_message),
+         "converted preview should build the processing cache: " + error_message);
+
+  std::filesystem::remove(temporary);
+
+  auto original = std::make_shared<PreviewImage>();
+  Expect(RenderOriginalPreviewFromProcessingCache(&prepared, 512, original, {}, {}, &error_message),
+         "original preview should render from the processing cache after the source is gone: " +
+             error_message);
+  Expect(original->width > 0 && original->height > 0,
+         "cache-backed original preview should produce image data");
+  Expect(std::max(original->width, original->height) <= 512,
+         "cache-backed original preview should obey the display-size limit");
+}
+
 void TestFullPreviewObeysDisplayDimension() {
   const std::filesystem::path source_path = RealOrfFixturePath("reference/_3210504.ORF");
   // The .ORF fixtures are gitignored, so an absent fixture means a broken
@@ -1529,6 +1564,7 @@ int main() {
     TestLocalOm3RecoveryCropPreviewMapping();
     TestFullPreviewObeysDisplayDimension();
     TestProxyPreviewReusesCachedFullPreview();
+    TestOriginalPreviewReusesProcessingCache();
     TestDisplayPreviewIsResizedProcessedFull();
     TestStandard20MpPreviewColourIsStableAcrossZoom();
     TestFullPreviewOrientationMatchesLibRawFlip();
