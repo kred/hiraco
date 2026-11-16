@@ -1,4 +1,8 @@
-import { PREVIEW_MAX_DIMENSION, previewMaxDimension } from '../lib/compare';
+import {
+  PREVIEW_MAX_DIMENSION,
+  previewDimensionSatisfies,
+  previewMaxDimension,
+} from '../lib/compare';
 import type { CompareMode, ZoomMode } from '../lib/compare';
 import {
   DEFAULT_STAGE_SETTINGS,
@@ -321,7 +325,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         PREVIEW_MAX_DIMENSION,
       );
       const canUsePreview = (buffer: PreviewBuffer | null, maxDimension: number | null) =>
-        buffer !== null && maxDimension !== null && maxDimension >= requiredPreviewDimension;
+        buffer !== null &&
+        maxDimension !== null &&
+        previewDimensionSatisfies(maxDimension, requiredPreviewDimension);
       return {
         ...state,
         selectedItemId: item.id,

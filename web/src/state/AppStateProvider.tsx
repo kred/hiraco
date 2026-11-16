@@ -19,7 +19,11 @@ import {
   type QueueItem,
   type SourceMetadata,
 } from './appState';
-import { PREVIEW_MAX_DIMENSION, previewMaxDimension } from '../lib/compare';
+import {
+  PREVIEW_MAX_DIMENSION,
+  previewDimensionSatisfies,
+  previewMaxDimension,
+} from '../lib/compare';
 import {
   loadCustomPreset,
   persistCustomPreset,
@@ -76,13 +80,6 @@ function stageOverridesKey(overrides: StageOverrides): string {
   return overridesToArray(overrides).join(',');
 }
 
-function dimensionSatisfies(rendered: number, requested: number): boolean {
-  if (rendered === requested || rendered === 0) {
-    return true;
-  }
-  return requested !== 0 && rendered >= requested;
-}
-
 function stampMatches(
   stamp: PreviewRenderStamp | null,
   expected: PreviewRenderStamp,
@@ -90,7 +87,7 @@ function stampMatches(
   return stamp !== null &&
       stamp.itemId === expected.itemId &&
       stamp.generation === expected.generation &&
-      dimensionSatisfies(stamp.maxDimension, expected.maxDimension) &&
+      previewDimensionSatisfies(stamp.maxDimension, expected.maxDimension) &&
       stamp.overridesKey === expected.overridesKey;
 }
 
@@ -539,14 +536,14 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         queueItem?.cachedOriginalPreview !== null &&
         queueItem?.cachedOriginalPreview !== undefined &&
         cachedOriginalMaxDimension !== null &&
-        dimensionSatisfies(cachedOriginalMaxDimension, requiredPreviewDimension)
+        previewDimensionSatisfies(cachedOriginalMaxDimension, requiredPreviewDimension)
           ? queueItem.cachedOriginalPreview
           : null;
       const cachedConverted =
         queueItem?.cachedConvertedPreview !== null &&
         queueItem?.cachedConvertedPreview !== undefined &&
         cachedConvertedMaxDimension !== null &&
-        dimensionSatisfies(cachedConvertedMaxDimension, requiredPreviewDimension)
+        previewDimensionSatisfies(cachedConvertedMaxDimension, requiredPreviewDimension)
           ? queueItem.cachedConvertedPreview
           : null;
       const cachedOverridesKey = stageOverridesKey(queueItem?.overrides ?? {});

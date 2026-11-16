@@ -187,6 +187,16 @@ describe('the application reducer', () => {
       { type: 'selection-changed', id: 1 },
     );
     expect(switched.convertedPreview).toBe(preview);
+
+    const fullRendered = appReducer(
+      makeState({ queue: [first, second], selectedItemId: 1 }),
+      { type: 'converted-preview', preview, maxDimension: 0 },
+    );
+    const fitFromFull = appReducer(
+      { ...fullRendered, selectedItemId: 2, zoomMode: 'fit', convertedPreview: null },
+      { type: 'selection-changed', id: 1 },
+    );
+    expect(fitFromFull.convertedPreview).toBe(preview);
   });
 
   it('evicts old row previews when the queue cache budget is exceeded', () => {

@@ -70,6 +70,17 @@ export function zoomFactor(mode: ZoomMode): number | null {
  * preview there would be upscaled and look blurry.  The fit view always
  * downscales whatever it gets, so the cap is fine.
  */
+/**
+ * Whether a preview rendered at `rendered` longest-edge can serve a request
+ * for `requested`.  0 means uncapped/full resolution.
+ */
+export function previewDimensionSatisfies(rendered: number, requested: number): boolean {
+  if (rendered === requested || rendered === 0) {
+    return true;
+  }
+  return requested !== 0 && rendered >= requested;
+}
+
 export function previewMaxDimension(
   mode: ZoomMode,
   imageWidth: number,
