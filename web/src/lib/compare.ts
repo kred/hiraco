@@ -33,7 +33,7 @@ export const COMPARE_MODES: CompareModeSpec[] = [
 
 export type ZoomMode = 'fit' | '50' | '100';
 
-/** The longest edge of a preview rendered by the web application. */
+/** Default cap for a fit preview; 50% may be larger and 100% is uncapped. */
 export const PREVIEW_MAX_DIMENSION = 2560;
 
 export interface ZoomModeSpec {
@@ -61,16 +61,6 @@ export function zoomFactor(mode: ZoomMode): number | null {
 }
 
 /**
- * The preview buffer dimension a zoom mode needs so the preview is never
- * upscaled on screen.
- *
- * 100% shows real image pixels one to one, so it asks for the uncapped
- * preview (0 means no limit).  At 50% the image is displayed at half its real
- * width, so half of the source resolution is enough; fetching the capped
- * preview there would be upscaled and look blurry.  The fit view always
- * downscales whatever it gets, so the cap is fine.
- */
-/**
  * Whether a preview rendered at `rendered` longest-edge can serve a request
  * for `requested`.  0 means uncapped/full resolution.
  */
@@ -81,6 +71,16 @@ export function previewDimensionSatisfies(rendered: number, requested: number): 
   return requested !== 0 && rendered >= requested;
 }
 
+/**
+ * The preview buffer dimension a zoom mode needs so the preview is never
+ * upscaled on screen.
+ *
+ * 100% shows real image pixels one to one, so it asks for the uncapped
+ * preview (0 means no limit).  At 50% the image is displayed at half its real
+ * width, so half of the source resolution is enough; fetching the capped
+ * preview there would be upscaled and look blurry.  The fit view always
+ * downscales whatever it gets, so the cap is fine.
+ */
 export function previewMaxDimension(
   mode: ZoomMode,
   imageWidth: number,
