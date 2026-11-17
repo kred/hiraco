@@ -641,21 +641,29 @@ int hiraco_wasm_get_original_preview(uint32_t session_id, uint32_t max_dimension
         [session]() { return session->cancel_requested->load(); };
     // The converted preview has already decoded the full frame.  Reuse that
     // cache for the unenhanced original instead of decoding the RAW again.
-    if (!RenderOriginalPreviewFromProcessingCache(&session->prepared,
-                                                  max_dimension,
-                                                  preview,
-                                                  ReportProgress,
-                                                  cancel,
-                                                  &error_message) &&
-        !RenderOriginalPreview(&session->prepared,
-                               preview,
-                               LibRawOverrideSet(),
-                               ReportProgress,
-                               cancel,
-                               &error_message,
-                               /*full_resolution=*/max_dimension == 0)) {
-      LastError() = error_message.empty() ? "the original preview could not be rendered" : error_message;
-      return 1;
+    const bool from_processing_cache =
+        RenderOriginalPreviewFromProcessingCache(&session->prepared,
+                                                 max_dimension,
+                                                 preview,
+                                                 ReportProgress,
+                                                 cancel,
+                                                 &error_message);
+    if (!from_processing_cache) {
+      // Do not start a fresh decode after the user cancelled.
+      if (cancel()) {
+        LastError() = error_message.empty() ? "operation canceled" : error_message;
+        return 1;
+      }
+      if (!RenderOriginalPreview(&session->prepared,
+                                 preview,
+                                 LibRawOverrideSet(),
+                                 ReportProgress,
+                                 cancel,
+                                 &error_message,
+                                 /*full_resolution=*/max_dimension == 0)) {
+        LastError() = error_message.empty() ? "the original preview could not be rendered" : error_message;
+        return 1;
+      }
     }
   } catch (const std::exception& error) {
     LastError() = std::string("unhandled error: ") + error.what();

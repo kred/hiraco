@@ -4000,21 +4000,27 @@ bool BuildOriginalPreviewFromProcessingCacheImpl(const ProcessingCache& cache,
     return false;
   }
 
-  CropRect cache_crop = crop_rect;
   const uint32_t source_width = cache.source_width > 0 ? cache.source_width : cache.raw_image.width;
   const uint32_t source_height = cache.source_height > 0 ? cache.source_height : cache.raw_image.height;
-  cache_crop = ClampCropRectToBounds(cache_crop, source_width, source_height);
-  if (cache.has_cached_crop) {
-    cache_crop.x = cache_crop.x > cache.region_origin_x
-        ? cache_crop.x - cache.region_origin_x
-        : 0;
-    cache_crop.y = cache_crop.y > cache.region_origin_y
-        ? cache_crop.y - cache.region_origin_y
-        : 0;
+  const CropRect requested = ClampCropRectToBounds(crop_rect, source_width, source_height);
+  const uint32_t region_x = cache.has_cached_crop ? cache.region_origin_x : 0;
+  const uint32_t region_y = cache.has_cached_crop ? cache.region_origin_y : 0;
+  const uint32_t region_right = region_x + cache.raw_image.width;
+  const uint32_t region_bottom = region_y + cache.raw_image.height;
+  const uint64_t requested_right = static_cast<uint64_t>(requested.x) + requested.width;
+  const uint64_t requested_bottom = static_cast<uint64_t>(requested.y) + requested.height;
+  // A cropped cache only contains one region.  Returning the intersection
+  // would silently show a partial or shifted image, so reject it and let the
+  // caller fall back to the LibRaw decode.
+  if (requested.x < region_x || requested.y < region_y ||
+      requested_right > region_right || requested_bottom > region_bottom) {
+    return false;
   }
-  cache_crop = ClampCropRectToBounds(cache_crop,
-                                     cache.raw_image.width,
-                                     cache.raw_image.height);
+  CropRect cache_crop = requested;
+  if (cache.has_cached_crop) {
+    cache_crop.x -= region_x;
+    cache_crop.y -= region_y;
+  }
 
   RasterImage crop = CropRasterImage(cache.raw_image, cache_crop);
   if (crop.width == 0 || crop.height == 0 || crop.colors < 3) {

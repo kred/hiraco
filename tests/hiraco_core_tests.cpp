@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -35,6 +37,57 @@ std::filesystem::path RealOrfFixturePath(const std::string& relative_path) {
   return std::filesystem::path(__FILE__).parent_path().parent_path() / relative_path;
 }
 
+
+// Tests write scratch files inside the checkout, never the system temp
+// directory: a large conversion test must not be able to fill the user's boot
+// volume if it is interrupted.
+std::filesystem::path TestScratchPath(const std::string& name, bool directory = false) {
+  static const std::filesystem::path root = [] {
+    const std::filesystem::path path = RealOrfFixturePath("build/test-tmp");
+    std::error_code error;
+    std::filesystem::create_directories(path, error);
+    if (error) {
+      throw std::runtime_error(
+          "could not create the project test scratch directory: " + error.message());
+    }
+    return path;
+  }();
+  // Keep parallel test processes from sharing a file name.
+  static std::atomic<uint64_t> sequence{0};
+  const uint64_t unique = static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count()) +
+      sequence.fetch_add(1);
+  const std::filesystem::path path = root / (std::to_string(unique) + "-" + name);
+  std::error_code error;
+  if (directory) {
+    std::filesystem::remove_all(path, error);
+  } else {
+    std::filesystem::remove(path, error);
+  }
+  return path;
+}
+
+/** Removes a test file or directory on scope exit, including on failure. */
+class ScopedTestPath {
+ public:
+  explicit ScopedTestPath(std::filesystem::path path, bool directory = false)
+      : path_(std::move(path)), directory_(directory) {}
+  ~ScopedTestPath() {
+    std::error_code error;
+    if (directory_) {
+      std::filesystem::remove_all(path_, error);
+    } else {
+      std::filesystem::remove(path_, error);
+    }
+  }
+  ScopedTestPath(const ScopedTestPath&) = delete;
+  ScopedTestPath& operator=(const ScopedTestPath&) = delete;
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+  bool directory_ = false;
+};
 
 RasterImage MakeSyntheticRgb(uint32_t width, uint32_t height) {
   RasterImage image;
@@ -285,8 +338,8 @@ void TestResolveOutputPath() {
 }
 
 void TestMalformedMakerNoteDoesNotReadOutOfBounds() {
-  const std::filesystem::path path =
-      std::filesystem::temp_directory_path() / "hiraco-malformed-makernote.orf";
+  ScopedTestPath scratch(TestScratchPath("malformed-makernote.orf"));
+  const std::filesystem::path& path = scratch.path();
   std::vector<uint8_t> data(26, 0);
   const auto put16 = [&data](size_t offset, uint16_t value) {
     data[offset] = static_cast<uint8_t>(value & 0xFF);
@@ -324,17 +377,15 @@ void TestMalformedMakerNoteDoesNotReadOutOfBounds() {
 
   const VendorMakerNoteResult result = ReadVendorMakerNote(path.string());
   Expect(!result.ok, "a malformed MakerNote must fail instead of reading out of bounds");
-  std::error_code error;
-  std::filesystem::remove(path, error);
 }
 
 void TestPathsReferToSameFile() {
-  const std::filesystem::path directory =
-      std::filesystem::temp_directory_path() / "hiraco-paths-refer-test";
+  ScopedTestPath scratch(TestScratchPath("paths-refer-test", /*directory=*/true),
+                         /*directory=*/true);
+  const std::filesystem::path& directory = scratch.path();
   std::error_code error;
-  std::filesystem::remove_all(directory, error);
   std::filesystem::create_directories(directory, error);
-  Expect(!error, "the path test needs a writable temporary directory");
+  Expect(!error, "the path test needs a writable scratch directory");
 
   const std::filesystem::path source = directory / "scene.ORF";
   {
@@ -352,8 +403,6 @@ void TestPathsReferToSameFile() {
          "two spellings of a not-yet-existing target should compare equal");
   Expect(!PathsReferToSameFile({}, source),
          "an empty path must never be reported as the source");
-
-  std::filesystem::remove_all(directory, error);
 }
 
 void TestOverwriteDecision() {
@@ -840,6 +889,26 @@ void TestProxyPreviewReusesCachedFullPreview() {
          "a cached full preview must not be re-enhanced for a 50%/fit request");
 }
 
+void TestOriginalPreviewRejectsUncoveredCacheCrop() {
+  ProcessingCache cache;
+  cache.raw_image = MakeSyntheticRgb(64, 64);
+  cache.source_width = 512;
+  cache.source_height = 512;
+  cache.has_cached_crop = true;
+  cache.region_origin_x = 100;
+  cache.region_origin_y = 100;
+
+  PreviewImage preview;
+  Expect(!BuildOriginalPreviewFromProcessingCache(
+             cache, MakeHighResMetadata(), CropRect{0, 0, 512, 512}, 512, &preview),
+         "an uncovered crop cache must be rejected so the caller can fall back");
+  Expect(BuildOriginalPreviewFromProcessingCache(
+             cache, MakeHighResMetadata(), CropRect{120, 120, 32, 32}, 512, &preview),
+         "a covered crop should still use the processing cache");
+  Expect(preview.width == 32 && preview.height == 32,
+         "a covered cache crop should preserve the requested geometry");
+}
+
 void TestOriginalPreviewReusesProcessingCache() {
   // Once the converted preview has decoded the frame, the unsharpened original
   // must come from that cache.  Removing the source before asking for the
@@ -848,11 +917,11 @@ void TestOriginalPreviewReusesProcessingCache() {
   Expect(std::filesystem::exists(source_path),
          "missing test fixture (gitignored *.ORF): " + source_path.string());
 
-  const std::filesystem::path temporary =
-      std::filesystem::temp_directory_path() / "hiraco_original_cache_test.ORF";
-  std::error_code remove_error;
-  std::filesystem::remove(temporary, remove_error);
-  std::filesystem::copy_file(source_path, temporary);
+  ScopedTestPath scratch(TestScratchPath("original-cache-test.ORF"));
+  const std::filesystem::path& temporary = scratch.path();
+  std::error_code copy_error;
+  std::filesystem::copy_file(source_path, temporary, copy_error);
+  Expect(!copy_error, "could not copy the test fixture: " + copy_error.message());
 
   PreparedSource prepared;
   std::string error_message;
@@ -863,7 +932,9 @@ void TestOriginalPreviewReusesProcessingCache() {
   Expect(RenderConvertedFullPreview(&prepared, {}, 512, converted, {}, {}, {}, &error_message),
          "converted preview should build the processing cache: " + error_message);
 
-  std::filesystem::remove(temporary);
+  std::error_code remove_error;
+  std::filesystem::remove(temporary, remove_error);
+  Expect(!remove_error, "could not remove the staged source: " + remove_error.message());
 
   auto original = std::make_shared<PreviewImage>();
   Expect(RenderOriginalPreviewFromProcessingCache(&prepared, 512, original, {}, {}, &error_message),
@@ -884,14 +955,13 @@ void TestConversionReusesPreviewCachesAfterSourceRemoval() {
   Expect(std::filesystem::exists(source_path),
          "missing test fixture (gitignored *.ORF): " + source_path.string());
 
-  const std::filesystem::path temporary =
-      std::filesystem::temp_directory_path() / "hiraco_conversion_cache_test.ORF";
-  const std::filesystem::path output =
-      std::filesystem::temp_directory_path() / "hiraco_conversion_cache_test.dng";
-  std::error_code remove_error;
-  std::filesystem::remove(temporary, remove_error);
-  std::filesystem::remove(output, remove_error);
-  std::filesystem::copy_file(source_path, temporary);
+  ScopedTestPath scratch(TestScratchPath("conversion-cache-test.ORF"));
+  ScopedTestPath scratch_output(TestScratchPath("conversion-cache-test.dng"));
+  const std::filesystem::path& temporary = scratch.path();
+  const std::filesystem::path& output = scratch_output.path();
+  std::error_code copy_error;
+  std::filesystem::copy_file(source_path, temporary, copy_error);
+  Expect(!copy_error, "could not copy the test fixture: " + copy_error.message());
 
   PreparedSource prepared;
   std::string error_message;
@@ -905,7 +975,9 @@ void TestConversionReusesPreviewCachesAfterSourceRemoval() {
   Expect(RenderOriginalPreviewFromProcessingCache(&prepared, 512, original, {}, {}, &error_message),
          "original preview should populate the embedded-preview cache: " + error_message);
 
-  std::filesystem::remove(temporary);
+  std::error_code remove_error;
+  std::filesystem::remove(temporary, remove_error);
+  Expect(!remove_error, "could not remove the staged source: " + remove_error.message());
 
   const DngWriteResult result = ConvertToDng(prepared,
                                              output,
@@ -917,10 +989,10 @@ void TestConversionReusesPreviewCachesAfterSourceRemoval() {
   Expect(result.ok,
          "conversion should succeed from the preview caches after the source is gone: " +
              result.message);
-  Expect(std::filesystem::exists(output) && std::filesystem::file_size(output) > 1'000'000,
+  std::error_code size_error;
+  const uintmax_t output_size = std::filesystem::file_size(output, size_error);
+  Expect(!size_error && output_size > 1'000'000,
          "cache-backed conversion should write a non-empty DNG");
-
-  std::filesystem::remove(output, remove_error);
 }
 
 void TestFullPreviewObeysDisplayDimension() {
@@ -1611,6 +1683,7 @@ int main() {
     TestLocalOm3RecoveryFullPreviewSmoke();
     TestLocalOm3RecoveryCropPreviewMapping();
     TestFullPreviewObeysDisplayDimension();
+    TestOriginalPreviewRejectsUncoveredCacheCrop();
     TestProxyPreviewReusesCachedFullPreview();
     TestOriginalPreviewReusesProcessingCache();
     TestConversionReusesPreviewCachesAfterSourceRemoval();

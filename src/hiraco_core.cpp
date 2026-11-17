@@ -795,6 +795,9 @@ bool RenderOriginalPreviewFromProcessingCache(PreparedSource* prepared,
                            prepared->image_height - crop.y);
   }
 
+  // A cache built for a crop does not cover the full/default crop used by
+  // the Original pane.  The helper rejects uncovered crops; returning false
+  // here lets the wasm bridge fall back to the LibRaw decode.
   if (!BuildOriginalPreviewFromProcessingCache(*cache,
                                                prepared->metadata,
                                                crop,
@@ -883,6 +886,10 @@ size_t GetPreviewCacheBytes(const PreparedSource& prepared) {
   size_t total = 0;
   if (prepared.data->original_preview) {
     total += preview_bytes(*prepared.data->original_preview);
+  }
+  if (prepared.data->cached_original_from_processing &&
+      prepared.data->cached_original_from_processing != prepared.data->original_preview) {
+    total += preview_bytes(*prepared.data->cached_original_from_processing);
   }
   total += preview_bytes(prepared.data->processed_full_preview);
   if (prepared.data->processing_cache) {
@@ -988,6 +995,9 @@ bool RenderConvertedCrop(PreparedSource* prepared,
     prepared->data->has_processing_cache = true;
     prepared->data->cached_libraw_overrides = libraw_overrides;
     prepared->data->processing_cache = cache;
+    // The derived original was built from the previous cached raster.
+    prepared->data->has_cached_original_from_processing = false;
+    prepared->data->cached_original_from_processing.reset();
   }
 
   return RenderConvertedCropPreview(*enhancement_metadata,
