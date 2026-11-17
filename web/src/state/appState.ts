@@ -1,3 +1,8 @@
+import {
+  PREVIEW_MAX_DIMENSION,
+  previewDimensionSatisfies,
+  previewMaxDimension,
+} from '../lib/compare';
 import type { CompareMode, ZoomMode } from '../lib/compare';
 import {
   DEFAULT_STAGE_SETTINGS,
@@ -79,9 +84,11 @@ export interface QueueItem {
   settings: StageSettings | null;
   overrides: StageOverrides;
   preset: PresetId | null;
-  /** Cached fit-mode previews, so reselecting a row does not decode again. */
+  /** Cached previews and the longest edge each was rendered at. */
   cachedOriginalPreview: PreviewBuffer | null;
+  cachedOriginalMaxDimension: number | null;
   cachedConvertedPreview: PreviewBuffer | null;
+  cachedConvertedMaxDimension: number | null;
 }
 
 /** Settings copied from one queue entry for pasting into another. */
@@ -162,8 +169,8 @@ export type AppAction =
   | { type: 'settings-copied'; value: CopiedSettings | null }
   | { type: 'settings-pasted'; ids: number[]; value: CopiedSettings }
   | { type: 'source-prepared'; width: number; height: number; metadata: SourceMetadata; baseSettings: StageSettings; settings: StageSettings; overrides: StageOverrides; preset: PresetId | null }
-  | { type: 'original-preview'; preview: PreviewBuffer }
-  | { type: 'converted-preview'; preview: PreviewBuffer }
+  | { type: 'original-preview'; preview: PreviewBuffer; maxDimension: number }
+  | { type: 'converted-preview'; preview: PreviewBuffer; maxDimension: number }
   | { type: 'settings-changed'; settings: StageSettings; overrides: StageOverrides }
   | { type: 'preset-applied'; preset: PresetId; settings: StageSettings; overrides: StageOverrides }
   | { type: 'compression-changed'; compression: CompressionMode }
@@ -178,12 +185,45 @@ export type AppAction =
 
 /** Large full-resolution previews are not retained per queue row. */
 export const PREVIEW_CACHE_LIMIT_BYTES = 32 * 1024 * 1024;
+/** Total preview memory retained across the queue. */
+export const QUEUE_PREVIEW_CACHE_LIMIT_BYTES = 96 * 1024 * 1024;
 
 function cacheablePreview(preview: PreviewBuffer): PreviewBuffer | null {
   // The returned preview keeps both arrays alive; count the recovered-pixel
   // mask as well as the RGBA pixels against the per-row cache limit.
   const bytes = preview.pixels.byteLength + preview.recoveredMask.byteLength;
   return bytes <= PREVIEW_CACHE_LIMIT_BYTES ? preview : null;
+}
+
+function previewBytes(preview: PreviewBuffer | null): number {
+  return preview === null ? 0 : preview.pixels.byteLength + preview.recoveredMask.byteLength;
+}
+
+function trimQueuePreviewCache(queue: QueueItem[], selectedItemId: number | null): QueueItem[] {
+  let total = 0;
+  for (const item of queue) {
+    total += previewBytes(item.cachedOriginalPreview) + previewBytes(item.cachedConvertedPreview);
+  }
+  if (total <= QUEUE_PREVIEW_CACHE_LIMIT_BYTES) {
+    return queue;
+  }
+  const trimmed = [...queue];
+  for (let index = 0; index < trimmed.length && total > QUEUE_PREVIEW_CACHE_LIMIT_BYTES; ++index) {
+    const item = trimmed[index];
+    if (item.id === selectedItemId ||
+        (item.cachedOriginalPreview === null && item.cachedConvertedPreview === null)) {
+      continue;
+    }
+    total -= previewBytes(item.cachedOriginalPreview) + previewBytes(item.cachedConvertedPreview);
+    trimmed[index] = {
+      ...item,
+      cachedOriginalPreview: null,
+      cachedOriginalMaxDimension: null,
+      cachedConvertedPreview: null,
+      cachedConvertedMaxDimension: null,
+    };
+  }
+  return trimmed;
 }
 
 /** The preset a value set matches: built-in first, then the custom slot. */
@@ -219,7 +259,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
                 ...(companionChanged
                   ? {
                       cachedOriginalPreview: null,
+                      cachedOriginalMaxDimension: null,
                       cachedConvertedPreview: null,
+                      cachedConvertedMaxDimension: null,
                     }
                   : {}),
               }
@@ -277,6 +319,15 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       }
       const baseSettings = item.baseSettings ?? DEFAULT_STAGE_SETTINGS;
       const settings = item.settings ?? applyOverrides(baseSettings, item.overrides);
+      const requiredPreviewDimension = previewMaxDimension(
+        state.zoomMode,
+        item.width,
+        PREVIEW_MAX_DIMENSION,
+      );
+      const canUsePreview = (buffer: PreviewBuffer | null, maxDimension: number | null) =>
+        buffer !== null &&
+        maxDimension !== null &&
+        previewDimensionSatisfies(maxDimension, requiredPreviewDimension);
       return {
         ...state,
         selectedItemId: item.id,
@@ -289,12 +340,16 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         settings,
         overrides: item.overrides,
         preset: matchedPreset(baseSettings, settings, state.customPreset),
-        // A cached preview is only valid for the fit resolution it was
-        // rendered at; zoom changes request a fresh one.
+        // A larger cached buffer can serve a smaller request; a smaller one
+        // cannot be upscaled for a higher zoom.
         originalPreview:
-          state.zoomMode === 'fit' ? item.cachedOriginalPreview : null,
+          canUsePreview(item.cachedOriginalPreview, item.cachedOriginalMaxDimension)
+            ? item.cachedOriginalPreview
+            : null,
         convertedPreview:
-          state.zoomMode === 'fit' ? item.cachedConvertedPreview : null,
+          canUsePreview(item.cachedConvertedPreview, item.cachedConvertedMaxDimension)
+            ? item.cachedConvertedPreview
+            : null,
         error: null,
         activity: { state: 'idle', message: `Loading ${item.sourceName}`, fraction: null },
       };
@@ -313,6 +368,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
                   ? null
                   : matchedPreset(item.baseSettings, action.value.settings, state.customPreset),
               cachedConvertedPreview: null,
+              cachedConvertedMaxDimension: null,
             }
           : item,
       );
@@ -361,26 +417,44 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         preset: action.preset,
       };
     }
-    case 'original-preview':
+    case 'original-preview': {
+      const cached = cacheablePreview(action.preview);
       return {
         ...state,
         originalPreview: action.preview,
-        queue: state.queue.map((item) =>
-          item.id === state.selectedItemId
-            ? { ...item, cachedOriginalPreview: cacheablePreview(action.preview) }
-            : item,
+        queue: trimQueuePreviewCache(
+          state.queue.map((item) =>
+            item.id === state.selectedItemId
+              ? {
+                  ...item,
+                  cachedOriginalPreview: cached,
+                  cachedOriginalMaxDimension: cached === null ? null : action.maxDimension,
+                }
+              : item,
+          ),
+          state.selectedItemId,
         ),
       };
-    case 'converted-preview':
+    }
+    case 'converted-preview': {
+      const cached = cacheablePreview(action.preview);
       return {
         ...state,
         convertedPreview: action.preview,
-        queue: state.queue.map((item) =>
-          item.id === state.selectedItemId
-            ? { ...item, cachedConvertedPreview: cacheablePreview(action.preview) }
-            : item,
+        queue: trimQueuePreviewCache(
+          state.queue.map((item) =>
+            item.id === state.selectedItemId
+              ? {
+                  ...item,
+                  cachedConvertedPreview: cached,
+                  cachedConvertedMaxDimension: cached === null ? null : action.maxDimension,
+                }
+              : item,
+          ),
+          state.selectedItemId,
         ),
       };
+    }
     case 'settings-changed': {
       // Moving a slider back onto a preset value highlights it again, like the
       // native SettingsMatchPreset.
@@ -399,6 +473,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
                 overrides: action.overrides,
                 preset,
                 cachedConvertedPreview: null,
+                cachedConvertedMaxDimension: null,
               }
             : item,
         ),
@@ -418,6 +493,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
                 overrides: action.overrides,
                 preset: action.preset,
                 cachedConvertedPreview: null,
+                cachedConvertedMaxDimension: null,
               }
             : item,
         ),

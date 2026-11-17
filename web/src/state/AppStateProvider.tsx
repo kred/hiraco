@@ -19,7 +19,11 @@ import {
   type QueueItem,
   type SourceMetadata,
 } from './appState';
-import { previewMaxDimension } from '../lib/compare';
+import {
+  PREVIEW_MAX_DIMENSION,
+  previewDimensionSatisfies,
+  previewMaxDimension,
+} from '../lib/compare';
 import {
   loadCustomPreset,
   persistCustomPreset,
@@ -47,9 +51,6 @@ import {
   type StageSettings,
 } from '../lib/stageSettings';
 
-/** The longest edge of the preview the browser renders. */
-const PREVIEW_MAX_DIMENSION = 2560;
-
 /** How long the browser waits for the sliders to settle before it renders. */
 const PREVIEW_DELAY_MS = 250;
 
@@ -65,6 +66,29 @@ function settingsFromValues(values: number[]): StageSettings {
 /** The overrides in the flat shape the bridge expects. */
 function overridesToArray(overrides: StageOverrides): number[] {
   return Array.from(serializeStageOverrides(overrides));
+}
+
+/** Identifies the inputs of a completed/started preview render. */
+interface PreviewRenderStamp {
+  itemId: number | null;
+  generation: number;
+  maxDimension: number;
+  overridesKey: string;
+}
+
+function stageOverridesKey(overrides: StageOverrides): string {
+  return overridesToArray(overrides).join(',');
+}
+
+function stampMatches(
+  stamp: PreviewRenderStamp | null,
+  expected: PreviewRenderStamp,
+): boolean {
+  return stamp !== null &&
+      stamp.itemId === expected.itemId &&
+      stamp.generation === expected.generation &&
+      previewDimensionSatisfies(stamp.maxDimension, expected.maxDimension) &&
+      stamp.overridesKey === expected.overridesKey;
 }
 
 /** The metadata of the bridge, in the shape the inspector shows. */
@@ -221,9 +245,10 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const cancelRequested = useRef(false);
 
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // The comparison mode and zoom whose previews are already requested, so the
-  // on-demand effect does not re-request them for unrelated state updates.
-  const previewViewRef = useRef('');
+  // Inputs of the most recent preview requests.  A mode/zoom change can reuse
+  // a buffer that is already on screen instead of re-running the pipeline.
+  const lastConvertedRender = useRef<PreviewRenderStamp | null>(null);
+  const lastOriginalRender = useRef<PreviewRenderStamp | null>(null);
   const previewRunning = useRef(false);
   const previewPending = useRef(false);
   const originalRunning = useRef(false);
@@ -297,16 +322,23 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     previewRunning.current = true;
     const generation = selectionGeneration.current;
     const started = beginPreviewJob();
+    const activeItem = stateRef.current.queue.find(
+      (item) => item.id === activeItemId.current,
+    );
+    const overrides = activeItem?.overrides ?? stateRef.current.overrides;
+    const maxDimension = previewMaxDimension(
+      stateRef.current.zoomMode,
+      activeSize.current.width,
+      PREVIEW_MAX_DIMENSION,
+    );
+    const stamp: PreviewRenderStamp = {
+      itemId: activeItemId.current,
+      generation,
+      maxDimension,
+      overridesKey: stageOverridesKey(overrides),
+    };
+    lastConvertedRender.current = stamp;
     try {
-      const activeItem = stateRef.current.queue.find(
-        (item) => item.id === activeItemId.current,
-      );
-      const overrides = activeItem?.overrides ?? stateRef.current.overrides;
-      const maxDimension = previewMaxDimension(
-        stateRef.current.zoomMode,
-        activeSize.current.width,
-        PREVIEW_MAX_DIMENSION,
-      );
       const preview = await client().convertedPreview(
         maxDimension,
         overridesToArray(overrides),
@@ -314,8 +346,15 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       if (generation !== selectionGeneration.current) {
         return;
       }
-      dispatch({ type: 'converted-preview', preview: previewFromBridge(preview) });
+      dispatch({
+        type: 'converted-preview',
+        preview: previewFromBridge(preview),
+        maxDimension,
+      });
     } catch (error) {
+      if (lastConvertedRender.current === stamp) {
+        lastConvertedRender.current = null;
+      }
       if (generation !== selectionGeneration.current) {
         return;
       }
@@ -348,18 +387,32 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     originalRunning.current = true;
     const generation = selectionGeneration.current;
     const started = beginPreviewJob();
+    const maxDimension = previewMaxDimension(
+      stateRef.current.zoomMode,
+      activeSize.current.width,
+      PREVIEW_MAX_DIMENSION,
+    );
+    const stamp: PreviewRenderStamp = {
+      itemId: activeItemId.current,
+      generation,
+      maxDimension,
+      overridesKey: '',
+    };
+    lastOriginalRender.current = stamp;
     try {
-      const maxDimension = previewMaxDimension(
-        stateRef.current.zoomMode,
-        activeSize.current.width,
-        PREVIEW_MAX_DIMENSION,
-      );
       const preview = await client().originalPreview(maxDimension);
       if (generation !== selectionGeneration.current) {
         return;
       }
-      dispatch({ type: 'original-preview', preview: previewFromBridge(preview) });
+      dispatch({
+        type: 'original-preview',
+        preview: previewFromBridge(preview),
+        maxDimension,
+      });
     } catch (error) {
+      if (lastOriginalRender.current === stamp) {
+        lastOriginalRender.current = null;
+      }
       if (generation !== selectionGeneration.current) {
         return;
       }
@@ -472,23 +525,60 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       // A cached fit preview already on screen is reused when the row is
       // selected again, so switching back does not decode it a second time.
       const compareMode = stateRef.current.compareMode;
-      const cachedPreviewUsable = stateRef.current.zoomMode === 'fit';
-      const cachedOriginal = cachedPreviewUsable
-        ? queueItem?.cachedOriginalPreview ?? null
-        : null;
-      const cachedConverted = cachedPreviewUsable
-        ? queueItem?.cachedConvertedPreview ?? null
-        : null;
+      const requiredPreviewDimension = previewMaxDimension(
+        stateRef.current.zoomMode,
+        activeSize.current.width,
+        PREVIEW_MAX_DIMENSION,
+      );
+      const cachedOriginalMaxDimension = queueItem?.cachedOriginalMaxDimension ?? null;
+      const cachedConvertedMaxDimension = queueItem?.cachedConvertedMaxDimension ?? null;
+      const cachedOriginal =
+        queueItem?.cachedOriginalPreview !== null &&
+        queueItem?.cachedOriginalPreview !== undefined &&
+        cachedOriginalMaxDimension !== null &&
+        previewDimensionSatisfies(cachedOriginalMaxDimension, requiredPreviewDimension)
+          ? queueItem.cachedOriginalPreview
+          : null;
+      const cachedConverted =
+        queueItem?.cachedConvertedPreview !== null &&
+        queueItem?.cachedConvertedPreview !== undefined &&
+        cachedConvertedMaxDimension !== null &&
+        previewDimensionSatisfies(cachedConvertedMaxDimension, requiredPreviewDimension)
+          ? queueItem.cachedConvertedPreview
+          : null;
+      const cachedOverridesKey = stageOverridesKey(queueItem?.overrides ?? {});
       if (compareMode === 'original') {
+        if (cachedOriginal !== null) {
+          lastOriginalRender.current = {
+            itemId,
+            generation,
+            maxDimension: cachedOriginalMaxDimension ?? requiredPreviewDimension,
+            overridesKey: '',
+          };
+        }
         if (cachedOriginal === null) {
           await renderOriginalPreview();
         }
       } else {
         if (cachedConverted === null) {
           await renderConvertedPreview();
+        } else {
+          lastConvertedRender.current = {
+            itemId,
+            generation,
+            maxDimension: cachedConvertedMaxDimension ?? requiredPreviewDimension,
+            overridesKey: cachedOverridesKey,
+          };
         }
         if (compareMode === 'side-by-side' && cachedOriginal === null) {
           await renderOriginalPreview();
+        } else if (compareMode === 'side-by-side' && cachedOriginal !== null) {
+          lastOriginalRender.current = {
+            itemId,
+            generation,
+            maxDimension: cachedOriginalMaxDimension ?? requiredPreviewDimension,
+            overridesKey: '',
+          };
         }
       }
       if (generation !== selectionGeneration.current) {
@@ -604,28 +694,50 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     };
   }, [client]);
 
-  // Render the previews a comparison mode needs when the mode or zoom changes.
-  // The opening path renders only the visible mode, so switching to Original
-  // or Side by side pulls in the missing preview at the current zoom.  The C++
-  // side caches the full-resolution preview, so a repeated request is a scale
-  // and copy rather than another RAW decode.
-  const previewViewKey = `${state.compareMode}:${state.zoomMode}`;
+  // Render only previews whose displayed resolution/settings changed.  The
+  // opening path renders the visible mode; compare-mode toggles and repeated
+  // zoom changes must not rerun a preview that is already on screen.
   useEffect(() => {
-    if (previewViewRef.current === previewViewKey) {
+    if (state.converting || convertingRef.current) {
       return;
     }
-    previewViewRef.current = previewViewKey;
+    const item = state.queue.find((entry) => entry.id === state.selectedItemId);
+    const maxDimension = previewMaxDimension(
+      state.zoomMode,
+      state.imageWidth,
+      PREVIEW_MAX_DIMENSION,
+    );
+    const itemId = activeItemId.current;
+    const generation = selectionGeneration.current;
+    const overrides = item?.overrides ?? state.overrides;
+    const convertedExpected: PreviewRenderStamp = {
+      itemId,
+      generation,
+      maxDimension,
+      overridesKey: stageOverridesKey(overrides),
+    };
+    const originalExpected: PreviewRenderStamp = {
+      itemId,
+      generation,
+      maxDimension,
+      overridesKey: '',
+    };
+    const originalNeeded =
+      state.compareMode !== 'converted' &&
+      !stampMatches(lastOriginalRender.current, originalExpected);
+    const convertedNeeded =
+      state.compareMode !== 'original' &&
+      !stampMatches(lastConvertedRender.current, convertedExpected);
+
     if (!sessionRef.current) {
-      // The comparison mode or zoom changed after a conversion closed the
-      // worker session (or after a cancel).  Reopen so the new view can load;
-      // the per-row cache still supplies an immediate fit preview.
-      if (!sessionLoading.current && !convertingRef.current &&
+      if ((originalNeeded || convertedNeeded) &&
+          !sessionLoading.current &&
           state.selectedItemId !== null) {
         void openSession();
       }
       return;
     }
-    if (state.compareMode !== 'converted') {
+    if (originalNeeded) {
       void renderOriginalPreview().catch((error: unknown) => {
         if (error instanceof ModuleCrashedError) {
           sessionRef.current = false;
@@ -635,14 +747,15 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         }
       });
     }
-    if (state.compareMode !== 'original') {
+    if (convertedNeeded) {
       void renderConvertedPreview();
     }
   }, [
-    previewViewKey,
     state.compareMode,
-    state.originalPreview,
-    state.convertedPreview,
+    state.zoomMode,
+    state.converting,
+    state.imageWidth,
+    state.selectedItemId,
     openSession,
     renderOriginalPreview,
     renderConvertedPreview,
@@ -783,7 +896,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
               overrides: {},
               preset: null,
               cachedOriginalPreview: null,
+              cachedOriginalMaxDimension: null,
               cachedConvertedPreview: null,
+              cachedConvertedMaxDimension: null,
             });
           }
 
@@ -794,6 +909,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
             activateItem(newItems[0].id, true);
             void openSession();
           } else if (selectedCompanionChanged && !convertingRef.current) {
+            selectionGeneration.current += 1;
             void openSession();
           }
         })
@@ -871,6 +987,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       if (file === null) {
         files.companion = null;
         companionRef.current = null;
+        selectionGeneration.current += 1;
         dispatch({ type: 'queue-updated', id, patch: { companionName: null } });
         sessionRef.current = false;
         void openSession();
@@ -885,6 +1002,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         const companion = { bytes, name: file.name };
         files.companion = companion;
         companionRef.current = companion;
+        selectionGeneration.current += 1;
         dispatch({
           type: 'queue-updated',
           id,
@@ -1076,6 +1194,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     let converted = 0;
     let failed = 0;
     let cancelled = false;
+    // The worker may already hold the selected item's prepared source.  Reuse
+    // it for the first conversion instead of opening the RAW a second time.
+    let sessionItemId: number | null = sessionRef.current ? activeItemId.current : null;
     try {
       for (let index = 0; index < items.length; index += 1) {
         if (cancelRequested.current) {
@@ -1107,22 +1228,37 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
           patch: { status: 'working', message: 'Preparing…' },
         });
         try {
-          const opened = await client().open(
-            files.source.bytes,
-            files.source.name,
-            files.companion?.bytes,
-            files.companion?.name,
-          );
-          if (snapshot.moduleStatus !== 'ready') {
-            dispatch({ type: 'module-status', status: 'ready', message: null });
+          const reuseSession =
+            item.id === sessionItemId &&
+            item.baseSettings !== null &&
+            item.settings !== null &&
+            item.metadata !== null;
+          let baseSettings = item.baseSettings;
+          let settings = item.settings;
+          let metadata = item.metadata;
+          let width = item.width;
+          let height = item.height;
+          if (!reuseSession) {
+            const opened = await client().open(
+              files.source.bytes,
+              files.source.name,
+              files.companion?.bytes,
+              files.companion?.name,
+            );
+            sessionItemId = item.id;
+            if (snapshot.moduleStatus !== 'ready') {
+              dispatch({ type: 'module-status', status: 'ready', message: null });
+            }
+            const baseValues = await client().resolvedSettings(overridesToArray({}));
+            baseSettings = settingsFromValues(baseValues);
+            metadata = metadataFromBridge(opened.metadata);
+            settings = applyOverrides(baseSettings, item.overrides);
+            width = opened.width;
+            height = opened.height;
           }
-          const baseValues = await client().resolvedSettings(overridesToArray({}));
-          const baseSettings = settingsFromValues(baseValues);
-          const metadata = metadataFromBridge(opened.metadata);
-          const settings = applyOverrides(baseSettings, item.overrides);
           const preset = matchedPreset(
-            baseSettings,
-            settings,
+            baseSettings!,
+            settings!,
             snapshot.customPreset,
           );
           dispatch({
@@ -1131,8 +1267,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
             patch: {
               status: 'working',
               message: 'Converting…',
-              width: opened.width,
-              height: opened.height,
+              width,
+              height,
               metadata,
               baseSettings,
               settings,
@@ -1173,6 +1309,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
           }
           if (error instanceof ModuleCrashedError) {
             sessionRef.current = false;
+            sessionItemId = null;
           }
           failed += 1;
           dispatch({
@@ -1193,9 +1330,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       convertingRef.current = false;
       cancelRequested.current = false;
       dispatch({ type: 'converting', running: false });
-      // The worker now holds the last converted session, not necessarily the
-      // selected one.  The next preview action reopens the selected item.
-      sessionRef.current = false;
+      // Keep the prepared session only when it still belongs to the selected
+      // item; otherwise the next preview action reopens the row.
+      sessionRef.current = !cancelled && sessionItemId === activeItemId.current;
       const message = cancelled
         ? 'Cancelled'
         : failed > 0

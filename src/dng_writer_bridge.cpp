@@ -3589,6 +3589,7 @@ bool RenderOm3RawDomainImage(const std::string& source_path,
 bool BuildLinearDngPayload(const std::string& source_path,
                            const SourceLinearDngMetadata& metadata,
                            const LibRawOverrideSet& libraw_overrides,
+                           const ProcessingCache* predecoded_raw,
                            LinearDngPayload* payload,
                            std::string* error_message) {
   const hiraco::ScopedTimingLog payload_timer("convert", "Build linear DNG payload");
@@ -3611,7 +3612,19 @@ bool BuildLinearDngPayload(const std::string& source_path,
   }
 
   payload->raw_image_is_camera_space = false;
-  if (IsOm3HighResMetadata(metadata)) {
+  const bool om3_metadata = IsOm3HighResMetadata(metadata);
+  const bool can_reuse_raw =
+      predecoded_raw != nullptr &&
+      !predecoded_raw->has_cached_crop &&
+      predecoded_raw->raw_image.width > 0 &&
+      predecoded_raw->raw_image.height > 0 &&
+      predecoded_raw->raw_image_is_camera_space == om3_metadata &&
+      LibRawOverridesEqual(predecoded_raw->libraw_overrides, libraw_overrides);
+  if (can_reuse_raw) {
+    const hiraco::ScopedTimingLog timer("convert", "Reuse preview raw cache");
+    payload->raw_image = predecoded_raw->raw_image;
+    payload->raw_image_is_camera_space = predecoded_raw->raw_image_is_camera_space;
+  } else if (om3_metadata) {
     const hiraco::ScopedTimingLog timer("convert", "Render raw payload");
     if (!RenderOm3RawDomainImage(source_path, metadata, nullptr, &payload->raw_image, error_message)) {
       return false;
@@ -3974,6 +3987,53 @@ RasterImage CropRasterImage(const RasterImage& source,
   return result;
 }
 
+bool BuildOriginalPreviewFromProcessingCacheImpl(const ProcessingCache& cache,
+                                             const SourceLinearDngMetadata& metadata,
+                                             const CropRect& crop_rect,
+                                             uint32_t max_dimension,
+                                             PreviewImage* preview) {
+  if (preview == nullptr || cache.raw_image.width == 0 || cache.raw_image.height == 0) {
+    return false;
+  }
+  if (cache.raw_image_is_camera_space &&
+      (!metadata.has_black_level || !metadata.has_as_shot_neutral)) {
+    return false;
+  }
+
+  const uint32_t source_width = cache.source_width > 0 ? cache.source_width : cache.raw_image.width;
+  const uint32_t source_height = cache.source_height > 0 ? cache.source_height : cache.raw_image.height;
+  const CropRect requested = ClampCropRectToBounds(crop_rect, source_width, source_height);
+  const uint32_t region_x = cache.has_cached_crop ? cache.region_origin_x : 0;
+  const uint32_t region_y = cache.has_cached_crop ? cache.region_origin_y : 0;
+  const uint64_t region_right = static_cast<uint64_t>(region_x) + cache.raw_image.width;
+  const uint64_t region_bottom = static_cast<uint64_t>(region_y) + cache.raw_image.height;
+  const uint64_t requested_right = static_cast<uint64_t>(requested.x) + requested.width;
+  const uint64_t requested_bottom = static_cast<uint64_t>(requested.y) + requested.height;
+  // A cropped cache only contains one region.  Returning the intersection
+  // would silently show a partial or shifted image, so reject it and let the
+  // caller fall back to the LibRaw decode.
+  if (requested.x < region_x || requested.y < region_y ||
+      requested_right > region_right || requested_bottom > region_bottom) {
+    return false;
+  }
+  CropRect cache_crop = requested;
+  if (cache.has_cached_crop) {
+    cache_crop.x -= region_x;
+    cache_crop.y -= region_y;
+  }
+
+  RasterImage crop = CropRasterImage(cache.raw_image, cache_crop);
+  if (crop.width == 0 || crop.height == 0 || crop.colors < 3) {
+    return false;
+  }
+  *preview = BuildDisplayPreviewFromRaster(metadata,
+                                           std::move(crop),
+                                           cache.raw_image_is_camera_space,
+                                           max_dimension,
+                                           cache.preview_auto_bright_gain);
+  return preview->width > 0 && preview->height > 0;
+}
+
 AutoPtr<dng_image> MakeUint16Image(dng_host& host, const RasterImage& image) {
   dng_rect bounds(image.height, image.width);
   AutoPtr<dng_image> dng_image_ptr(host.Make_dng_image(bounds,
@@ -4162,6 +4222,18 @@ void AppendImagePreview(dng_host& host,
 
 RasterImage ScaleRasterImageForDisplay(const RasterImage& source, uint32_t max_dimension) {
   return BuildScaledRasterImage(source, max_dimension);
+}
+
+bool BuildOriginalPreviewFromProcessingCache(const ProcessingCache& cache,
+                                             const SourceLinearDngMetadata& metadata,
+                                             const CropRect& crop_rect,
+                                             uint32_t max_dimension,
+                                             PreviewImage* preview) {
+  return BuildOriginalPreviewFromProcessingCacheImpl(cache,
+                                                     metadata,
+                                                     crop_rect,
+                                                     max_dimension,
+                                                     preview);
 }
 
 PreviewImage ScalePreviewImageForDisplay(const PreviewImage& source,
@@ -4512,6 +4584,7 @@ bool BuildProcessingCacheFromRaw(const std::string& source_path,
 
   cache->raw_image = RasterImage();
   cache->cfa_guide_image = RasterImage();
+  cache->libraw_overrides = libraw_overrides;
   cache->raw_image_is_camera_space = false;
   cache->highlight_recovery_enabled = false;
   cache->preview_auto_bright_gain = 1.0;
@@ -4868,6 +4941,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const StageOverrideSet& stage_overrides,
                                      const LibRawOverrideSet& libraw_overrides,
                                      std::shared_ptr<const PreviewImage> preview_override,
+                                     std::shared_ptr<const ProcessingCache> predecoded_raw,
                                      ProgressCallback progress,
                                      CancelCheck cancel) {
   const hiraco::ScopedTimingLog convert_timer("convert", "Write linear DNG from raw");
@@ -4949,6 +5023,7 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       if (!BuildLinearDngPayload(source_path,
                                  metadata,
                                  libraw_overrides,
+                                 predecoded_raw.get(),
                                  &payload,
                                  &render_error)) {
         result.message = render_error;
@@ -5017,6 +5092,10 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
       return result;
     }
     PopulateLinearRawNegative(host, source_path, payload.raw_image, metadata, *negative.Get());
+    // The negative owns its copy; the multi-hundred-MB source payloads are no
+    // longer needed while the compressor writes the file.
+    payload.raw_image = RasterImage();
+    payload.cfa_guide_image = RasterImage();
 
     dng_preview_list preview_list;
     AppendImagePreview(host, preview_image, &preview_list);

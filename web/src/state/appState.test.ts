@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
+import { PREVIEW_MAX_DIMENSION } from '../lib/compare';
 import {
   PREVIEW_CACHE_LIMIT_BYTES,
+  QUEUE_PREVIEW_CACHE_LIMIT_BYTES,
   appReducer,
   initialAppState,
   matchedPreset,
   type AppState,
+  type PreviewBuffer,
   type QueueItem,
 } from './appState';
 import {
@@ -35,7 +38,9 @@ function makeItem(
     overrides,
     preset: null,
     cachedOriginalPreview: null,
+    cachedOriginalMaxDimension: null,
     cachedConvertedPreview: null,
+    cachedConvertedMaxDimension: null,
   };
 }
 
@@ -137,7 +142,7 @@ describe('the application reducer', () => {
       originalPreview: null,
     });
 
-    const rendered = appReducer(state, { type: 'converted-preview', preview });
+    const rendered = appReducer(state, { type: 'converted-preview', preview, maxDimension: PREVIEW_MAX_DIMENSION });
     expect(rendered.queue[0].cachedConvertedPreview).toBe(preview);
     expect(rendered.queue[1].cachedConvertedPreview).toBeNull();
 
@@ -162,6 +167,64 @@ describe('the application reducer', () => {
     expect(companionChanged.queue[0].cachedOriginalPreview).toBeNull();
   });
 
+  it('reuses a cached preview when a larger render satisfies the zoom', () => {
+    const preview = {
+      width: 2,
+      height: 1,
+      pixels: new Uint8ClampedArray(8),
+      recoveredMask: new Uint8Array(2),
+    };
+    const first = makeItem(1);
+    const second = makeItem(2);
+    const state = makeState({ queue: [first, second], selectedItemId: 1 });
+    const rendered = appReducer(state, {
+      type: 'converted-preview',
+      preview,
+      maxDimension: 5193,
+    });
+    const switched = appReducer(
+      { ...rendered, selectedItemId: 2, zoomMode: '50', convertedPreview: null },
+      { type: 'selection-changed', id: 1 },
+    );
+    expect(switched.convertedPreview).toBe(preview);
+
+    const fullRendered = appReducer(
+      makeState({ queue: [first, second], selectedItemId: 1 }),
+      { type: 'converted-preview', preview, maxDimension: 0 },
+    );
+    const fitFromFull = appReducer(
+      { ...fullRendered, selectedItemId: 2, zoomMode: 'fit', convertedPreview: null },
+      { type: 'selection-changed', id: 1 },
+    );
+    expect(fitFromFull.convertedPreview).toBe(preview);
+  });
+
+  it('evicts old row previews when the queue cache budget is exceeded', () => {
+    const fakePreview = (bytes: number) =>
+      ({
+        width: 1,
+        height: 1,
+        pixels: { byteLength: bytes },
+        recoveredMask: { byteLength: 0 },
+      }) as unknown as PreviewBuffer;
+    const items = [1, 2, 3, 4].map((id) => makeItem(id));
+    let state = makeState({ queue: items, selectedItemId: 1 });
+    for (const id of [1, 2, 3, 4]) {
+      state = { ...state, selectedItemId: id };
+      state = appReducer(state, {
+        type: 'converted-preview',
+        preview: fakePreview(30 * 1024 * 1024),
+        maxDimension: PREVIEW_MAX_DIMENSION,
+      });
+    }
+    const total = state.queue.reduce(
+      (sum, item) => sum + (item.cachedConvertedPreview?.pixels.byteLength ?? 0),
+      0,
+    );
+    expect(total).toBeLessThanOrEqual(QUEUE_PREVIEW_CACHE_LIMIT_BYTES);
+    expect(state.queue.find((item) => item.id === 4)?.cachedConvertedPreview).not.toBeNull();
+  });
+
   it('counts the recovered mask against the preview cache limit', () => {
     const preview = {
       width: 2,
@@ -170,7 +233,7 @@ describe('the application reducer', () => {
       recoveredMask: new Uint8Array(PREVIEW_CACHE_LIMIT_BYTES + 1),
     };
     const state = makeState({ queue: [makeItem(1)], selectedItemId: 1 });
-    const rendered = appReducer(state, { type: 'converted-preview', preview });
+    const rendered = appReducer(state, { type: 'converted-preview', preview, maxDimension: PREVIEW_MAX_DIMENSION });
     expect(rendered.convertedPreview).toBe(preview);
     expect(rendered.queue[0].cachedConvertedPreview).toBeNull();
   });
@@ -186,7 +249,7 @@ describe('the application reducer', () => {
       queue: [makeItem(1), makeItem(2)],
       selectedItemId: 1,
     });
-    const rendered = appReducer(state, { type: 'converted-preview', preview });
+    const rendered = appReducer(state, { type: 'converted-preview', preview, maxDimension: PREVIEW_MAX_DIMENSION });
     const edited = appReducer(rendered, {
       type: 'settings-changed',
       settings: rendered.settings,

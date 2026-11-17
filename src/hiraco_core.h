@@ -80,6 +80,16 @@ bool TryGetCachedOriginalPreview(const PreparedSource& prepared,
                                  const LibRawOverrideSet& libraw_overrides,
                                  std::shared_ptr<const PreviewImage>* preview);
 
+// Builds the original preview from the processing cache that the converted
+// preview already populated.  Returns false when no such cache exists, so the
+// caller can fall back to the LibRaw decode path.
+bool RenderOriginalPreviewFromProcessingCache(PreparedSource* prepared,
+                                              uint32_t max_dimension,
+                                              std::shared_ptr<PreviewImage> preview,
+                                              ProgressCallback progress = {},
+                                              CancelCheck cancel = {},
+                                              std::string* error_message = nullptr);
+
 // Releases only recomputable converted-preview data. The original preview and
 // metadata remain available, so a queue item can be revisited cheaply.
 void ReleasePreviewProcessingCache(PreparedSource* prepared);

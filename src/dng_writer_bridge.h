@@ -115,6 +115,16 @@ PreviewImage ScalePreviewImageForDisplay(const PreviewImage& source,
 
 RasterImage ScaleRasterImageForDisplay(const RasterImage& source, uint32_t max_dimension);
 
+// Builds the unenhanced ("original") preview from the already decoded
+// processing cache.  This skips a second LibRaw decode when the converted
+// preview has already been rendered.  The returned image is display-referred
+// and oriented, but no detail enhancement or highlight recovery is applied.
+bool BuildOriginalPreviewFromProcessingCache(const ProcessingCache& cache,
+                                             const SourceLinearDngMetadata& metadata,
+                                             const CropRect& crop_rect,
+                                             uint32_t max_dimension,
+                                             PreviewImage* preview);
+
 bool RenderConvertedCropPreview(const SourceLinearDngMetadata& metadata,
                                 const ProcessingCache& cache,
                                 const CropRect& crop_rect,
@@ -145,5 +155,6 @@ DngWriteResult WriteLinearDngFromRaw(const std::string& source_path,
                                      const StageOverrideSet& stage_overrides = {},
                                      const LibRawOverrideSet& libraw_overrides = {},
                                      std::shared_ptr<const PreviewImage> preview_override = {},
+                                     std::shared_ptr<const ProcessingCache> predecoded_raw = {},
                                      ProgressCallback progress = {},
                                      CancelCheck cancel = {});

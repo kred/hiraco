@@ -33,6 +33,9 @@ export const COMPARE_MODES: CompareModeSpec[] = [
 
 export type ZoomMode = 'fit' | '50' | '100';
 
+/** Default cap for a fit preview; 50% may be larger and 100% is uncapped. */
+export const PREVIEW_MAX_DIMENSION = 2560;
+
 export interface ZoomModeSpec {
   id: ZoomMode;
   label: string;
@@ -55,6 +58,17 @@ export function zoomFactor(mode: ZoomMode): number | null {
     default:
       return null;
   }
+}
+
+/**
+ * Whether a preview rendered at `rendered` longest-edge can serve a request
+ * for `requested`.  0 means uncapped/full resolution.
+ */
+export function previewDimensionSatisfies(rendered: number, requested: number): boolean {
+  if (rendered === requested || rendered === 0) {
+    return true;
+  }
+  return requested !== 0 && rendered >= requested;
 }
 
 /**

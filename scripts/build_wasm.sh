@@ -87,4 +87,4 @@ echo "  build-wasm/hiraco-capability-check.js   (capability reporting check)"
 echo "  build-wasm/hiraco-halide-check.js      (Halide pipeline check)"
 echo
 echo "Try it:"
-echo "  node build-wasm/hiraco-cli.js convert sample/_8142490.ORI /tmp/out.dng --compression deflate"
+echo "  node build-wasm/hiraco-cli.js convert sample/_8142490.ORI build-wasm/out.dng --compression deflate"

@@ -191,6 +191,28 @@ async function main() {
     module._hiraco_wasm_free_buffer(BigInt(maskPointer), BigInt(maskSize));
   }
 
+  // Once the converted preview has decoded the frame, the original preview
+  // must come from that cache as well.
+  const cachedOriginalStatus = module._hiraco_wasm_get_original_preview(
+    sessionId,
+    maxDimension,
+    BigInt(previewPointerPointer),
+    BigInt(previewSizePointer),
+    BigInt(previewWidthPointer),
+    BigInt(previewHeightPointer));
+  if (cachedOriginalStatus !== 0) {
+    console.error('could not render the cache-backed original preview: ' +
+                  module.UTF8ToString(module._hiraco_wasm_get_last_error()));
+    process.exit(1);
+  }
+  const cachedOriginalPointer = readU64(previewPointerPointer);
+  const cachedOriginalSize = readU64(previewSizePointer);
+  if (cachedOriginalSize === 0) {
+    console.error('the cache-backed original preview is empty');
+    process.exit(1);
+  }
+  module._hiraco_wasm_free_buffer(BigInt(cachedOriginalPointer), BigInt(cachedOriginalSize));
+
   module._hiraco_wasm_close_session(sessionId);
 
   console.log(`ok: image ${width}x${height}`);
