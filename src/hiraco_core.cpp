@@ -762,6 +762,7 @@ bool RenderOriginalPreviewFromProcessingCache(PreparedSource* prepared,
     return false;
   }
 
+  std::shared_ptr<const PreviewImage> cached_original;
   std::shared_ptr<const ProcessingCache> cache;
   {
     std::lock_guard<std::mutex> lock(prepared->data->mutex);
@@ -770,13 +771,19 @@ bool RenderOriginalPreviewFromProcessingCache(PreparedSource* prepared,
         PreviewDimensionSatisfies(
             prepared->data->cached_original_from_processing_max_dimension,
             max_dimension)) {
-      *preview = *prepared->data->cached_original_from_processing;
-      return true;
+      cached_original = prepared->data->cached_original_from_processing;
+    } else if (prepared->data->has_processing_cache && prepared->data->processing_cache) {
+      cache = prepared->data->processing_cache;
     }
-    if (!prepared->data->has_processing_cache || !prepared->data->processing_cache) {
-      return false;
-    }
-    cache = prepared->data->processing_cache;
+  }
+  if (cached_original) {
+    *preview = max_dimension == 0
+        ? *cached_original
+        : ScalePreviewImageForDisplay(*cached_original, max_dimension);
+    return true;
+  }
+  if (!cache) {
+    return false;
   }
 
   CropRect crop;
@@ -821,12 +828,6 @@ bool RenderOriginalPreviewFromProcessingCache(PreparedSource* prepared,
       prepared->data->has_cached_original_from_processing = true;
       prepared->data->cached_original_from_processing_max_dimension = rendered_dimension;
       prepared->data->cached_original_from_processing = preview;
-    }
-    if (!prepared->data->has_original_preview) {
-      prepared->data->has_original_preview = true;
-      prepared->data->original_preview_full_resolution = max_dimension == 0;
-      prepared->data->original_preview_libraw_overrides = LibRawOverrideSet();
-      prepared->data->original_preview = preview;
     }
   }
   if (progress) {
@@ -1316,6 +1317,34 @@ DngWriteResult ConvertToDng(const PreparedSource& prepared,
     if (prepared.data->has_processing_cache && prepared.data->processing_cache &&
         !prepared.data->processing_cache->has_cached_crop) {
       predecoded_raw = prepared.data->processing_cache;
+    }
+  }
+
+  // A full-frame processing cache can also provide the embedded 1024 px
+  // thumbnail when Original has not been visited yet.
+  if (!preview_override && predecoded_raw) {
+    CropRect crop;
+    crop.width = prepared.image_width;
+    crop.height = prepared.image_height;
+    if (prepared.metadata.has_default_crop &&
+        prepared.metadata.default_crop_width > 0 &&
+        prepared.metadata.default_crop_height > 0 &&
+        prepared.metadata.default_crop_origin_h < prepared.image_width &&
+        prepared.metadata.default_crop_origin_v < prepared.image_height) {
+      crop.x = prepared.metadata.default_crop_origin_h;
+      crop.y = prepared.metadata.default_crop_origin_v;
+      crop.width = std::min(prepared.metadata.default_crop_width,
+                            prepared.image_width - crop.x);
+      crop.height = std::min(prepared.metadata.default_crop_height,
+                             prepared.image_height - crop.y);
+    }
+    auto thumbnail = std::make_shared<PreviewImage>();
+    if (BuildOriginalPreviewFromProcessingCache(*predecoded_raw,
+                                                *enhancement_metadata,
+                                                crop,
+                                                1024,
+                                                thumbnail.get())) {
+      preview_override = std::move(thumbnail);
     }
   }
 

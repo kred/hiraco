@@ -902,6 +902,9 @@ void TestOriginalPreviewRejectsUncoveredCacheCrop() {
   Expect(!BuildOriginalPreviewFromProcessingCache(
              cache, MakeHighResMetadata(), CropRect{0, 0, 512, 512}, 512, &preview),
          "an uncovered crop cache must be rejected so the caller can fall back");
+  Expect(!BuildOriginalPreviewFromProcessingCache(
+             cache, MakeHighResMetadata(), CropRect{120, 120, 64, 64}, 512, &preview),
+         "a crop overhanging the cached region must be rejected");
   Expect(BuildOriginalPreviewFromProcessingCache(
              cache, MakeHighResMetadata(), CropRect{120, 120, 32, 32}, 512, &preview),
          "a covered crop should still use the processing cache");
@@ -944,6 +947,18 @@ void TestOriginalPreviewReusesProcessingCache() {
          "cache-backed original preview should produce image data");
   Expect(std::max(original->width, original->height) <= 512,
          "cache-backed original preview should obey the display-size limit");
+
+  auto cached_at_2560 = std::make_shared<PreviewImage>();
+  Expect(RenderOriginalPreviewFromProcessingCache(&prepared, 2560, cached_at_2560, {}, {},
+                                                  &error_message),
+         "a larger cache-backed original should render from the processing cache: " +
+             error_message);
+  auto cached_at_512 = std::make_shared<PreviewImage>();
+  Expect(RenderOriginalPreviewFromProcessingCache(&prepared, 512, cached_at_512, {}, {},
+                                                  &error_message),
+         "a cache hit must honor the newer display-size request: " + error_message);
+  Expect(std::max(cached_at_512->width, cached_at_512->height) <= 512,
+         "a cache hit must be resized, not returned at the old resolution");
 }
 
 void TestConversionReusesPreviewCachesAfterSourceRemoval() {
